@@ -36,10 +36,10 @@ function putPath(out: number[], path: string): void {
   putPString(out, wirePath(path));
 }
 
-export function loginGuest(version = C.AFPVersion21): Uint8Array {
+export function loginGuest(version = C.AFPVersion21, uam = C.UAMNoUserAuthent): Uint8Array {
   const out: number[] = [C.CmdLogin];
   putPString(out, version);
-  putPString(out, C.UAMNoUserAuthent);
+  putPString(out, uam);
   return new Uint8Array(out);
 }
 
@@ -85,6 +85,40 @@ export function matchUam(uams: string[], pattern: RegExp): string | undefined {
   return uams.find((u) => pattern.test(u));
 }
 
+/** Newest advertised AFP version this client ranks, using the server's exact string. */
+const AFP_VERSION_RANK: Record<string, number> = {
+  'AFPVersion 1.1': 1,
+  'AFPVersion 2.0': 2,
+  'AFPVersion 2.1': 3,
+  'AFP2.2': 4,
+  'AFPVersion 2.2': 4,
+  AFPX03: 5,
+  'AFP3.0': 5,
+};
+
+export function pickAfpVersion(versions: string[], fallback = C.AFPVersion21): string {
+  let best = '';
+  let bestRank = 0;
+  for (const v of versions) {
+    const r = AFP_VERSION_RANK[v] ?? 0;
+    if (r > bestRank) {
+      best = v;
+      bestRank = r;
+    }
+  }
+  return best || fallback;
+}
+
+/** Server's advertised cleartext UAM spelling (e.g. `Cleartxt passwrd`). */
+export function pickCleartextUam(uams: string[]): string {
+  const want = C.UAMCleartxtPasswrd.toLowerCase();
+  return uams.find((u) => u.toLowerCase() === want) ?? C.UAMCleartxtPasswrd;
+}
+
+export function pickGuestUam(uams: string[]): string {
+  return uams.find((u) => /no user authent/i.test(u)) ?? C.UAMNoUserAuthent;
+}
+
 export function closeVol(volId: number): Uint8Array {
   const out: number[] = [C.CmdCloseVol, 0];
   appendBe16(out, volId);
@@ -110,6 +144,7 @@ export function parseSrvrParms(b: Uint8Array): { serverTime: number; volumes: { 
     const len = b[o++]!;
     const name = decodeMacRoman(b.subarray(o, o + len));
     o += len;
+    if ((1 + len) % 2) o++; // pad after odd-length Pascal name
     volumes.push({ flags, name });
   }
   return { serverTime, volumes };

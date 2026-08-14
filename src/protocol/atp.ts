@@ -15,6 +15,65 @@ export const MaxATPData = 578;
 export const DDPType = 3;
 export const HeaderSize = 8;
 
+/** 3-bit TRel timeout in the low bits of an XO TReq control byte (OmniTalk TRel30s). */
+export const TRel30s = 0;
+
+export function setTRelTimeout(control: number, timeout: number = TRel30s): number {
+  return (control & ~0x07) | (timeout & 0x07);
+}
+
+/** Highest response slot implied by a TReq bitmap (bitmap 0x01 → 1, 0xff → 8). */
+export function maxRespFromBitmap(bitmap: number): number {
+  let n = 0;
+  for (let i = 0; i < MaxResponsePackets; i++) {
+    if (bitmap & (1 << i)) n = i + 1;
+  }
+  return Math.max(1, n);
+}
+
+/**
+ * OmniTalk `haveAll`: complete when the EOM packet and everything before it has
+ * arrived, or when every packet the request asked for has arrived (System 7 often
+ * omits EOM on a one-packet OpenSess/Command TResp).
+ */
+export function responseComplete(
+  maxResp: number,
+  got: { has(seq: number): boolean },
+  eomSeq: number | null,
+): boolean {
+  if (eomSeq != null && eomSeq >= 0) {
+    for (let i = 0; i <= eomSeq; i++) {
+      if (!got.has(i)) return false;
+    }
+    return true;
+  }
+  for (let i = 0; i < maxResp; i++) {
+    if (!got.has(i)) return false;
+  }
+  return true;
+}
+
+/** Bitmap of still-missing response slots (OmniTalk missingMask). */
+export function missingBitmap(
+  maxResp: number,
+  got: { has(seq: number): boolean },
+  eomSeq: number | null,
+): number {
+  const fullMask = (1 << maxResp) - 1;
+  if (eomSeq != null && eomSeq >= 0) {
+    let m = 0;
+    for (let i = 0; i <= eomSeq; i++) {
+      if (!got.has(i)) m |= 1 << i;
+    }
+    return m;
+  }
+  let m = 0;
+  for (let i = 0; i < maxResp; i++) {
+    if (!got.has(i)) m |= 1 << i;
+  }
+  return m || fullMask;
+}
+
 export interface Header {
   control: number;
   bitmap: number;

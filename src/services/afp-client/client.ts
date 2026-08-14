@@ -26,10 +26,6 @@ export interface AfpServerNotice {
   minutes?: number;
 }
 
-function pickAfpVersion(versions: string[]): string {
-  return versions.find((v) => /2\.[12]|AFPVersion 2/.test(v)) ?? C.AFPVersion21;
-}
-
 function passwordKey(password: string, shiftLeft: boolean): Uint8Array {
   const key = new Uint8Array(8);
   key.set(encodeMacRoman(password).subarray(0, 8));
@@ -157,7 +153,7 @@ export class AfpClient {
     client.serverName = info.serverName;
     client.versions = info.versions;
     client.uams = info.uams;
-    client.version = pickAfpVersion(info.versions);
+    client.version = cmd.pickAfpVersion(info.versions);
     client.supportsSrvrMsg = (info.flags & C.SrvrInfoSupportsSrvrMsg) !== 0;
     return client;
   }
@@ -183,8 +179,9 @@ export class AfpClient {
 
   async login(creds: AfpCredentials): Promise<void> {
     if (creds.kind === 'guest') {
-      log.info(`FPLogin guest (${this.version}, ${C.UAMNoUserAuthent})`, 'afp');
-      const login = await this.sess.command(cmd.loginGuest(this.version));
+      const uam = cmd.pickGuestUam(this.uams);
+      log.info(`FPLogin guest (${this.version}, ${uam})`, 'afp');
+      const login = await this.sess.command(cmd.loginGuest(this.version, uam));
       this.assertLoginOk(login.result, 'FPLogin');
     } else {
       await this.loginPassword(creds.username, creds.password);
@@ -194,13 +191,19 @@ export class AfpClient {
   }
 
   private async loginPassword(username: string, password: string): Promise<void> {
+    const advertisedClear = this.uams.some(
+      (u) => u.toLowerCase() === C.UAMCleartxtPasswrd.toLowerCase() || /cleartxt/i.test(u),
+    );
     const twoWay = cmd.matchUam(this.uams, /2[- ]way.*randnum/i);
     const randnum = cmd.matchUam(this.uams, /randnum/i);
-    const cleartxt = cmd.matchUam(this.uams, /cleartxt/i);
 
-    if (twoWay) {
-      log.info(`FPLogin user “${username}” via ${twoWay}`, 'afp');
-      await this.loginRandnumUam(username, password, twoWay, true);
+    // OmniTalk LoginNegotiated: password login uses the advertised cleartext UAM
+    // verbatim (System 7 silently ignores a version/UAM it did not advertise).
+    if (advertisedClear || (!twoWay && !randnum)) {
+      const uam = cmd.pickCleartextUam(this.uams);
+      log.info(`FPLogin user “${username}” via ${uam} (${this.version})`, 'afp');
+      const login = await this.sess.command(cmd.loginCleartext(username, password, this.version, uam));
+      this.assertLoginOk(login.result, 'FPLogin');
       return;
     }
     if (randnum) {
@@ -208,10 +211,9 @@ export class AfpClient {
       await this.loginRandnumUam(username, password, randnum, false);
       return;
     }
-    if (cleartxt) {
-      log.info(`FPLogin user “${username}” via ${cleartxt}`, 'afp');
-      const login = await this.sess.command(cmd.loginCleartext(username, password, this.version, cleartxt));
-      this.assertLoginOk(login.result, 'FPLogin');
+    if (twoWay) {
+      log.info(`FPLogin user “${username}” via ${twoWay}`, 'afp');
+      await this.loginRandnumUam(username, password, twoWay, true);
       return;
     }
     throw new Error(
@@ -260,6 +262,12 @@ export class AfpClient {
     }
     const parsed = cmd.parseSrvrParms(parms.data);
     this.volumes = parsed.volumes;
+    if (this.volumes.length === 0) {
+      log.warn(
+        `FPGetSrvrParms empty (result=${parms.result} ${parms.data.length}b ${[...parms.data].map((x) => x.toString(16).padStart(2, '0')).join(' ')})`,
+        'afp',
+      );
+    }
     log.info(
       `FPGetSrvrParms ${this.volumes.length} volume(s): ${this.volumes.map((v) => v.name).join(', ') || '(none)'}`,
       'afp',
@@ -318,6 +326,7 @@ export class AfpClient {
           4000,
           path,
         ),
+        { bitmap: 0xff },
       );
       if (r.result === C.ErrObjectNotFnd) break;
       if (r.result !== C.NoErr) throw new Error(`FPEnumerate ${r.result}`);
@@ -345,6 +354,13 @@ export class AfpClient {
     if (r.result !== C.NoErr) throw new Error(`FPRename ${r.result}`);
   }
 
+  async moveAndRename(srcDir: number, srcName: string, dstDir: number, newName: string): Promise<void> {
+    const r = await this.sess.command(cmd.moveAndRename(this.volId, srcDir, srcName, dstDir, newName));
+    if (r.result !== C.NoErr) {
+      throw new Error(`FPMoveAndRename ${C.afpResultName(r.result)} (${r.result})`);
+    }
+  }
+
   async readFile(path: string, dirId = C.CNIDRoot, resource = false): Promise<Uint8Array> {
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
     const open = await this.sess.command(
@@ -356,7 +372,7 @@ export class AfpClient {
     let offset = 0;
     try {
       for (;;) {
-        const rr = await this.sess.command(cmd.readFork(forkRef, offset, 4096));
+        const rr = await this.sess.command(cmd.readFork(forkRef, offset, 4096), { bitmap: 0xff });
         if (rr.result === C.ErrEOFErr) {
           if (rr.data.length) chunks.push(rr.data);
           break;

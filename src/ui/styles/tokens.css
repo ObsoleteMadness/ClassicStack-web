@@ -1540,6 +1540,19 @@ login-dialog[hidden],
   flex: 1;
 }
 
+.login-dialog__submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 8.5rem;
+}
+
+.login-dialog__field input:disabled,
+.login-dialog__footer .btn:disabled {
+  opacity: 0.55;
+}
+
 .side-item .side-item-label {
   flex: 1;
   min-width: 0;

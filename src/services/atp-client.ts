@@ -15,8 +15,10 @@ export interface AtpRequest {
   xo?: boolean;
   timeoutMs?: number;
   retries?: number;
-  /** ATP TReq bitmap of wanted response slots. Default 0xff; OpenSess should use 0x01. */
+  /** ATP TReq bitmap of wanted response slots. Default 0xff; OpenSess / small AFP cmds use 0x01. */
   bitmap?: number;
+  /** Skip the error log on timeout (ASP tickle). */
+  quietTimeout?: boolean;
 }
 
 export interface AtpResponse {
@@ -31,26 +33,26 @@ export type AtpInboundTReq = {
   data: Uint8Array;
 };
 
+type AtpPending = {
+  parts: Map<number, Uint8Array>;
+  userData: number;
+  resolve: (r: AtpResponse) => void;
+  reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  eomSeq: number | null;
+  maxResp: number;
+  xo: boolean;
+  reqUserData: number;
+  destNetwork: number;
+  destNode: number;
+  destSocket: number;
+  srcSocket: number;
+};
+
 export class AtpClient {
   private stack: LocalTalkStack;
   private nextTid = 1;
-  private pending = new Map<
-    number,
-    {
-      parts: Map<number, Uint8Array>;
-      userData: number;
-      resolve: (r: AtpResponse) => void;
-      reject: (e: Error) => void;
-      timer: ReturnType<typeof setTimeout>;
-      eomSeen: boolean;
-      reqBitmap: number;
-      xo: boolean;
-      destNetwork: number;
-      destNode: number;
-      destSocket: number;
-      srcSocket: number;
-    }
-  >();
+  private pending = new Map<number, AtpPending>();
   private listening = new Set<number>();
   /** Server-initiated TReq handlers (ASP WriteContinue / Tickle / Attention on WSS). */
   private tReqHandlers = new Map<number, (req: AtpInboundTReq) => void | Promise<void>>();
@@ -110,25 +112,29 @@ export class AtpClient {
     this.ensureListen(req.srcSocket);
     const tid = this.nextTid++ & 0xffff;
     if (tid === 0) this.nextTid = 1;
-    const timeoutMs = req.timeoutMs ?? 3000;
-    const retries = req.retries ?? 3;
+    // OmniTalk: 2s interval, 5 retries (6 attempts). ASP Command/OpenSess leave this default.
+    const timeoutMs = req.timeoutMs ?? 2000;
+    const retries = req.retries ?? 5;
     const bitmap = req.bitmap ?? 0xff;
+    const maxResp = atp.maxRespFromBitmap(bitmap);
     const xo = !!req.xo;
-
-    const control = atp.TREQ | (xo ? atp.XO : 0);
-    const payload = atp.encodePacket(
-      { control, bitmap, transId: tid, userData: req.userData },
-      req.data ?? new Uint8Array(),
-    );
+    const quietTimeout = !!req.quietTimeout;
+    const body = req.data ?? new Uint8Array();
 
     return new Promise((resolve, reject) => {
       let attempts = 0;
       const maxAttempts = retries + 1;
 
-      const send = () => {
+      const send = (bm: number) => {
         attempts++;
+        let control = atp.TREQ | (xo ? atp.XO : 0);
+        if (xo) control = atp.setTRelTimeout(control, atp.TRel30s);
+        const payload = atp.encodePacket(
+          { control, bitmap: bm, transId: tid, userData: req.userData },
+          body,
+        );
         log.trace(
-          `ATP TReq tid=${tid} ${req.destNetwork}.${req.destNode}:${req.destSocket} xo=${xo} bm=0x${bitmap.toString(16)} try=${attempts}/${maxAttempts}`,
+          `ATP TReq tid=${tid} ${req.destNetwork}.${req.destNode}:${req.destSocket} xo=${xo} bm=0x${bm.toString(16)} try=${attempts}/${maxAttempts}`,
           'atp',
         );
         void this.stack.send({
@@ -148,15 +154,20 @@ export class AtpClient {
         const p = this.pending.get(tid);
         if (!p) return;
         p.timer = setTimeout(() => {
+          const cur = this.pending.get(tid);
+          if (!cur) return;
+          if (atp.responseComplete(cur.maxResp, cur.parts, cur.eomSeq)) {
+            this.tryFinish(tid, cur);
+            return;
+          }
           if (attempts < maxAttempts) {
-            send();
+            send(atp.missingBitmap(cur.maxResp, cur.parts, cur.eomSeq));
             armTimer();
           } else {
             this.pending.delete(tid);
-            log.error(
-              `ATP timeout tid=${tid} ${req.destNetwork}.${req.destNode}:${req.destSocket} xo=${xo} bm=0x${bitmap.toString(16)} after ${attempts} tries`,
-              'atp',
-            );
+            const msg = `ATP timeout tid=${tid} ${req.destNetwork}.${req.destNode}:${req.destSocket} xo=${xo} bm=0x${bitmap.toString(16)} after ${attempts} tries`;
+            if (!quietTimeout) log.error(msg, 'atp');
+            else log.trace(msg, 'atp');
             reject(new Error('atp: timeout'));
           }
         }, timeoutMs);
@@ -168,39 +179,55 @@ export class AtpClient {
         resolve,
         reject,
         timer: undefined as unknown as ReturnType<typeof setTimeout>,
-        eomSeen: false,
-        reqBitmap: bitmap,
+        eomSeq: null,
+        maxResp,
         xo,
+        reqUserData: req.userData,
         destNetwork: req.destNetwork,
         destNode: req.destNode,
         destSocket: req.destSocket,
         srcSocket: req.srcSocket,
       });
-      send();
+      send(bitmap);
       armTimer();
     });
   }
 
-  private finishPending(
-    tid: number,
-    pend: {
-      parts: Map<number, Uint8Array>;
-      userData: number;
-      resolve: (r: AtpResponse) => void;
-      reject: (e: Error) => void;
-      timer: ReturnType<typeof setTimeout>;
-      xo: boolean;
-      destNetwork: number;
-      destNode: number;
-      destSocket: number;
-      srcSocket: number;
-    },
-    out: Uint8Array,
-  ): void {
+  private tryFinish(tid: number, pend: AtpPending): void {
+    if (!atp.responseComplete(pend.maxResp, pend.parts, pend.eomSeq)) return;
+    let last = pend.eomSeq;
+    if (last == null || last < 0) {
+      last = 0;
+      while (last + 1 < pend.maxResp && pend.parts.has(last + 1)) last++;
+      if (!pend.parts.has(0)) return;
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (let i = 0; i <= last; i++) {
+      const part = pend.parts.get(i);
+      if (!part) return;
+      chunks.push(part);
+      total += part.length;
+    }
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const c of chunks) {
+      out.set(c, o);
+      o += c.length;
+    }
+    this.finishPending(tid, pend, out);
+  }
+
+  private finishPending(tid: number, pend: AtpPending, out: Uint8Array): void {
     clearTimeout(pend.timer);
     this.pending.delete(tid);
     if (pend.xo) {
-      const trel = atp.encodePacket({ control: atp.TREL, bitmap: 0, transId: tid, userData: 0 });
+      const trel = atp.encodePacket({
+        control: atp.TREL,
+        bitmap: 0,
+        transId: tid,
+        userData: pend.reqUserData,
+      });
       void this.stack
         .send({
           hops: 0,
@@ -246,30 +273,10 @@ export class AtpClient {
     }
 
     const seq = header.bitmap & 0x07;
-    pend.parts.set(seq, data);
+    // Zero-length TResp still counts (OpenSess payload lives in UserData).
+    if (!pend.parts.has(seq)) pend.parts.set(seq, data);
     if (seq === 0) pend.userData = header.userData;
-    if (atp.hasEOM(header)) pend.eomSeen = true;
-
-    // Classic Mac often omits EOM on a one-packet OpenSess TResp.
-    const oneSlot = pend.reqBitmap === 0x01;
-    if (!pend.eomSeen && !(oneSlot && pend.parts.has(0))) return;
-
-    let max = -1;
-    for (const k of pend.parts.keys()) if (k > max) max = k;
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    for (let i = 0; i <= max; i++) {
-      const part = pend.parts.get(i);
-      if (!part) return; // gap
-      chunks.push(part);
-      total += part.length;
-    }
-    const out = new Uint8Array(total);
-    let o = 0;
-    for (const c of chunks) {
-      out.set(c, o);
-      o += c.length;
-    }
-    this.finishPending(header.transId, pend, out);
+    if (atp.hasEOM(header)) pend.eomSeq = seq;
+    this.tryFinish(header.transId, pend);
   }
 }

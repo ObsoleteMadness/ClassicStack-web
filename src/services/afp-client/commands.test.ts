@@ -16,6 +16,8 @@ import {
   loginGuest,
   loginCleartext,
   loginCont,
+  pickAfpVersion,
+  pickCleartextUam,
 } from './commands';
 
 describe('AFP client wirePath + Pascal framing', () => {
@@ -162,6 +164,21 @@ describe('AFP login packets', () => {
     expect(b[0]).toBe(C.CmdLogin);
     expect(b.length % 2).toBe(0);
     expect([...b.subarray(b.length - 8)]).toEqual([...encodeMacRoman('secret'), 0, 0]);
+  });
+
+  it('uses the advertised version and Cleartxt passwrd spelling', () => {
+    expect(pickAfpVersion(['AFPVersion 1.1', 'AFPVersion 2.0', 'AFPVersion 2.1'])).toBe(
+      'AFPVersion 2.1',
+    );
+    expect(pickCleartextUam(['Cleartxt passwrd', 'Randnum exchange'])).toBe('Cleartxt passwrd');
+    const version = encodeMacRoman('AFPVersion 2.1');
+    const uam = encodeMacRoman('Cleartxt passwrd');
+    const b = loginCleartext('user', 'pw', 'AFPVersion 2.1', 'Cleartxt passwrd');
+    expect(b[0]).toBe(C.CmdLogin);
+    expect(b[1]).toBe(version.length);
+    expect([...b.subarray(2, 2 + version.length)]).toEqual([...version]);
+    expect(b[2 + version.length]).toBe(uam.length);
+    expect([...b.subarray(3 + version.length, 3 + version.length + uam.length)]).toEqual([...uam]);
   });
 
   it('loginCont is cmd+pad+id+auth', () => {

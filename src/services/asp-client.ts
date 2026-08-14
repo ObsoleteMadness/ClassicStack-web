@@ -15,6 +15,7 @@ export class AspSession {
   private wssSocket: number;
   private sessionId = 0;
   private seq = 0;
+  private seqInit = false;
   private tickleTimer: ReturnType<typeof setInterval> | null = null;
   /** Pending ASP Write data keyed by sequence (answered by WriteContinue). */
   private pendingWrites = new Map<number, Uint8Array>();
@@ -51,7 +52,7 @@ export class AspSession {
       destSocket: this.destSocket,
       srcSocket: this.wssSocket,
       userData: asp.packGetStatus(),
-      timeoutMs: 4000,
+      bitmap: 0xff,
     });
     return resp.data;
   }
@@ -67,9 +68,8 @@ export class AspSession {
       destSocket: this.destSocket,
       srcSocket: this.wssSocket,
       userData: asp.packOpenSess(this.wssSocket),
-      xo: true,
+      xo: false,
       bitmap: 0x01,
-      timeoutMs: 4000,
     });
     const sss = (resp.userData >>> 24) & 0xff;
     const sid = (resp.userData >>> 16) & 0xff;
@@ -80,6 +80,7 @@ export class AspSession {
     this.sessionId = sid;
     this.opened = true;
     this.seq = 0;
+    this.seqInit = false;
     this.ensureWssHandler();
     this.tickleTimer = setInterval(() => {
       void this.atp
@@ -92,6 +93,7 @@ export class AspSession {
           timeoutMs: 5000,
           retries: 1,
           bitmap: 0x01,
+          quietTimeout: true,
         })
         .catch(() => undefined);
     }, asp.TickleIntervalMs);
@@ -137,18 +139,36 @@ export class AspSession {
     });
   }
 
-  async command(block: Uint8Array): Promise<{ result: number; data: Uint8Array }> {
-    if (!this.opened) throw new Error('ASP session not open');
+  /**
+   * First Command/Write on a session MUST be sequence 0 (OmniTalk nextSeq).
+   * System 7 ASP silently drops any other first sequence.
+   */
+  private nextSeq(): number {
+    if (!this.seqInit) {
+      this.seqInit = true;
+      this.seq = 0;
+      return 0;
+    }
     this.seq = (this.seq + 1) & 0xffff;
+    return this.seq;
+  }
+
+  async command(
+    block: Uint8Array,
+    opts?: { bitmap?: number; timeoutMs?: number },
+  ): Promise<{ result: number; data: Uint8Array }> {
+    if (!this.opened) throw new Error('ASP session not open');
+    const seq = this.nextSeq();
     const resp = await this.atp.request({
       destNetwork: this.destNetwork,
       destNode: this.destNode,
       destSocket: this.destSocket,
       srcSocket: this.wssSocket,
-      userData: asp.packCommand(this.sessionId, this.seq),
+      userData: asp.packCommand(this.sessionId, seq),
       data: block,
       xo: true,
-      timeoutMs: 8000,
+      bitmap: opts?.bitmap ?? 0x01,
+      timeoutMs: opts?.timeoutMs,
     });
     return { result: u32ToI32(resp.userData), data: resp.data };
   }
@@ -162,8 +182,7 @@ export class AspSession {
   async write(cmdBlock: Uint8Array, writeData: Uint8Array): Promise<{ result: number; data: Uint8Array }> {
     if (!this.opened) throw new Error('ASP session not open');
     this.ensureWssHandler();
-    this.seq = (this.seq + 1) & 0xffff;
-    const seq = this.seq;
+    const seq = this.nextSeq();
     this.pendingWrites.set(seq, writeData);
     try {
       const resp = await this.atp.request({
@@ -175,6 +194,7 @@ export class AspSession {
         data: cmdBlock,
         xo: true,
         timeoutMs: 15000,
+        bitmap: 0x01,
       });
       return { result: u32ToI32(resp.userData), data: resp.data };
     } finally {
