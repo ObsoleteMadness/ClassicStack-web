@@ -338,6 +338,10 @@ async function main(): Promise<void> {
       loginDialog.close();
     },
 
+    showAlert(title: string, text: string) {
+      alertDialog.show(title, text);
+    },
+
     async findServer(nbpName: string) {
       if (!nbp) return null;
       let list = await nbp.lookup(nbpName, 'AFPServer');

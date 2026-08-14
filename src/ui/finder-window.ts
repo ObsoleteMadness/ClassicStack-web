@@ -37,6 +37,7 @@ export interface FinderHost {
   } | null;
   isConnected(): boolean;
   nodeLabel(): string;
+  showAlert(title: string, text: string): void;
 }
 
 interface ListItem {
@@ -329,9 +330,9 @@ export class FinderWindow extends HTMLElement {
   }): string {
     const params = new URLSearchParams();
     if (state.view !== 'icon') params.set('view', state.view);
-    if (state.source === 'remote' && state.share) {
+    if (state.source === 'remote' && state.share && state.vol) {
       params.set('share', state.share);
-      if (state.vol) params.set('vol', state.vol);
+      params.set('vol', state.vol);
     }
     if (state.path.length) params.set('path', state.path.join('/'));
     const q = params.toString();
@@ -376,7 +377,7 @@ export class FinderWindow extends HTMLElement {
       view: this.view,
       source: this.source,
       share: this.source === 'remote' ? this.remoteNbpName || meta?.nbpName || '' : '',
-      vol: this.source === 'remote' ? meta?.volumeName || this.pathStack[0]?.name || '' : '',
+      vol: this.source === 'remote' ? this.pathStack[0]?.name || meta?.volumeName || '' : '',
       path: this.pathNamesForUrl(),
     };
   }
@@ -450,56 +451,78 @@ export class FinderWindow extends HTMLElement {
     state: ReturnType<FinderWindow['historySnapshot']>,
   ): Promise<void> {
     this.historyQuiet = true;
+    let bounceToLocal = false;
     try {
       this.view = state.view;
       this.selectedId = null;
-      if (state.source === 'remote' && state.share) {
-        if (!this.host.isConnected()) {
-          this.setStatus(`Connect serial to open share “${state.share}”`);
-          this.resetToLocalShare();
+      if (state.source === 'remote') {
+        const target = state.vol ? `${state.share}:${state.vol}` : state.share || 'remote share';
+        if (!state.share || !state.vol) {
+          bounceToLocal = true;
+          this.bounceRemoteNavigation(
+            'Cannot navigate to that server — the URL must include both server and volume name.',
+          );
           await this.reload();
           return;
         }
-        const metaNow = this.host.remoteMeta();
-        const already =
-          !!metaNow?.loggedIn && metaNow.nbpName.toLowerCase() === state.share.toLowerCase();
-        if (!already) {
-          const hit = await this.host.findServer(state.share);
-          if (!hit) {
-            this.setStatus(`Could not find AFP server “${state.share}”`);
-            this.resetToLocalShare();
-            await this.reload();
-            return;
-          }
-          const ok = await this.connectServerWithLogin(hit);
-          if (!ok) {
-            this.resetToLocalShare();
-            await this.reload();
-            return;
-          }
-        } else {
-          this.remoteNbpName = metaNow!.nbpName;
-          this.remoteLoggedIn = true;
-          this.remoteVolumes = metaNow!.volumes;
+        if (!this.host.isConnected() || !this.remoteServerConnected(state.share)) {
+          bounceToLocal = true;
+          this.bounceRemoteNavigation(
+            `Cannot navigate to “${target}” — that server isn’t connected.`,
+          );
+          await this.reload();
+          return;
         }
-        if (state.vol) {
-          await this.mountRemoteVolume(state.vol);
-          this.pathStack = await this.resolvePathNames(state.path, state.vol);
+        const volName = this.canonicalVolumeName(state.vol);
+        if (!volName) {
+          bounceToLocal = true;
+          this.bounceRemoteNavigation(
+            `Cannot navigate to “${target}” — volume “${state.vol}” is not on that server.`,
+          );
+          await this.reload();
+          return;
+        }
+        try {
+          await this.mountRemoteVolume(volName);
+          this.pathStack = await this.resolvePathNames(state.path, volName);
           this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
           await this.reload();
-        } else {
-          this.showLocalShare();
+        } catch (err) {
+          bounceToLocal = true;
+          const msg = err instanceof Error ? err.message : String(err);
+          this.bounceRemoteNavigation(`Cannot navigate to “${target}”: ${msg}`);
           await this.reload();
         }
-      } else {
-        this.showLocalShare();
-        this.pathStack = await this.resolvePathNames(state.path, 'Browser Share');
-        this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
-        await this.reload();
+        return;
       }
+      this.showLocalShare();
+      this.pathStack = await this.resolvePathNames(state.path, 'Browser Share');
+      this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+      await this.reload();
     } finally {
       this.historyQuiet = false;
+      if (bounceToLocal) this.syncHistory(true);
     }
+  }
+
+  /** True when this Finder session is already logged in to the named AFP server. */
+  private remoteServerConnected(share: string): boolean {
+    if (!this.remoteLoggedIn || !share) return false;
+    const meta = this.host.remoteMeta();
+    const nbp = this.remoteNbpName || meta?.nbpName || '';
+    return nbp.toLowerCase() === share.toLowerCase() && !!meta?.loggedIn;
+  }
+
+  private canonicalVolumeName(vol: string): string | null {
+    const lower = vol.toLowerCase();
+    return this.remoteVolumes.find((v) => v.toLowerCase() === lower) ?? null;
+  }
+
+  private bounceRemoteNavigation(message: string): void {
+    log.warn(message, 'finder');
+    this.host.showAlert('Cannot navigate to that server', message);
+    this.setStatus(message);
+    this.showLocalShare();
   }
 
   private showLocalShare(): void {
@@ -796,7 +819,7 @@ export class FinderWindow extends HTMLElement {
             this.patchIconInDom(key, urls);
             return;
           }
-          const urls = await iconCache.getForNode(node, (id, name) => this.vfs.lookup(id, name));
+          const urls = await this.iconLookup(node);
           if (gen !== this.iconLoadGen) return;
           this.iconUrls.set(key, urls);
           this.patchIconInDom(key, urls);
@@ -986,6 +1009,14 @@ export class FinderWindow extends HTMLElement {
     return `<span class="${cls}" aria-hidden="true"></span>`;
   }
 
+  private iconLookup(node: VNode): Promise<IconUrls> {
+    return iconCache.getForNode(
+      node,
+      (id, name) => this.vfs.lookup(id, name),
+      (n) => this.vfs.loadIconResources?.(n) ?? Promise.resolve(null),
+    );
+  }
+
   /** Kick off icon resolution for visible items; patches DOM when ready. */
   private prefetchIcons(items: ListItem[]): void {
     const gen = ++this.iconLoadGen;
@@ -998,7 +1029,7 @@ export class FinderWindow extends HTMLElement {
           try {
             let urls: IconUrls;
             if (it.node) {
-              urls = await iconCache.getForNode(it.node, (id, name) => this.vfs.lookup(id, name));
+              urls = await this.iconLookup(it.node);
             } else if (it.isDir) {
               urls = {
                 small: '/icons/DIR16.png',
@@ -1163,7 +1194,7 @@ export class FinderWindow extends HTMLElement {
     void (async () => {
       try {
         await iconCache.init();
-        const urls = await iconCache.getForNode(node, (id, name) => this.vfs.lookup(id, name));
+        const urls = await this.iconLookup(node);
         if (gen !== this.iconLoadGen) return;
         this.iconUrls.set(key, urls);
         this.patchIconInDom(key, urls);
