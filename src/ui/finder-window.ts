@@ -49,6 +49,15 @@ interface ListItem {
   finderInfo?: Uint8Array;
 }
 
+interface ClipNode {
+  name: string;
+  isDir: boolean;
+  data: Uint8Array;
+  resource: Uint8Array;
+  finderInfo: Uint8Array;
+  kids?: ClipNode[];
+}
+
 /** On-disk size for Finder lists: data fork + resource fork. */
 function nodeByteSize(n: VNode): number {
   if (n.isDir) return 0;
@@ -82,6 +91,11 @@ export class FinderWindow extends HTMLElement {
   private dragDepth = 0;
   /** Folder ids expanded in list-view outline. */
   private expandedIds = new Set<number>();
+  /** Folders whose children are being fetched (list disclose / column pane). */
+  private loadingIds = new Set<number>();
+  private folderLoadGen = new Map<number, number>();
+  private columnLoading = false;
+  private columnLoadGen = 0;
   private listChildCache = new Map<number, VNode[]>();
   /** Skip pushState while applying browser back/forward. */
   private historyQuiet = false;
@@ -92,15 +106,24 @@ export class FinderWindow extends HTMLElement {
   private sortKey: SortKey = 'name';
   private sortDir: 'asc' | 'desc' = 'asc';
   private renamingId: number | null = null;
-  private clipboard: { mode: 'cut' | 'copy'; ids: number[] } | null = null;
+  private clipboard: {
+    mode: 'cut' | 'copy';
+    items: ClipNode[];
+    source: Catalog | null;
+    sourceIds: number[];
+  } | null = null;
+  private catalogs = new Map<string, Catalog>();
   private contextMenu: { x: number; y: number; targetId: number | null } | null = null;
   /** Show Finder-invisible / Icon\\r items (persisted via prefs). */
   private showHiddenFiles = loadPrefs().showHiddenFiles;
   /** Local item being dragged (null for external file drops). */
   private dragNodeId: number | null = null;
+  private dragNode: VNode | null = null;
+  private dragCatalog: Catalog | null = null;
   private dropHoverFolderId: number | null = null;
   private springTimer: ReturnType<typeof setTimeout> | null = null;
   private springFolderId: number | null = null;
+  private springShareKey: string | null = null;
   private vfsUnsub: (() => void) | null = null;
   private vfsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   /** Parent folder ids coalesced from VFS change events until the debounced refresh. */
@@ -135,6 +158,7 @@ export class FinderWindow extends HTMLElement {
 
   bind(vfs: Catalog, host: FinderHost): void {
     this.localVfs = vfs;
+    this.catalogs.set('local', vfs);
     this.attachCatalog(vfs);
     this.host = host;
     this.ensureShellEvents();
@@ -147,14 +171,30 @@ export class FinderWindow extends HTMLElement {
     this.vfs = next;
     this.vfsUnsub = next.subscribe((change) => this.onVfsChanged(change));
     this.expandedIds.clear();
+    this.loadingIds.clear();
+    this.folderLoadGen.clear();
     this.listChildCache.clear();
     this.columnChildren = [];
-    this.clipboard = null;
+    this.columnLoading = false;
+    this.columnLoadGen++;
     this.iconUrls.clear();
     this.iconLoadGen++;
   }
 
+  private dropRemoteCatalogs(nbp?: string): void {
+    const prefix = nbp ? `${nbp}:` : null;
+    for (const key of [...this.catalogs.keys()]) {
+      if (key === 'local') continue;
+      if (prefix && !key.startsWith(prefix)) continue;
+      const cat = this.catalogs.get(key);
+      if (this.clipboard && this.clipboard.source === cat) this.clipboard.source = null;
+      this.catalogs.delete(key);
+    }
+  }
+
   private mountCatalog(cat: Catalog, source: 'local' | 'remote', rootName: string): void {
+    const key = source === 'local' ? 'local' : `${this.remoteNbpName}:${rootName}`;
+    this.catalogs.set(key, cat);
     this.attachCatalog(cat);
     this.source = source;
     this.cwd = cat.rootId();
@@ -173,6 +213,7 @@ export class FinderWindow extends HTMLElement {
     this.remoteVolumes = [];
     this.remoteNbpName = '';
     this.remoteLookup = null;
+    this.dropRemoteCatalogs();
     if (status) this.setStatus(status);
     void this.reload().then(() => {
       this.syncHistory();
@@ -447,12 +488,11 @@ export class FinderWindow extends HTMLElement {
           this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
           await this.reload();
         } else {
-          this.resetToLocalShare();
+          this.showLocalShare();
           await this.reload();
         }
       } else {
-        await this.host.closeRemote();
-        this.resetToLocalShare();
+        this.showLocalShare();
         this.pathStack = await this.resolvePathNames(state.path, 'Browser Share');
         this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
         await this.reload();
@@ -462,10 +502,14 @@ export class FinderWindow extends HTMLElement {
     }
   }
 
-  private resetToLocalShare(): void {
+  private showLocalShare(): void {
     const local = this.localVfs ?? this.host.localCatalog();
     this.mountCatalog(local, 'local', 'Browser Share');
     this.remoteOpen = false;
+  }
+
+  private resetToLocalShare(): void {
+    this.showLocalShare();
     this.remoteLoggedIn = false;
     this.remoteVolumes = [];
     this.remoteLookup = null;
@@ -658,10 +702,7 @@ export class FinderWindow extends HTMLElement {
     const connectedName = this.remoteNbpName || meta?.nbpName || '';
     const volumes = this.remoteVolumes.length ? this.remoteVolumes : (meta?.volumes ?? []);
     const viewingLocal = this.source === 'local';
-    const openVol =
-      this.source === 'remote' && this.remoteOpen
-        ? meta?.volumeName || this.pathStack[0]?.name || ''
-        : '';
+    const openVol = this.source === 'remote' ? this.pathStack[0]?.name || '' : '';
     const viewingServer = this.source === 'remote' && !this.remoteOpen;
     const servers = this.servers
       .map((s, i) => {
@@ -904,9 +945,12 @@ export class FinderWindow extends HTMLElement {
     const sel = this.selectedId != null && it.key === String(this.selectedId) ? 'selected' : '';
     const id = Number(it.key);
     const expanded = it.isDir && this.expandedIds.has(id);
+    const loading = it.isDir && this.loadingIds.has(id);
     const drag = 'draggable="true"';
     const disclose = it.isDir
-      ? `<button type="button" class="disclose ${expanded ? 'open' : ''}" data-disclose="${it.key}" aria-label="${expanded ? 'Collapse' : 'Expand'}">${expanded ? '▾' : '▸'}</button>`
+      ? `<button type="button" class="disclose ${expanded ? 'open' : ''}${loading ? ' loading' : ''}" data-disclose="${it.key}" aria-busy="${loading}" aria-label="${
+          loading ? 'Loading' : expanded ? 'Collapse' : 'Expand'
+        }">${loading ? this.spinnerHtml('disclose-spinner') : expanded ? '▾' : '▸'}</button>`
       : `<span class="disclose spacer"></span>`;
     return `<tr data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" class="${sel}" style="--depth:${depth}" ${drag}>
       <td class="name-cell">${disclose}${this.glyphHtml(it, 'small', 'row')}${this.nameLabelHtml(it)}</td>
@@ -1153,9 +1197,32 @@ export class FinderWindow extends HTMLElement {
       })
       .join('');
 
-    const preview = this.columnPreviewNode();
+    const loadingCol = this.columnLoading
+      ? this.columnLoadingHtml(listColCount)
+      : '';
+    const preview = this.columnLoading ? null : this.columnPreviewNode();
     const previewCol = preview ? this.itemInfoHtml(preview, { variant: 'column' }) : '';
-    return `<div class="column-view">${cols}${previewCol}</div>`;
+    return `<div class="column-view">${cols}${loadingCol}${previewCol}</div>`;
+  }
+
+  private spinnerHtml(extraClass = ''): string {
+    return `<span class="status-spinner${extraClass ? ` ${extraClass}` : ''}" aria-hidden="true"></span>`;
+  }
+
+  private columnLoadingHtml(colIndex: number): string {
+    return `<div class="column column--loading" data-col-index="${colIndex}" aria-busy="true">
+      <div class="column-loading">${this.spinnerHtml()}<span>Loading</span></div>
+    </div>`;
+  }
+
+  private nextFolderLoad(id: number): number {
+    const g = (this.folderLoadGen.get(id) ?? 0) + 1;
+    this.folderLoadGen.set(id, g);
+    return g;
+  }
+
+  private folderLoadIsCurrent(id: number, gen: number): boolean {
+    return this.folderLoadGen.get(id) === gen;
   }
 
   private itemFromEvent(e: Event): HTMLElement | null {
@@ -1213,7 +1280,7 @@ export class FinderWindow extends HTMLElement {
       return;
     }
     if (t.closest('[data-local]')) {
-      this.resetToLocalShare();
+      this.showLocalShare();
       await this.reload();
       this.syncHistory();
       this.render();
@@ -1263,6 +1330,9 @@ export class FinderWindow extends HTMLElement {
       e.preventDefault();
       e.stopPropagation();
       const id = Number(disclose.getAttribute('data-disclose'));
+      this.selectedId = id;
+      const row = disclose.closest('[data-id]') as HTMLElement | null;
+      if (row) this.paintSelection(row);
       await this.toggleExpand(id);
       return;
     }
@@ -1278,19 +1348,21 @@ export class FinderWindow extends HTMLElement {
       const colIndex = Number(item.getAttribute('data-col') ?? '0');
       const beforePath = this.pathNamesForUrl().join('/');
       this.pathStack = this.pathStack.slice(0, colIndex + 1);
+      this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
+      this.columnLoading = false;
       if (isDir) {
         const node = this.findInColumns(id) ?? this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
         if (node?.isDir) {
           this.pathStack.push({ id: node.id, name: node.name });
           this.cwd = node.id;
+          await this.loadColumnFolder(node.id, colIndex);
         }
       } else {
         this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+        this.nodes = this.columnChildren[this.columnChildren.length - 1] ?? this.nodes;
+        this.renderPath();
+        this.renderContent();
       }
-      this.nodes = this.sortNodes(await this.vfs.children(this.cwd));
-      await this.refreshColumns();
-      this.renderPath();
-      this.renderContent();
       if (beforePath !== this.pathNamesForUrl().join('/')) this.syncHistory();
       return;
     }
@@ -1300,15 +1372,63 @@ export class FinderWindow extends HTMLElement {
     if (this.showProps) this.refreshPropsPanel();
   }
 
+  private async loadColumnFolder(folderId: number, parentColIndex: number): Promise<void> {
+    this.columnLoadGen++;
+    const gen = this.columnLoadGen;
+    this.columnLoading = true;
+    this.renderPath();
+    this.renderContent();
+    try {
+      const kids = this.sortNodes(await this.vfs.children(folderId));
+      if (gen !== this.columnLoadGen) return;
+      this.columnChildren = this.columnChildren.slice(0, parentColIndex + 1);
+      this.columnChildren.push(kids);
+      this.nodes = kids;
+    } catch (err) {
+      if (gen !== this.columnLoadGen) return;
+      const msg = err instanceof Error ? err.message : String(err);
+      this.setStatus(`Couldn’t open folder: ${msg}`);
+      this.pathStack = this.pathStack.slice(0, parentColIndex + 1);
+      this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+    } finally {
+      if (gen === this.columnLoadGen) this.columnLoading = false;
+    }
+    if (gen !== this.columnLoadGen) return;
+    this.renderPath();
+    this.renderContent();
+  }
+
   private async toggleExpand(id: number): Promise<void> {
     if (this.expandedIds.has(id)) {
       this.expandedIds.delete(id);
+      this.loadingIds.delete(id);
+      this.nextFolderLoad(id);
       this.collapseDescendants(id);
-    } else {
-      this.expandedIds.add(id);
-      const kids = this.sortNodes(await this.vfs.children(id));
-      this.listChildCache.set(id, kids);
+      this.renderContent();
+      return;
     }
+    this.expandedIds.add(id);
+    const cached = this.listChildCache.get(id);
+    if (cached) {
+      this.renderContent();
+      return;
+    }
+    const gen = this.nextFolderLoad(id);
+    this.loadingIds.add(id);
+    this.renderContent();
+    try {
+      const kids = this.sortNodes(await this.vfs.children(id));
+      if (!this.folderLoadIsCurrent(id, gen)) return;
+      this.listChildCache.set(id, kids);
+    } catch (err) {
+      if (!this.folderLoadIsCurrent(id, gen)) return;
+      this.expandedIds.delete(id);
+      const msg = err instanceof Error ? err.message : String(err);
+      this.setStatus(`Couldn’t expand folder: ${msg}`);
+    } finally {
+      if (this.folderLoadIsCurrent(id, gen)) this.loadingIds.delete(id);
+    }
+    if (!this.folderLoadIsCurrent(id, gen)) return;
     this.renderContent();
   }
 
@@ -1381,15 +1501,19 @@ export class FinderWindow extends HTMLElement {
     }
     const id = Number(item.getAttribute('data-id'));
     this.dragNodeId = id;
+    this.dragNode = this.findNodeAnywhere(id);
+    this.dragCatalog = this.vfs;
     this.selectedId = id;
     e.dataTransfer?.setData('application/x-cs-node', String(id));
-    e.dataTransfer!.effectAllowed = 'move';
+    e.dataTransfer!.effectAllowed = 'copyMove';
     item.classList.add('dragging');
   }
 
   private onDragEnd(): void {
     this.querySelectorAll('.dragging').forEach((el) => el.classList.remove('dragging'));
     this.dragNodeId = null;
+    this.dragNode = null;
+    this.dragCatalog = null;
     this.clearSpringTimer();
     this.clearDropUi();
     this.clearDragPortal();
@@ -1434,9 +1558,6 @@ export class FinderWindow extends HTMLElement {
   private onDragOver(e: DragEvent): void {
     if (!this.isDropDrag(e)) return;
     e.preventDefault();
-    if (e.dataTransfer) {
-      e.dataTransfer.dropEffect = this.isInternalDrag() ? 'move' : 'copy';
-    }
     void this.updateDropHover(e);
   }
 
@@ -1489,7 +1610,7 @@ export class FinderWindow extends HTMLElement {
     return Number.isFinite(idx) ? idx : null;
   }
 
-  /** Destination parent id for a drop, or null if invalid. */
+  /** Destination parent id for a drop in the current catalog, or null if invalid. */
   private resolveDropParent(e: DragEvent): number | null {
     const pathId = this.pathDropIdFromEvent(e);
     if (pathId != null) return pathId;
@@ -1512,16 +1633,109 @@ export class FinderWindow extends HTMLElement {
     return null;
   }
 
+  private currentShareKey(): string {
+    return this.source === 'local' ? 'local' : `${this.remoteNbpName}:${this.pathStack[0]?.name ?? ''}`;
+  }
+
+  /** Sidebar share under the pointer (Browser Share or a mounted/listed volume). */
+  private shareDropFromEvent(e: DragEvent): { key: string; name: string } | null {
+    const t = e.target as HTMLElement | null;
+    if (!t) return null;
+    if (t.closest('[data-eject]')) return null;
+    const side = this.querySelector('.sidebar');
+    if (!side) return null;
+    if (t.closest('[data-local]') && side.contains(t.closest('[data-local]')!)) {
+      return { key: 'local', name: 'Browser Share' };
+    }
+    const volEl = t.closest('[data-vol]') as HTMLElement | null;
+    if (!volEl || !side.contains(volEl) || !this.remoteLoggedIn) return null;
+    const vi = Number(volEl.getAttribute('data-vol'));
+    const name = this.remoteVolumes[vi];
+    if (!name) return null;
+    return { key: `${this.remoteNbpName}:${name}`, name };
+  }
+
+  private async ensureShareCatalog(key: string): Promise<Catalog | null> {
+    if (key === 'local') return this.localVfs ?? this.catalogs.get('local') ?? null;
+    const existing = this.catalogs.get(key);
+    if (existing) return existing;
+    const prefix = `${this.remoteNbpName}:`;
+    if (!this.remoteLoggedIn || !key.startsWith(prefix)) return null;
+    const name = key.slice(prefix.length);
+    if (!name) return null;
+    const cat = await this.host.openRemoteVolume(name);
+    this.catalogs.set(key, cat);
+    return cat;
+  }
+
+  private resolveDropDest(e: DragEvent): {
+    catalog: Catalog | null;
+    parentId: number;
+    shareKey?: string;
+    label: string;
+  } | null {
+    const share = this.shareDropFromEvent(e);
+    if (share) {
+      const cat = this.catalogs.get(share.key) ?? (share.key === 'local' ? (this.localVfs ?? null) : null);
+      return {
+        catalog: cat,
+        parentId: cat?.rootId() ?? 0,
+        shareKey: share.key,
+        label: share.name,
+      };
+    }
+    const parentId = this.resolveDropParent(e);
+    if (parentId == null) return null;
+    const destNode = this.findNodeAnywhere(parentId);
+    return {
+      catalog: this.vfs,
+      parentId,
+      label: destNode?.name ?? this.pathStack.find((p) => p.id === parentId)?.name ?? 'folder',
+    };
+  }
+
   private async updateDropHover(e: DragEvent): Promise<void> {
+    const share = this.shareDropFromEvent(e);
+    if (share) {
+      const destCat =
+        this.catalogs.get(share.key) ?? (share.key === 'local' ? (this.localVfs ?? null) : null);
+      if (this.isInternalDrag() && this.dragNodeId != null && destCat && destCat === this.dragCatalog) {
+        if (!this.isValidMoveTarget(this.dragNodeId, destCat.rootId(), destCat)) {
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
+          this.clearSpringTimer();
+          this.paintDropTarget(null, false, null, null, null);
+          return;
+        }
+      }
+      if (e.dataTransfer) {
+        const same = this.isInternalDrag() && destCat != null && destCat === this.dragCatalog;
+        e.dataTransfer.dropEffect = this.isInternalDrag() ? (same ? 'move' : 'copy') : 'copy';
+      }
+      this.paintDropTarget(null, false, null, null, share.key);
+      if (share.key !== this.currentShareKey() && share.key !== this.springShareKey) {
+        this.clearSpringTimer();
+        this.springShareKey = share.key;
+        this.springTimer = setTimeout(() => {
+          void this.springLoadShare(share.key);
+        }, 1000);
+      } else if (share.key === this.currentShareKey()) {
+        this.clearSpringTimer();
+      }
+      return;
+    }
+
     const pathId = this.pathDropIdFromEvent(e);
     if (pathId != null) {
-      if (this.isInternalDrag() && this.dragNodeId != null) {
-        if (!(await this.isValidMoveTarget(this.dragNodeId, pathId))) {
+      if (this.isInternalDrag() && this.dragNodeId != null && this.dragCatalog === this.vfs) {
+        if (!this.isValidMoveTarget(this.dragNodeId, pathId, this.vfs)) {
           if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
           this.clearSpringTimer();
           this.paintDropTarget(null, false, null, null);
           return;
         }
+      }
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = this.isInternalDrag() && this.dragCatalog === this.vfs ? 'move' : 'copy';
       }
       this.clearSpringTimer();
       this.paintDropTarget(null, false, null, pathId);
@@ -1533,13 +1747,18 @@ export class FinderWindow extends HTMLElement {
     const folderId = folderEl ? Number(folderEl.getAttribute('data-id')) : null;
     const colIndex = this.columnIndexFromEvent(e);
 
-    if (this.isInternalDrag() && dest != null && this.dragNodeId != null) {
-      if (!(await this.isValidMoveTarget(this.dragNodeId, dest))) {
+    if (this.isInternalDrag() && dest != null && this.dragNodeId != null && this.dragCatalog === this.vfs) {
+      if (!this.isValidMoveTarget(this.dragNodeId, dest, this.vfs)) {
         if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
         this.clearSpringTimer();
         this.paintDropTarget(null, false, null, null);
         return;
       }
+    }
+
+    if (e.dataTransfer) {
+      if (!this.isInternalDrag()) e.dataTransfer.dropEffect = 'copy';
+      else e.dataTransfer.dropEffect = this.dragCatalog === this.vfs ? 'move' : 'copy';
     }
 
     const blankActive = dest != null && folderId == null;
@@ -1561,12 +1780,19 @@ export class FinderWindow extends HTMLElement {
     blankActive: boolean,
     columnIndex: number | null = null,
     pathId: number | null = null,
+    shareKey: string | null = null,
   ): void {
     this.dropHoverFolderId = folderId;
     this.querySelectorAll('.drop-target').forEach((el) => el.classList.remove('drop-target'));
     this.querySelectorAll('.drop-target-col').forEach((el) => el.classList.remove('drop-target-col'));
     const content = this.contentEl();
     content?.classList.remove('drop-active');
+
+    if (shareKey != null) {
+      const sel = shareKey === 'local' ? '[data-local]' : this.shareVolumeSelector(shareKey);
+      if (sel) this.querySelector(`.sidebar ${sel}`)?.classList.add('drop-target');
+      return;
+    }
 
     if (pathId != null) {
       this.querySelector(`.crumb[data-path-id="${pathId}"]`)?.classList.add('drop-target');
@@ -1592,6 +1818,14 @@ export class FinderWindow extends HTMLElement {
     content?.classList.add('drop-active');
   }
 
+  private shareVolumeSelector(shareKey: string): string | null {
+    const prefix = `${this.remoteNbpName}:`;
+    if (!shareKey.startsWith(prefix)) return null;
+    const name = shareKey.slice(prefix.length);
+    const vi = this.remoteVolumes.indexOf(name);
+    return vi >= 0 ? `[data-vol="${vi}"]` : null;
+  }
+
   private clearDropUi(): void {
     this.dropHoverFolderId = null;
     this.querySelectorAll('.drop-target').forEach((el) => el.classList.remove('drop-target'));
@@ -1605,12 +1839,40 @@ export class FinderWindow extends HTMLElement {
       this.springTimer = null;
     }
     this.springFolderId = null;
+    this.springShareKey = null;
+  }
+
+  private async springLoadShare(key: string): Promise<void> {
+    this.springTimer = null;
+    if (this.springShareKey !== key) return;
+    if (this.currentShareKey() === key) return;
+    this.parkDragSource();
+    try {
+      if (key === 'local') {
+        this.showLocalShare();
+      } else {
+        const prefix = `${this.remoteNbpName}:`;
+        if (!key.startsWith(prefix)) return;
+        await this.mountRemoteVolume(key.slice(prefix.length));
+      }
+      if (this.springShareKey !== key) return;
+      await this.reload();
+      if (this.springShareKey !== key) return;
+      this.renderSidebar();
+      this.renderPath();
+      this.renderContent();
+      this.syncHistory();
+      this.paintDropTarget(null, false, null, null, key);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.setStatus(`Couldn’t open share: ${msg}`);
+    }
   }
 
   private async springLoadFolder(id: number): Promise<void> {
     this.springTimer = null;
     if (this.dropHoverFolderId !== id && this.springFolderId !== id) return;
-    const node = (await this.vfs.get(id)) ?? this.findNodeAnywhere(id);
+    const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
     if (!node?.isDir) return;
 
     if (this.view === 'list') {
@@ -1626,17 +1888,49 @@ export class FinderWindow extends HTMLElement {
 
   /** Expand a list-view folder without remounting the dragged row. */
   private async springExpandList(id: number): Promise<void> {
-    if (this.expandedIds.has(id)) return;
+    if (this.expandedIds.has(id) || this.loadingIds.has(id)) return;
     this.expandedIds.add(id);
-    const kids = this.sortNodes(await this.vfs.children(id));
-    this.listChildCache.set(id, kids);
     const row = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
-    if (!row?.parentElement) {
-      this.parkDragSource();
-      this.renderContent();
-      this.paintDropTarget(id, false);
+    const cached = this.listChildCache.get(id);
+    if (cached) {
+      this.insertListChildRows(row, cached, id);
       return;
     }
+    const gen = this.nextFolderLoad(id);
+    this.loadingIds.add(id);
+    const disclose = row?.querySelector('[data-disclose]');
+    if (disclose) {
+      disclose.classList.add('open', 'loading');
+      disclose.setAttribute('aria-busy', 'true');
+      disclose.setAttribute('aria-label', 'Loading');
+      disclose.innerHTML = this.spinnerHtml('disclose-spinner');
+    } else {
+      this.renderContent();
+    }
+    try {
+      const kids = this.sortNodes(await this.vfs.children(id));
+      if (!this.folderLoadIsCurrent(id, gen)) return;
+      this.listChildCache.set(id, kids);
+      this.loadingIds.delete(id);
+      if (!row?.parentElement) {
+        this.parkDragSource();
+        this.renderContent();
+        this.paintDropTarget(id, false);
+        return;
+      }
+      this.insertListChildRows(row, kids, id);
+    } catch (err) {
+      if (!this.folderLoadIsCurrent(id, gen)) return;
+      this.expandedIds.delete(id);
+      this.loadingIds.delete(id);
+      const msg = err instanceof Error ? err.message : String(err);
+      this.setStatus(`Couldn’t expand folder: ${msg}`);
+      this.renderContent();
+    }
+  }
+
+  private insertListChildRows(row: HTMLTableRowElement | null, kids: VNode[], folderId: number): void {
+    if (!row?.parentElement) return;
     const depth = Number(String(row.style.getPropertyValue('--depth') || '0'));
     const html = kids
       .map((n) =>
@@ -1657,10 +1951,12 @@ export class FinderWindow extends HTMLElement {
     const disclose = row.querySelector('[data-disclose]');
     if (disclose) {
       disclose.classList.add('open');
+      disclose.classList.remove('loading');
+      disclose.setAttribute('aria-busy', 'false');
       disclose.setAttribute('aria-label', 'Collapse');
       disclose.textContent = '▾';
     }
-    this.paintDropTarget(id, false);
+    this.paintDropTarget(folderId, false);
   }
 
   /** Navigate into a folder in icon view; park drag source so the gesture survives. */
@@ -1690,7 +1986,7 @@ export class FinderWindow extends HTMLElement {
     const colItem = this.querySelector(`.col-item[data-id="${node.id}"]`) as HTMLElement | null;
     if (!colItem) return;
     const colIndex = Number(colItem.getAttribute('data-col') ?? '0');
-    if (this.pathStack[colIndex + 1]?.id === node.id) return;
+    if (this.pathStack[colIndex + 1]?.id === node.id && !this.columnLoading) return;
 
     this.parkDragSource();
 
@@ -1698,16 +1994,11 @@ export class FinderWindow extends HTMLElement {
     this.pathStack.push({ id: node.id, name: node.name });
     this.cwd = node.id;
     this.selectedId = null;
-
-    const kids = this.sortNodes(await this.vfs.children(node.id));
     this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
-    this.columnChildren.push(kids);
-    this.nodes = kids;
 
     const view = this.querySelector('.column-view');
     if (!view) {
-      this.renderPath();
-      this.renderContent();
+      await this.loadColumnFolder(node.id, colIndex);
       this.syncHistory();
       this.clearSpringTimer();
       return;
@@ -1723,30 +2014,54 @@ export class FinderWindow extends HTMLElement {
     parentCol?.querySelectorAll('.col-item.selected').forEach((el) => el.classList.remove('selected'));
     colItem.classList.add('selected');
 
-    const body =
-      kids.length === 0
-        ? `<div class="empty" style="padding:16px;font-size:12px">Empty</div>`
-        : kids
-            .map((n) =>
-              this.colItemHtml(
-                {
-                  key: String(n.id),
-                  name: n.name,
-                  isDir: n.isDir,
-                  size: nodeByteSize(n),
-                  mod: fromMacTime(n.modDate),
-                  node: n,
-                },
-                colIndex + 1,
-                null,
-              ),
-            )
-            .join('');
-    const newCol = document.createElement('div');
-    newCol.className = 'column';
-    newCol.setAttribute('data-col-index', String(colIndex + 1));
-    newCol.innerHTML = body;
-    parentCol?.after(newCol);
+    this.columnLoadGen++;
+    const gen = this.columnLoadGen;
+    this.columnLoading = true;
+    parentCol?.insertAdjacentHTML('afterend', this.columnLoadingHtml(colIndex + 1));
+    this.renderPath();
+    this.scrollColumnsToEnd();
+
+    try {
+      const kids = this.sortNodes(await this.vfs.children(node.id));
+      if (gen !== this.columnLoadGen) return;
+      this.columnChildren.push(kids);
+      this.nodes = kids;
+      this.columnLoading = false;
+      const loadingCol = view.querySelector('.column--loading');
+      const body =
+        kids.length === 0
+          ? `<div class="empty" style="padding:16px;font-size:12px">Empty</div>`
+          : kids
+              .map((n) =>
+                this.colItemHtml(
+                  {
+                    key: String(n.id),
+                    name: n.name,
+                    isDir: n.isDir,
+                    size: nodeByteSize(n),
+                    mod: fromMacTime(n.modDate),
+                    node: n,
+                  },
+                  colIndex + 1,
+                  null,
+                ),
+              )
+              .join('');
+      const newCol = document.createElement('div');
+      newCol.className = 'column';
+      newCol.setAttribute('data-col-index', String(colIndex + 1));
+      newCol.innerHTML = body;
+      if (loadingCol) loadingCol.replaceWith(newCol);
+      else parentCol?.after(newCol);
+    } catch (err) {
+      if (gen !== this.columnLoadGen) return;
+      this.columnLoading = false;
+      view.querySelector('.column--loading')?.remove();
+      const msg = err instanceof Error ? err.message : String(err);
+      this.setStatus(`Couldn’t open folder: ${msg}`);
+      this.pathStack = this.pathStack.slice(0, colIndex + 1);
+      this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+    }
 
     this.renderPath();
     this.scrollColumnsToEnd();
@@ -1755,34 +2070,68 @@ export class FinderWindow extends HTMLElement {
     this.paintDropTarget(node.id, false);
   }
 
-  private async isValidMoveTarget(id: number, destParent: number): Promise<boolean> {
+  private isValidMoveTarget(id: number, destParent: number, fs: Catalog = this.vfs): boolean {
+    if (this.dragCatalog && fs !== this.dragCatalog) return true;
     if (id === destParent) return false;
-    const node = await this.vfs.get(id);
-    if (!node) return false;
+    const node =
+      (this.dragNodeId === id ? this.dragNode : null) ??
+      (fs === this.vfs ? this.findNodeAnywhere(id) : null);
+    if (!node) return true;
     if (!node.isDir) return true;
-    let cur: VNode | undefined = await this.vfs.get(destParent);
-    while (cur) {
-      if (cur.id === id) return false;
-      if (!cur.parentId || cur.parentId === cur.id) break;
-      cur = await this.vfs.get(cur.parentId);
+    const seen = new Set<number>();
+    let curId: number | null = destParent;
+    while (curId != null && !seen.has(curId)) {
+      if (curId === id) return false;
+      seen.add(curId);
+      if (fs === this.vfs) {
+        const idx = this.pathStack.findIndex((p) => p.id === curId);
+        if (idx > 0) {
+          curId = this.pathStack[idx - 1]!.id;
+          continue;
+        }
+        if (idx === 0) break;
+        const n = this.findNodeAnywhere(curId);
+        if (!n?.parentId || n.parentId === n.id) break;
+        curId = n.parentId;
+        continue;
+      }
+      break;
     }
     return true;
   }
 
-  private async moveNodeTo(id: number, destParent: number): Promise<void> {
-    const node = await this.vfs.get(id);
+  private async moveNodeTo(id: number, destParent: number, fs: Catalog = this.vfs): Promise<void> {
+    const node = (this.dragNodeId === id ? this.dragNode : null) ?? (await fs.get(id));
     if (!node) return;
     if (node.parentId === destParent) return;
-    if (!(await this.isValidMoveTarget(id, destParent))) {
+    if (!this.isValidMoveTarget(id, destParent, fs)) {
       this.setStatus('Can’t move an item into itself');
       return;
     }
-    const clash = await this.vfs.lookup(destParent, node.name);
+    const clash = await fs.lookup(destParent, node.name);
     if (clash && clash.id !== id) {
-      const name = await this.uniqueChildName(destParent, node.name);
-      await this.vfs.rename(id, name);
+      const name = await this.uniqueChildName(destParent, node.name, fs);
+      await fs.rename(id, name);
     }
-    await this.vfs.move(id, destParent);
+    await fs.move(id, destParent);
+  }
+
+  private async copyNodeAcross(
+    src: Catalog,
+    id: number,
+    dest: Catalog,
+    destParent: number,
+  ): Promise<void> {
+    const node =
+      (this.dragNodeId === id && this.dragCatalog === src ? this.dragNode : null) ??
+      (await src.get(id));
+    if (!node) return;
+    dest.beginBatch();
+    try {
+      await this.writeClipNode(dest, destParent, await this.snapshotNode(src, node));
+    } finally {
+      dest.endBatch();
+    }
   }
 
   private async refreshAfterMutation(): Promise<void> {
@@ -1809,8 +2158,9 @@ export class FinderWindow extends HTMLElement {
   private async onDrop(e: DragEvent): Promise<void> {
     e.preventDefault();
     e.stopPropagation();
-    const dest = this.resolveDropParent(e);
+    const destInfo = this.resolveDropDest(e);
     const internalId = this.dragNodeId;
+    const srcCat = this.dragCatalog;
     this.clearSpringTimer();
     this.clearDropUi();
     this.dragDepth = 0;
@@ -1818,13 +2168,30 @@ export class FinderWindow extends HTMLElement {
     this.querySelectorAll('.dragging').forEach((el) => el.classList.remove('dragging'));
     this.clearDragPortal();
 
-    if (!this.vfs || dest == null) return;
+    if (!destInfo) {
+      this.dragNode = null;
+      this.dragCatalog = null;
+      return;
+    }
 
     try {
+      const destCat = destInfo.catalog ?? (destInfo.shareKey ? await this.ensureShareCatalog(destInfo.shareKey) : null);
+      if (!destCat) {
+        this.setStatus('Couldn’t open drop target');
+        return;
+      }
+      const destParent = destInfo.parentId || destCat.rootId();
+
       if (internalId != null) {
-        await this.moveNodeTo(internalId, dest);
-        this.setStatus('Moved 1 item');
-        await this.refreshAfterMutation();
+        if (!srcCat) return;
+        if (srcCat === destCat) {
+          await this.moveNodeTo(internalId, destParent, destCat);
+          this.setStatus('Moved 1 item');
+        } else {
+          await this.copyNodeAcross(srcCat, internalId, destCat, destParent);
+          this.setStatus(`Copied 1 item to ${destInfo.label}`);
+        }
+        if (this.vfs === destCat) await this.refreshAfterMutation();
         return;
       }
 
@@ -1835,7 +2202,7 @@ export class FinderWindow extends HTMLElement {
       }
       this.setStatus('Scanning…', { busy: true });
       let lastPaint = 0;
-      const count = await this.vfs.importDataTransfer(dest, dt, {
+      const count = await destCat.importDataTransfer(destParent, dt, {
         onScan: (total) => {
           this.setStatus(
             total > 0 ? `Importing… 0/${total} (0%)` : 'Importing…',
@@ -1858,20 +2225,18 @@ export class FinderWindow extends HTMLElement {
         this.setStatus('No files in drop');
         return;
       }
-      const destNode = await this.vfs.get(dest);
-      const where = destNode?.name ?? 'folder';
-      this.setStatus(`Imported ${count} item(s) into ${where}`);
-      if (this.view === 'list' && dest !== this.cwd && !this.expandedIds.has(dest)) {
-        this.expandedIds.add(dest);
+      this.setStatus(`Imported ${count} item(s) into ${destInfo.label}`);
+      if (this.vfs === destCat && this.view === 'list' && destParent !== this.cwd && !this.expandedIds.has(destParent)) {
+        this.expandedIds.add(destParent);
       }
-      // Consume the batched VFS notify so we don't double-refresh.
+      if (this.vfs !== destCat) return;
       if (this.vfsRefreshTimer) {
         clearTimeout(this.vfsRefreshTimer);
         this.vfsRefreshTimer = null;
       }
       const parents = [...this.pendingVfsParents];
       this.pendingVfsParents.clear();
-      if (this.changeImpactsVisibleFolders(parents.length ? parents : [dest])) {
+      if (this.changeImpactsVisibleFolders(parents.length ? parents : [destParent])) {
         iconCache.clearDirectoryCache();
         this.iconUrls.clear();
         this.iconLoadGen++;
@@ -1880,6 +2245,9 @@ export class FinderWindow extends HTMLElement {
     } catch (err) {
       console.error(err);
       this.setStatus(`Drop failed: ${(err as Error).message}`);
+    } finally {
+      this.dragNode = null;
+      this.dragCatalog = null;
     }
   }
 
@@ -1963,8 +2331,9 @@ export class FinderWindow extends HTMLElement {
       this.remoteLoggedIn = false;
       this.remoteVolumes = [];
       this.remoteOpen = false;
-      if (this.source === 'remote') this.resetToLocalShare();
+      if (this.source === 'remote') this.showLocalShare();
       const info = await this.host.beginRemote(s);
+      this.dropRemoteCatalogs();
       const allowGuest = info.uams.some((u) => /no user authent/i.test(u));
       this.setStatus(`Connected to ${info.serverName || s.object} — sign in`);
       let error: string | undefined;
@@ -2020,16 +2389,19 @@ export class FinderWindow extends HTMLElement {
 
   private async mountRemoteVolume(name: string): Promise<void> {
     log.info(`Opening volume “${name}”`, 'afp');
-    const cat = await this.host.openRemoteVolume(name);
-    const meta = this.host.remoteMeta();
-    this.mountCatalog(cat, 'remote', meta?.volumeName || name);
+    const key = `${this.remoteNbpName}:${name}`;
+    const cat = await this.ensureShareCatalog(key);
+    if (!cat) throw new Error(`Couldn’t open volume “${name}”`);
+    this.mountCatalog(cat, 'remote', name);
     this.remoteOpen = true;
-    this.setStatus(`Mounted ${meta?.serverName || this.remoteNbpName}:${name}`);
+    this.setStatus(`Mounted ${this.remoteNbpName}:${name}`);
   }
 
   private async ejectRemote(): Promise<void> {
     log.info(`Eject “${this.remoteNbpName || 'remote'}”`, 'afp');
+    const nbp = this.remoteNbpName;
     await this.host.closeRemote().catch(() => undefined);
+    this.dropRemoteCatalogs(nbp);
     this.resetToLocalShare();
     this.setStatus('Disconnected from AFP server');
     await this.reload();
@@ -2103,16 +2475,60 @@ export class FinderWindow extends HTMLElement {
     this.refreshPropsPanel();
   }
 
-  private cutSelection(): void {
-    if (this.selectedId == null) return;
-    this.clipboard = { mode: 'cut', ids: [this.selectedId] };
-    this.setStatus('Cut 1 item');
+  private async cutSelection(): Promise<void> {
+    await this.captureSelection('cut');
   }
 
-  private copySelection(): void {
+  private async copySelection(): Promise<void> {
+    await this.captureSelection('copy');
+  }
+
+  private async captureSelection(mode: 'cut' | 'copy'): Promise<void> {
     if (this.selectedId == null) return;
-    this.clipboard = { mode: 'copy', ids: [this.selectedId] };
-    this.setStatus('Copied 1 item');
+    const node = this.findNodeAnywhere(this.selectedId) ?? (await this.vfs.get(this.selectedId));
+    if (!node) return;
+    this.setStatus(mode === 'cut' ? 'Cutting…' : 'Copying…', { busy: true });
+    try {
+      const item = await this.snapshotNode(this.vfs, node);
+      this.clipboard = {
+        mode,
+        items: [item],
+        source: mode === 'cut' ? this.vfs : this.vfs,
+        sourceIds: [node.id],
+      };
+      this.setStatus(
+        `${mode === 'cut' ? 'Cut' : 'Copied'} “${node.name}” — paste in this share or another`,
+      );
+    } catch (err) {
+      this.setStatus(`${mode === 'cut' ? 'Cut' : 'Copy'} failed: ${(err as Error).message}`);
+    }
+  }
+
+  private async snapshotNode(fs: Catalog, node: VNode): Promise<ClipNode> {
+    if (node.isDir) {
+      const kids = await fs.children(node.id);
+      const out: ClipNode[] = [];
+      for (const k of kids) {
+        const full = k.isDir ? k : ((await fs.ensureContent(k.id)) ?? k);
+        out.push(await this.snapshotNode(fs, full));
+      }
+      return {
+        name: node.name,
+        isDir: true,
+        data: new Uint8Array(),
+        resource: new Uint8Array(),
+        finderInfo: node.finderInfo.slice(),
+        kids: out,
+      };
+    }
+    const full = (await fs.ensureContent(node.id)) ?? node;
+    return {
+      name: full.name,
+      isDir: false,
+      data: full.data.slice(),
+      resource: full.resource.slice(),
+      finderInfo: full.finderInfo.slice(),
+    };
   }
 
   private async onMkdir(): Promise<void> {
@@ -2124,10 +2540,10 @@ export class FinderWindow extends HTMLElement {
     this.renderContent();
   }
 
-  private async uniqueChildName(parentId: number, base: string): Promise<string> {
+  private async uniqueChildName(parentId: number, base: string, fs: Catalog = this.vfs): Promise<string> {
     let name = base;
     let n = 2;
-    while (await this.vfs.lookup(parentId, name)) {
+    while (await fs.lookup(parentId, name)) {
       name = `${base} ${n++}`;
     }
     return name;
@@ -2192,6 +2608,7 @@ export class FinderWindow extends HTMLElement {
             `<hr/>`,
             `<button type="button" data-ctx="cut">Cut</button>`,
             `<button type="button" data-ctx="copy">Copy</button>`,
+            this.clipboard ? `<button type="button" data-ctx="paste">Paste</button>` : '',
           ]
         : [
             `<button type="button" data-ctx="mkdir">New Folder</button>`,
@@ -2223,10 +2640,10 @@ export class FinderWindow extends HTMLElement {
         break;
       }
       case 'cut':
-        this.cutSelection();
+        await this.cutSelection();
         break;
       case 'copy':
-        this.copySelection();
+        await this.copySelection();
         break;
       case 'paste':
         await this.pasteClipboard();
@@ -2238,32 +2655,58 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async pasteClipboard(): Promise<void> {
-    if (!this.clipboard) return;
-    for (const id of this.clipboard.ids) {
-      const src = await this.vfs.get(id);
-      if (!src) continue;
-      if (this.clipboard.mode === 'cut') {
-        if (src.parentId === this.cwd) continue;
-        await this.vfs.move(id, this.cwd);
+    if (!this.clipboard?.items.length) return;
+    const clip = this.clipboard;
+    this.setStatus('Pasting…', { busy: true });
+    try {
+      const sameShare = clip.source === this.vfs;
+      if (clip.mode === 'cut' && sameShare) {
+        for (const id of clip.sourceIds) {
+          const src = await this.vfs.get(id);
+          if (!src || src.parentId === this.cwd) continue;
+          if (!this.isValidMoveTarget(id, this.cwd)) {
+            this.setStatus('Can’t move an item into itself');
+            return;
+          }
+          const clash = await this.vfs.lookup(this.cwd, src.name);
+          if (clash && clash.id !== id) {
+            const name = await this.uniqueChildName(this.cwd, src.name);
+            await this.vfs.rename(id, name);
+          }
+          await this.vfs.move(id, this.cwd);
+        }
       } else {
-        await this.duplicateNode(src, this.cwd);
+        this.vfs.beginBatch();
+        try {
+          for (const item of clip.items) {
+            await this.writeClipNode(this.vfs, this.cwd, item);
+          }
+        } finally {
+          this.vfs.endBatch();
+        }
+        if (clip.mode === 'cut' && clip.source) {
+          for (const id of clip.sourceIds) {
+            await clip.source.remove(id).catch(() => undefined);
+          }
+        }
       }
+      if (clip.mode === 'cut') this.clipboard = null;
+      await this.reload();
+      this.renderContent();
+      this.setStatus('Paste complete');
+    } catch (err) {
+      this.setStatus(`Paste failed: ${(err as Error).message}`);
     }
-    if (this.clipboard.mode === 'cut') this.clipboard = null;
-    await this.reload();
-    this.renderContent();
-    this.setStatus('Paste complete');
   }
 
-  private async duplicateNode(src: VNode, parentId: number): Promise<void> {
-    const name = await this.uniqueChildName(parentId, src.name);
-    if (src.isDir) {
-      const dir = await this.vfs.mkdir(parentId, name);
-      const kids = await this.vfs.children(src.id);
-      for (const k of kids) await this.duplicateNode(k, dir.id);
-    } else {
-      await this.vfs.createFile(parentId, name, src.data.slice(), src.resource.slice(), src.finderInfo.slice());
+  private async writeClipNode(fs: Catalog, parentId: number, item: ClipNode): Promise<void> {
+    const name = await this.uniqueChildName(parentId, item.name, fs);
+    if (item.isDir) {
+      const dir = await fs.mkdir(parentId, name);
+      for (const kid of item.kids ?? []) await this.writeClipNode(fs, dir.id, kid);
+      return;
     }
+    await fs.createFile(parentId, name, item.data.slice(), item.resource.slice(), item.finderInfo.slice());
   }
 
   private isEditingField(t: EventTarget | null): boolean {
@@ -2360,12 +2803,12 @@ export class FinderWindow extends HTMLElement {
     // Cut / Copy / Paste
     if (mod && !e.shiftKey && !e.altKey && lower === 'x') {
       e.preventDefault();
-      this.cutSelection();
+      await this.cutSelection();
       return;
     }
     if (mod && !e.shiftKey && !e.altKey && lower === 'c') {
       e.preventDefault();
-      this.copySelection();
+      await this.copySelection();
       return;
     }
     if (mod && !e.shiftKey && !e.altKey && lower === 'v') {
@@ -2473,16 +2916,17 @@ export async function collectFsZipEntries(
     const kids = await vfs.children(node.id);
     const dirPrefix = prefix ? `${prefix}${node.name}/` : `${node.name}/`;
     for (const kid of kids) {
-      const full = kid.isDir ? kid : ((await vfs.get(kid.id)) ?? kid);
+      const full = kid.isDir ? kid : ((await vfs.ensureContent(kid.id)) ?? kid);
       out.push(...(await collectFsZipEntries(vfs, full, dirPrefix)));
     }
     return out;
   }
-  const base = prefix ? `${prefix}${node.name}` : node.name;
-  out.push({ name: base, data: node.data });
+  const full = (await vfs.ensureContent(node.id)) ?? node;
+  const base = prefix ? `${prefix}${full.name}` : full.name;
+  out.push({ name: base, data: full.data });
   out.push({
-    name: prefix ? `${prefix}._${node.name}` : `._${node.name}`,
-    data: buildAppleDouble(node.finderInfo, node.resource),
+    name: prefix ? `${prefix}._${full.name}` : `._${full.name}`,
+    data: buildAppleDouble(full.finderInfo, full.resource),
   });
   return out;
 }

@@ -255,9 +255,9 @@ async function main(): Promise<void> {
 
     async openRemoteVolume(name: string) {
       if (!remote) throw new Error('not logged in');
-      await remote.openVolume(name);
-      log.info(`Mounted remote ${remote.serverName || remoteNbpName}:${remote.volumeName}`, 'afp');
-      return new RemoteVfs(remote, remote.volumeName || name);
+      const volId = await remote.openVolume(name);
+      log.info(`Mounted remote ${remote.serverName || remoteNbpName}:${name} (vol ${volId})`, 'afp');
+      return new RemoteVfs(remote, name, volId);
     },
 
     localCatalog() {

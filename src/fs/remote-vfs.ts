@@ -6,21 +6,24 @@ import { unescapeHostFilename } from '../protocol/host-filename';
 import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appledouble';
 import { be32 } from '../protocol/binary';
 import type { Catalog, VNode, VfsChangeListener } from './virtual-fs';
+import { importDataTransferInto } from './import-transfer';
 
 const EMPTY = new Uint8Array();
 
 export class RemoteVfs implements Catalog {
   private client: AfpClient;
   private volumeName: string;
+  private volId: number;
   private nodes = new Map<number, VNode>();
   private forksLoaded = new Set<number>();
   private listeners = new Set<VfsChangeListener>();
   private batchDepth = 0;
   private batchParents = new Set<number>();
 
-  constructor(client: AfpClient, volumeName: string) {
+  constructor(client: AfpClient, volumeName: string, volId: number) {
     this.client = client;
     this.volumeName = volumeName;
+    this.volId = volId;
     this.nodes.set(this.rootId(), this.makeRoot());
   }
 
@@ -48,14 +51,18 @@ export class RemoteVfs implements Catalog {
   }
 
   async get(id: number): Promise<VNode | undefined> {
-    const node = this.nodes.get(id) ?? (id === this.rootId() ? this.ensureRoot() : undefined);
+    return this.nodes.get(id) ?? (id === this.rootId() ? this.ensureRoot() : undefined);
+  }
+
+  async ensureContent(id: number): Promise<VNode | undefined> {
+    const node = await this.get(id);
     if (!node || node.isDir) return node;
     if (!this.forksLoaded.has(id)) await this.hydrateForks(node);
     return node;
   }
 
   async children(parentId: number): Promise<VNode[]> {
-    const entries = await this.client.list(parentId);
+    const entries = await this.client.list(parentId, '', this.volId);
     const kids: VNode[] = [];
     for (const e of entries) {
       if (!e.cnid) continue;
@@ -73,7 +80,7 @@ export class RemoteVfs implements Catalog {
   async mkdir(parentId: number, name: string): Promise<VNode> {
     const existing = await this.lookup(parentId, name);
     if (existing) throw new Error('exists');
-    await this.client.mkdir(name, parentId);
+    await this.client.mkdir(name, parentId, this.volId);
     const node = (await this.lookup(parentId, name)) ?? this.placeholderDir(parentId, name);
     this.notify(parentId);
     return node;
@@ -93,10 +100,10 @@ export class RemoteVfs implements Catalog {
     resource = new Uint8Array(),
     finderInfo = new Uint8Array(32),
   ): Promise<VNode> {
-    await this.client.writeFile(name, data, parentId, false);
-    if (resource.length) await this.client.writeFile(name, resource, parentId, true);
+    await this.client.writeFile(name, data, parentId, false, this.volId);
+    if (resource.length) await this.client.writeFile(name, resource, parentId, true, this.volId);
     if (finderInfo.some((b) => b !== 0)) {
-      await this.client.setFinderInfo(name, finderInfo, parentId);
+      await this.client.setFinderInfo(name, finderInfo, parentId, this.volId);
     }
     const node =
       (await this.lookup(parentId, name)) ??
@@ -116,7 +123,7 @@ export class RemoteVfs implements Catalog {
 
   async put(node: VNode): Promise<void> {
     this.nodes.set(node.id, node);
-    await this.client.setFinderInfo(node.name, node.finderInfo, node.parentId);
+    await this.client.setFinderInfo(node.name, node.finderInfo, node.parentId, this.volId);
     this.notify(node.parentId);
   }
 
@@ -124,7 +131,7 @@ export class RemoteVfs implements Catalog {
     const n = this.nodes.get(id) ?? (await this.get(id));
     if (!n) throw new Error('not found');
     if (n.id === this.rootId()) throw new Error('cannot rename volume root');
-    await this.client.rename(n.name, newName, n.parentId);
+    await this.client.rename(n.name, newName, n.parentId, this.volId);
     n.name = newName;
     n.modDate = macTime();
     this.nodes.set(id, n);
@@ -136,7 +143,7 @@ export class RemoteVfs implements Catalog {
     if (!n) throw new Error('not found');
     if (n.id === this.rootId()) throw new Error('cannot move volume root');
     if (n.parentId === newParent) return;
-    await this.client.moveAndRename(n.parentId, n.name, newParent, n.name);
+    await this.client.moveAndRename(n.parentId, n.name, newParent, n.name, this.volId);
     const oldParent = n.parentId;
     n.parentId = newParent;
     n.modDate = macTime();
@@ -152,7 +159,7 @@ export class RemoteVfs implements Catalog {
       const kids = await this.children(id);
       for (const k of kids) await this.remove(k.id);
     }
-    await this.client.remove(n.name, n.parentId);
+    await this.client.remove(n.name, n.parentId, this.volId);
     this.nodes.delete(id);
     this.forksLoaded.delete(id);
     this.notify(n.parentId);
@@ -166,20 +173,7 @@ export class RemoteVfs implements Catalog {
       onProgress?: (done: number, total: number) => void;
     },
   ): Promise<number> {
-    const files = [...dt.files];
-    opts?.onScan?.(files.length);
-    this.beginBatch();
-    let done = 0;
-    try {
-      for (const file of files) {
-        await this.importBlob(parentId, file);
-        done++;
-        opts?.onProgress?.(done, files.length);
-      }
-      return files.length;
-    } finally {
-      this.endBatch();
-    }
+    return importDataTransferInto(this, parentId, dt, (p, file) => this.importBlob(p, file), opts);
   }
 
   private async importBlob(parentId: number, file: File): Promise<VNode> {
@@ -193,7 +187,7 @@ export class RemoteVfs implements Catalog {
         if (existing && !existing.isDir) {
           const data = this.forksLoaded.has(existing.id)
             ? existing.data
-            : await this.client.readFile(existing.name, parentId, false);
+            : await this.client.readFile(existing.name, parentId, false, this.volId);
           return this.createFile(parentId, target, data, ad.resource, ad.finderInfo);
         }
         return this.createFile(parentId, target, new Uint8Array(), ad.resource, ad.finderInfo);
@@ -212,12 +206,12 @@ export class RemoteVfs implements Catalog {
 
   private async hydrateForks(node: VNode): Promise<void> {
     try {
-      node.data = await this.client.readFile(node.name, node.parentId, false);
+      node.data = await this.client.readFile(node.name, node.parentId, false, this.volId);
     } catch {
       node.data = EMPTY;
     }
     try {
-      node.resource = await this.client.readFile(node.name, node.parentId, true);
+      node.resource = await this.client.readFile(node.name, node.parentId, true, this.volId);
     } catch {
       node.resource = EMPTY;
     }

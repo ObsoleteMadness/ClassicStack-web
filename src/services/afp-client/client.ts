@@ -44,6 +44,7 @@ export class AfpClient {
   uams: string[] = [];
   volumes: { flags: number; name: string }[] = [];
   private version = C.AFPVersion21;
+  private openVolIds = new Map<string, number>();
   loggedIn = false;
   supportsSrvrMsg = false;
   private noticeHandler: ((n: AfpServerNotice) => void) | null = null;
@@ -275,12 +276,12 @@ export class AfpClient {
     return this.volumes;
   }
 
-  async openVolume(name: string): Promise<void> {
-    if (this.volId && this.volumeName === name) return;
-    if (this.volId) {
-      await this.sess.command(cmd.closeVol(this.volId)).catch(() => undefined);
-      this.volId = 0;
-      this.volumeName = '';
+  async openVolume(name: string): Promise<number> {
+    const already = this.openVolIds.get(name);
+    if (already != null) {
+      this.volId = already;
+      this.volumeName = name;
+      return already;
     }
     log.info(`FPOpenVol “${name}”`, 'afp');
     const ov = await this.sess.command(cmd.openVol(name));
@@ -288,6 +289,7 @@ export class AfpClient {
       throw new Error(`FPOpenVol ${C.afpResultName(ov.result)} (${ov.result})`);
     }
     const { volId } = cmd.parseOpenVol(ov.data);
+    this.openVolIds.set(name, volId);
     this.volId = volId;
     this.volumeName = name;
     log.info(`Opened volume “${name}” (id ${volId})`, 'afp');
@@ -308,16 +310,27 @@ export class AfpClient {
         /* optional greeting */
       }
     }
+    return volId;
   }
 
-  async list(dirId = C.CNIDRoot, path = ''): Promise<cmd.DirEntry[]> {
-    if (!this.volId) return [];
+  /** Volume id for an already-opened volume name. */
+  volumeId(name: string): number {
+    return this.openVolIds.get(name) ?? 0;
+  }
+
+  private vid(volId?: number): number {
+    return volId && volId > 0 ? volId : this.volId;
+  }
+
+  async list(dirId = C.CNIDRoot, path = '', volId?: number): Promise<cmd.DirEntry[]> {
+    const vol = this.vid(volId);
+    if (!vol) return [];
     const all: cmd.DirEntry[] = [];
     let start = 1;
     for (;;) {
       const r = await this.sess.command(
         cmd.enumerate(
-          this.volId,
+          vol,
           dirId,
           cmd.DEFAULT_FILE_BITMAP,
           cmd.DEFAULT_DIR_BITMAP,
@@ -339,32 +352,38 @@ export class AfpClient {
     return all;
   }
 
-  async mkdir(name: string, dirId = C.CNIDRoot): Promise<void> {
-    const r = await this.sess.command(cmd.createDir(this.volId, dirId, name));
+  async mkdir(name: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
+    const r = await this.sess.command(cmd.createDir(this.vid(volId), dirId, name));
     if (r.result !== C.NoErr) throw new Error(`FPCreateDir ${r.result}`);
   }
 
-  async remove(path: string, dirId = C.CNIDRoot): Promise<void> {
-    const r = await this.sess.command(cmd.deletePath(this.volId, dirId, path));
+  async remove(path: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
+    const r = await this.sess.command(cmd.deletePath(this.vid(volId), dirId, path));
     if (r.result !== C.NoErr) throw new Error(`FPDelete ${r.result}`);
   }
 
-  async rename(path: string, newName: string, dirId = C.CNIDRoot): Promise<void> {
-    const r = await this.sess.command(cmd.rename(this.volId, dirId, path, newName));
+  async rename(path: string, newName: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
+    const r = await this.sess.command(cmd.rename(this.vid(volId), dirId, path, newName));
     if (r.result !== C.NoErr) throw new Error(`FPRename ${r.result}`);
   }
 
-  async moveAndRename(srcDir: number, srcName: string, dstDir: number, newName: string): Promise<void> {
-    const r = await this.sess.command(cmd.moveAndRename(this.volId, srcDir, srcName, dstDir, newName));
+  async moveAndRename(
+    srcDir: number,
+    srcName: string,
+    dstDir: number,
+    newName: string,
+    volId?: number,
+  ): Promise<void> {
+    const r = await this.sess.command(cmd.moveAndRename(this.vid(volId), srcDir, srcName, dstDir, newName));
     if (r.result !== C.NoErr) {
       throw new Error(`FPMoveAndRename ${C.afpResultName(r.result)} (${r.result})`);
     }
   }
 
-  async readFile(path: string, dirId = C.CNIDRoot, resource = false): Promise<Uint8Array> {
+  async readFile(path: string, dirId = C.CNIDRoot, resource = false, volId?: number): Promise<Uint8Array> {
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
     const open = await this.sess.command(
-      cmd.openFork(this.volId, dirId, C.FileBitmapDataForkLen | C.FileBitmapRsrcForkLen, C.AccessRead, flag, path),
+      cmd.openFork(this.vid(volId), dirId, C.FileBitmapDataForkLen | C.FileBitmapRsrcForkLen, C.AccessRead, flag, path),
     );
     if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
     const { forkRef } = cmd.parseOpenFork(open.data);
@@ -401,15 +420,16 @@ export class AfpClient {
     data: Uint8Array,
     dirId = C.CNIDRoot,
     resource = false,
+    volId?: number,
   ): Promise<void> {
-    // Create if needed
-    const cr = await this.sess.command(cmd.createFile(this.volId, dirId, path, 0));
+    const vol = this.vid(volId);
+    const cr = await this.sess.command(cmd.createFile(vol, dirId, path, 0));
     if (cr.result !== C.NoErr && cr.result !== C.ErrObjectExists) {
       throw new Error(`FPCreateFile ${cr.result}`);
     }
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
     const open = await this.sess.command(
-      cmd.openFork(this.volId, dirId, 0, C.AccessRead | C.AccessWrite, flag, path),
+      cmd.openFork(vol, dirId, 0, C.AccessRead | C.AccessWrite, flag, path),
     );
     if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
     const { forkRef } = cmd.parseOpenFork(open.data);
@@ -429,9 +449,9 @@ export class AfpClient {
     }
   }
 
-  async setFinderInfo(path: string, finderInfo: Uint8Array, dirId = C.CNIDRoot): Promise<void> {
+  async setFinderInfo(path: string, finderInfo: Uint8Array, dirId = C.CNIDRoot, volId?: number): Promise<void> {
     const r = await this.sess.command(
-      cmd.setFileDirParms(this.volId, dirId, C.FDBitmapFinderInfo, path, finderInfo),
+      cmd.setFileDirParms(this.vid(volId), dirId, C.FDBitmapFinderInfo, path, finderInfo),
     );
     if (r.result !== C.NoErr) throw new Error(`FPSetFileDirParms ${r.result}`);
   }
@@ -444,6 +464,7 @@ export class AfpClient {
     this.volId = 0;
     this.volumeName = '';
     this.volumes = [];
+    this.openVolIds.clear();
     await this.sess.close();
   }
 }

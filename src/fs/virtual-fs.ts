@@ -5,6 +5,7 @@ import { macTime } from '../protocol/afp/constants';
 import { escapeHostFilename, unescapeHostFilename } from '../protocol/host-filename';
 import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appledouble';
 import { be32 } from '../protocol/binary';
+import { importDataTransferInto } from './import-transfer';
 
 export type VfsChange = { parentIds: number[] };
 export type VfsChangeListener = (change: VfsChange) => void;
@@ -31,6 +32,8 @@ export interface Catalog {
   beginBatch(): void;
   endBatch(): void;
   get(id: number): Promise<VNode | undefined>;
+  /** Load data/resource forks if the catalog stores them separately (remote AFP). */
+  ensureContent(id: number): Promise<VNode | undefined>;
   children(parentId: number): Promise<VNode[]>;
   lookup(parentId: number, name: string): Promise<VNode | undefined>;
   mkdir(parentId: number, name: string): Promise<VNode>;
@@ -357,6 +360,10 @@ export class VirtualFS implements Catalog {
     await this.remove(sidecar.id);
   }
 
+  async ensureContent(id: number): Promise<VNode | undefined> {
+    return this.get(id);
+  }
+
   /**
    * Import files and folders from a drag-and-drop DataTransfer.
    * Uses FileSystemEntry (directory trees) when available; falls back to FileList
@@ -371,77 +378,7 @@ export class VirtualFS implements Catalog {
       onProgress?: (done: number, total: number) => void;
     },
   ): Promise<number> {
-    const entries = collectDataTransferEntries(dt);
-    const total =
-      entries.length > 0
-        ? await countFsEntries(entries)
-        : dt.files.length;
-    opts?.onScan?.(total);
-
-    this.beginBatch();
-    let done = 0;
-    const tick = (): void => {
-      done++;
-      opts?.onProgress?.(done, total);
-    };
-    try {
-      if (entries.length > 0) {
-        entries.sort(compareImportEntries);
-        for (const entry of entries) {
-          await this.importFsEntry(parentId, entry, tick);
-        }
-        return entries.length;
-      }
-
-      const files = [...dt.files].sort(compareImportFiles);
-      for (const file of files) {
-        await this.importFileWithRelativePath(parentId, file);
-        tick();
-      }
-      return files.length;
-    } finally {
-      this.endBatch();
-    }
-  }
-
-  private async importFsEntry(
-    parentId: number,
-    entry: FileSystemEntry,
-    onItem?: () => void,
-  ): Promise<void> {
-    if (entry.isDirectory) {
-      const dir = await this.ensureDir(parentId, unescapeHostFilename(entry.name));
-      onItem?.();
-      const kids = (await readDirectoryEntries(entry as FileSystemDirectoryEntry)).sort(
-        compareImportEntries,
-      );
-      for (const kid of kids) {
-        await this.importFsEntry(dir.id, kid, onItem);
-      }
-      return;
-    }
-    if (entry.isFile) {
-      const file = await readFileEntry(entry as FileSystemFileEntry);
-      await this.importBlob(parentId, file);
-      onItem?.();
-    }
-  }
-
-  /** Recreate folders from webkitRelativePath (directory input / some drops). */
-  private async importFileWithRelativePath(parentId: number, file: File): Promise<void> {
-    const rel = file.webkitRelativePath;
-    if (!rel || !rel.includes('/')) {
-      await this.importBlob(parentId, file);
-      return;
-    }
-    const parts = rel.split('/');
-    let dirId = parentId;
-    for (let i = 0; i < parts.length - 1; i++) {
-      const part = parts[i]!;
-      if (!part || part === '.' || part === '..') continue;
-      dirId = (await this.ensureDir(dirId, unescapeHostFilename(part))).id;
-    }
-    await this.importBlob(dirId, file);
+    return importDataTransferInto(this, parentId, dt, (p, file) => this.importBlob(p, file), opts);
   }
 
   async rename(id: number, newName: string): Promise<void> {
@@ -483,78 +420,6 @@ export class VirtualFS implements Catalog {
   async desktopSet(key: string, data: Uint8Array): Promise<void> {
     await this.db.put('desktop', { key, data });
   }
-}
-
-/** Top-level file/directory entries from a drop (empty if Entry API unavailable). */
-function collectDataTransferEntries(dt: DataTransfer): FileSystemEntry[] {
-  const entries: FileSystemEntry[] = [];
-  for (let i = 0; i < dt.items.length; i++) {
-    const item = dt.items[i]!;
-    if (item.kind !== 'file') continue;
-    const entry = item.webkitGetAsEntry?.() ?? null;
-    if (entry) entries.push(entry);
-  }
-  return entries;
-}
-
-/** Count files + directories in a drop tree (same units as import progress ticks). */
-async function countFsEntries(entries: FileSystemEntry[]): Promise<number> {
-  let total = 0;
-  const walk = async (entry: FileSystemEntry): Promise<void> => {
-    total++;
-    if (!entry.isDirectory) return;
-    const kids = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
-    for (const kid of kids) await walk(kid);
-  };
-  for (const entry of entries) await walk(entry);
-  return total;
-}
-
-/** Import data forks before ._ sidecars when order is otherwise arbitrary. */
-function isAppleDoubleSidecarName(name: string): boolean {
-  return name.startsWith('._') && name.length > 2;
-}
-
-function compareImportEntries(a: FileSystemEntry, b: FileSystemEntry): number {
-  const as = isAppleDoubleSidecarName(a.name) ? 1 : 0;
-  const bs = isAppleDoubleSidecarName(b.name) ? 1 : 0;
-  return as - bs || a.name.localeCompare(b.name);
-}
-
-function compareImportFiles(a: File, b: File): number {
-  const an = a.webkitRelativePath || a.name;
-  const bn = b.webkitRelativePath || b.name;
-  const as = isAppleDoubleSidecarName(a.name) ? 1 : 0;
-  const bs = isAppleDoubleSidecarName(b.name) ? 1 : 0;
-  return as - bs || an.localeCompare(bn);
-}
-
-/** DirectoryReader.readEntries returns batches; call until empty. */
-function readDirectoryEntries(dir: FileSystemDirectoryEntry): Promise<FileSystemEntry[]> {
-  const reader = dir.createReader();
-  const all: FileSystemEntry[] = [];
-  return new Promise((resolve, reject) => {
-    const readBatch = (): void => {
-      reader.readEntries(
-        (batch) => {
-          if (batch.length === 0) {
-            resolve(all);
-            return;
-          }
-          all.push(...batch);
-          readBatch();
-        },
-        (err) => reject(err),
-      );
-    };
-    readBatch();
-  });
-}
-
-function readFileEntry(entry: FileSystemFileEntry): Promise<File> {
-  return new Promise((resolve, reject) => {
-    entry.file(resolve, reject);
-  });
 }
 
 function defaultFinder(name: string): Uint8Array {
