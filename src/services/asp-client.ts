@@ -3,6 +3,7 @@
 import * as asp from '../protocol/asp';
 import { be16, u32ToI32 } from '../protocol/binary';
 import type { AtpClient } from './atp-client';
+import { log } from '../util/logger';
 
 let nextWss = 128;
 
@@ -40,6 +41,10 @@ export class AspSession {
 
   /** ASP GetStatus → FPGetSrvrInfo body (no session). */
   async getStatus(): Promise<Uint8Array> {
+    log.info(
+      `ASP GetStatus ${this.destNetwork}.${this.destNode}:${this.destSocket} wss=${this.wssSocket}`,
+      'asp',
+    );
     const resp = await this.atp.request({
       destNetwork: this.destNetwork,
       destNode: this.destNode,
@@ -52,6 +57,10 @@ export class AspSession {
   }
 
   async open(): Promise<void> {
+    log.info(
+      `ASP OpenSess ${this.destNetwork}.${this.destNode}:${this.destSocket} wss=${this.wssSocket}`,
+      'asp',
+    );
     const resp = await this.atp.request({
       destNetwork: this.destNetwork,
       destNode: this.destNode,
@@ -59,12 +68,14 @@ export class AspSession {
       srcSocket: this.wssSocket,
       userData: asp.packOpenSess(this.wssSocket),
       xo: true,
+      bitmap: 0x01,
       timeoutMs: 4000,
     });
     const sss = (resp.userData >>> 24) & 0xff;
     const sid = (resp.userData >>> 16) & 0xff;
     const err = (resp.userData << 16) >> 16;
     if (err !== 0) throw new Error(`ASP OpenSess error ${err}`);
+    log.info(`ASP session ${sid} SSS=${sss}`, 'asp');
     this.destSocket = sss;
     this.sessionId = sid;
     this.opened = true;
@@ -80,6 +91,7 @@ export class AspSession {
           userData: asp.packTickle(this.sessionId),
           timeoutMs: 5000,
           retries: 1,
+          bitmap: 0x01,
         })
         .catch(() => undefined);
     }, asp.TickleIntervalMs);
@@ -187,6 +199,7 @@ export class AspSession {
         userData: asp.packClose(this.sessionId),
         timeoutMs: 3000,
         retries: 1,
+        bitmap: 0x01,
       });
     } catch {
       /* ignore */

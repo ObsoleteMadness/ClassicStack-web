@@ -3,6 +3,7 @@
 import * as atp from '../protocol/atp';
 import type { LocalTalkStack } from '../net/stack';
 import type { Datagram } from '../protocol/ddp';
+import { log } from '../util/logger';
 
 export interface AtpRequest {
   destNetwork: number;
@@ -14,6 +15,8 @@ export interface AtpRequest {
   xo?: boolean;
   timeoutMs?: number;
   retries?: number;
+  /** ATP TReq bitmap of wanted response slots. Default 0xff; OpenSess should use 0x01. */
+  bitmap?: number;
 }
 
 export interface AtpResponse {
@@ -40,6 +43,12 @@ export class AtpClient {
       reject: (e: Error) => void;
       timer: ReturnType<typeof setTimeout>;
       eomSeen: boolean;
+      reqBitmap: number;
+      xo: boolean;
+      destNetwork: number;
+      destNode: number;
+      destSocket: number;
+      srcSocket: number;
     }
   >();
   private listening = new Set<number>();
@@ -103,9 +112,10 @@ export class AtpClient {
     if (tid === 0) this.nextTid = 1;
     const timeoutMs = req.timeoutMs ?? 3000;
     const retries = req.retries ?? 3;
-    const bitmap = 0xff; // request all 8 response slots
+    const bitmap = req.bitmap ?? 0xff;
+    const xo = !!req.xo;
 
-    const control = atp.TREQ | (req.xo ? atp.XO : 0);
+    const control = atp.TREQ | (xo ? atp.XO : 0);
     const payload = atp.encodePacket(
       { control, bitmap, transId: tid, userData: req.userData },
       req.data ?? new Uint8Array(),
@@ -113,8 +123,14 @@ export class AtpClient {
 
     return new Promise((resolve, reject) => {
       let attempts = 0;
+      const maxAttempts = retries + 1;
+
       const send = () => {
         attempts++;
+        log.trace(
+          `ATP TReq tid=${tid} ${req.destNetwork}.${req.destNode}:${req.destSocket} xo=${xo} bm=0x${bitmap.toString(16)} try=${attempts}/${maxAttempts}`,
+          'atp',
+        );
         void this.stack.send({
           hops: 0,
           destNetwork: req.destNetwork,
@@ -128,34 +144,78 @@ export class AtpClient {
         });
       };
 
-      const timer = setTimeout(() => {
-        if (attempts < retries) {
-          send();
-          // reset timer
-          const p = this.pending.get(tid);
-          if (p) {
-            clearTimeout(p.timer);
-            p.timer = setTimeout(() => {
-              this.pending.delete(tid);
-              reject(new Error('atp: timeout'));
-            }, timeoutMs);
+      const armTimer = () => {
+        const p = this.pending.get(tid);
+        if (!p) return;
+        p.timer = setTimeout(() => {
+          if (attempts < maxAttempts) {
+            send();
+            armTimer();
+          } else {
+            this.pending.delete(tid);
+            log.error(
+              `ATP timeout tid=${tid} ${req.destNetwork}.${req.destNode}:${req.destSocket} xo=${xo} bm=0x${bitmap.toString(16)} after ${attempts} tries`,
+              'atp',
+            );
+            reject(new Error('atp: timeout'));
           }
-        } else {
-          this.pending.delete(tid);
-          reject(new Error('atp: timeout'));
-        }
-      }, timeoutMs);
+        }, timeoutMs);
+      };
 
       this.pending.set(tid, {
         parts: new Map(),
         userData: 0,
         resolve,
         reject,
-        timer,
+        timer: undefined as unknown as ReturnType<typeof setTimeout>,
         eomSeen: false,
+        reqBitmap: bitmap,
+        xo,
+        destNetwork: req.destNetwork,
+        destNode: req.destNode,
+        destSocket: req.destSocket,
+        srcSocket: req.srcSocket,
       });
       send();
+      armTimer();
     });
+  }
+
+  private finishPending(
+    tid: number,
+    pend: {
+      parts: Map<number, Uint8Array>;
+      userData: number;
+      resolve: (r: AtpResponse) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+      xo: boolean;
+      destNetwork: number;
+      destNode: number;
+      destSocket: number;
+      srcSocket: number;
+    },
+    out: Uint8Array,
+  ): void {
+    clearTimeout(pend.timer);
+    this.pending.delete(tid);
+    if (pend.xo) {
+      const trel = atp.encodePacket({ control: atp.TREL, bitmap: 0, transId: tid, userData: 0 });
+      void this.stack
+        .send({
+          hops: 0,
+          destNetwork: pend.destNetwork,
+          srcNetwork: this.stack.network,
+          destNode: pend.destNode,
+          srcSocket: pend.srcSocket,
+          destSocket: pend.destSocket,
+          srcNode: this.stack.node,
+          ddpType: atp.DDPType,
+          data: trel,
+        })
+        .catch(() => undefined);
+    }
+    pend.resolve({ userData: pend.userData, data: out, transId: tid });
   }
 
   private onDdp(dg: Datagram): void {
@@ -179,13 +239,21 @@ export class AtpClient {
     const pend = this.pending.get(header.transId);
     if (!pend) return;
 
+    // STS is a bitmap of received packets, not a data sequence number.
+    if (atp.hasSTS(header)) {
+      log.trace(`ATP STS tid=${header.transId} bm=0x${header.bitmap.toString(16)}`, 'atp');
+      return;
+    }
+
     const seq = header.bitmap & 0x07;
     pend.parts.set(seq, data);
     if (seq === 0) pend.userData = header.userData;
     if (atp.hasEOM(header)) pend.eomSeen = true;
 
-    // Reassemble in order until EOM and contiguous from 0.
-    if (!pend.eomSeen) return;
+    // Classic Mac often omits EOM on a one-packet OpenSess TResp.
+    const oneSlot = pend.reqBitmap === 0x01;
+    if (!pend.eomSeen && !(oneSlot && pend.parts.has(0))) return;
+
     let max = -1;
     for (const k of pend.parts.keys()) if (k > max) max = k;
     const chunks: Uint8Array[] = [];
@@ -202,10 +270,6 @@ export class AtpClient {
       out.set(c, o);
       o += c.length;
     }
-    clearTimeout(pend.timer);
-    this.pending.delete(header.transId);
-
-    // Send TRel for XO if needed — omitted for ALO default.
-    pend.resolve({ userData: pend.userData, data: out, transId: header.transId });
+    this.finishPending(header.transId, pend, out);
   }
 }

@@ -64,3 +64,7 @@ export function hasXO(h: Header): boolean {
 export function hasEOM(h: Header): boolean {
   return (h.control & EOM) !== 0;
 }
+
+export function hasSTS(h: Header): boolean {
+  return (h.control & STS) !== 0;
+}
