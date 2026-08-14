@@ -654,24 +654,28 @@ export class FinderWindow extends HTMLElement {
   private renderSidebar(): void {
     const side = this.querySelector('.sidebar');
     if (!side) return;
-    const localSel = this.source === 'local' ? 'selected' : '';
     const meta = this.host?.remoteMeta?.() ?? null;
     const connectedName = this.remoteNbpName || meta?.nbpName || '';
     const volumes = this.remoteVolumes.length ? this.remoteVolumes : (meta?.volumes ?? []);
-    const openVol = this.source === 'remote' && this.remoteOpen ? (meta?.volumeName || this.pathStack[0]?.name || '') : '';
+    const viewingLocal = this.source === 'local';
+    const openVol =
+      this.source === 'remote' && this.remoteOpen
+        ? meta?.volumeName || this.pathStack[0]?.name || ''
+        : '';
+    const viewingServer = this.source === 'remote' && !this.remoteOpen;
     const servers = this.servers
       .map((s, i) => {
         const connected =
           this.remoteLoggedIn &&
           (s.object === connectedName ||
             (this.remoteLookup != null && s.node === this.remoteLookup.node && s.socket === this.remoteLookup.socket));
-        const serverSel = connected && !openVol ? 'selected' : '';
+        const serverSel = viewingServer && connected ? 'selected' : '';
         const kids =
           connected && volumes.length
             ? volumes
                 .map(
                   (v, vi) => `
-      <div class="side-item side-item--child ${openVol === v ? 'selected' : ''}" data-vol="${vi}" data-server="${i}">
+      <div class="side-item side-item--child ${!viewingLocal && openVol === v ? 'selected' : ''}" data-vol="${vi}">
         <span class="dot"></span>
         <span class="side-item-label">${this.escape(v)}</span>
       </div>`,
@@ -691,7 +695,7 @@ export class FinderWindow extends HTMLElement {
       .join('');
     side.innerHTML = `
       <div class="side-label">Favorites</div>
-      <div class="side-item ${localSel}" data-local>
+      <div class="side-item ${viewingLocal ? 'selected' : ''}" data-local>
         <span class="dot"></span>
         <span>Browser Share</span>
       </div>
