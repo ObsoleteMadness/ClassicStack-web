@@ -95,6 +95,10 @@ async function main(): Promise<void> {
   const vfs = new VirtualFS();
   let remote: AfpClient | null = null;
   let remoteNbpName = '';
+  let afpScanTimer: ReturnType<typeof setInterval> | null = null;
+  let afpScanBusy = false;
+  let lastAfpScanKey = '';
+  const AFP_SCAN_MS = 10_000;
 
   activityWindow.bind({
     traffic,
@@ -175,6 +179,70 @@ async function main(): Promise<void> {
     void applyNetboot(state);
   });
 
+  function afpServerKey(s: LookupResult): string {
+    return `${s.object}\0${s.network}.${s.node}:${s.socket}`;
+  }
+
+  function afpServerListKey(list: LookupResult[]): string {
+    return list.map(afpServerKey).sort().join('|');
+  }
+
+  function stopAfpServerScan(): void {
+    if (afpScanTimer != null) {
+      clearInterval(afpScanTimer);
+      afpScanTimer = null;
+    }
+    afpScanBusy = false;
+    lastAfpScanKey = '';
+  }
+
+  async function scanAfpServers(kind: 'auto' | 'manual'): Promise<LookupResult[]> {
+    if (!nbp) return [];
+    while (afpScanBusy) {
+      if (kind === 'auto' || !nbp) return [];
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (!nbp) return [];
+    afpScanBusy = true;
+    try {
+      const list = await nbp.lookup('=', 'AFPServer');
+      if (!nbp) return [];
+      const prevKey = lastAfpScanKey;
+      const key = afpServerListKey(list);
+      const changed = key !== prevKey;
+      lastAfpScanKey = key;
+      finder.setServers(list);
+      if (kind === 'manual' || !prevKey || changed) {
+        log.info(`NBP found ${list.length} AFPServer(s)`, 'nbp');
+      }
+      if (kind === 'auto' && prevKey && changed) {
+        finder.setStatus(
+          list.length ? `Found ${list.length} AFP server(s)` : 'No AFP servers on the network',
+        );
+      }
+      return list;
+    } finally {
+      afpScanBusy = false;
+    }
+  }
+
+  function startAfpServerScan(): void {
+    stopAfpServerScan();
+    void (async () => {
+      finder.setStatus('Looking up AFPServer…');
+      const list = await scanAfpServers('auto');
+      if (!nbp) return;
+      finder.setStatus(
+        list.length
+          ? `Found ${list.length} AFP server(s)`
+          : 'No AFP servers found — scanning every 10s',
+      );
+    })();
+    afpScanTimer = setInterval(() => {
+      void scanAfpServers('auto');
+    }, AFP_SCAN_MS);
+  }
+
   const host: FinderHost = {
     isConnected: () => serial.connected,
     nodeLabel: () =>
@@ -204,12 +272,14 @@ async function main(): Promise<void> {
         log.info(`LocalTalk node claimed: ${node} (net ${net})`, 'stack');
         finder.setStatus(`LocalTalk node claimed: ${node} (net ${net}). Sharing “Browser Share”.`);
         void applyNetboot(netboot.getState());
+        startAfpServerScan();
       });
       log.info('Serial connected; starting node claim', 'serial');
       await stack.startClaim();
     },
 
     async disconnectSerial() {
+      stopAfpServerScan();
       await remote?.close().catch(() => undefined);
       remote = null;
       remoteNbpName = '';
@@ -226,11 +296,7 @@ async function main(): Promise<void> {
     },
 
     async refreshNetwork() {
-      if (!nbp) return [];
-      const list = await nbp.lookup('=', 'AFPServer');
-      finder.setServers(list);
-      log.info(`NBP found ${list.length} AFPServer(s)`, 'nbp');
-      return list;
+      return scanAfpServers('manual');
     },
 
     async beginRemote(h: LookupResult) {

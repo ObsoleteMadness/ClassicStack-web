@@ -2412,9 +2412,7 @@ export class FinderWindow extends HTMLElement {
   private async onRefresh(): Promise<void> {
     this.setStatus('Looking up AFPServer…');
     const list = await this.host.refreshNetwork();
-    this.servers = list;
     this.setStatus(`Found ${list.length} AFP server(s)`);
-    this.renderSidebar();
   }
 
   private async navigateToPathIndex(index: number): Promise<void> {
