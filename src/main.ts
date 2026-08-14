@@ -46,7 +46,7 @@ async function main(): Promise<void> {
   const menubar = new AppMenuBar();
   const stage = document.createElement('div');
   stage.className = 'app-stage';
-  const finder = document.createElement('finder-window') as FinderWindow;
+  const finder = new FinderWindow();
   const logPanel = new LogPanel();
   logPanel.hidden = true;
   const activityWindow = new ActivityWindow();

@@ -65,7 +65,7 @@ export class AppMenuBar extends HTMLElement {
   private render(): void {
     const capturing = this.host?.pcap.capturing ?? false;
     const count = this.host?.pcap.packetCount ?? 0;
-    const showHidden = this.host?.finder?.getShowHiddenFiles() ?? false;
+    const showHidden = this.host?.finder?.getShowHiddenFiles?.() ?? false;
     this.innerHTML = `
       <div class="app-menubar__inner">
         <span class="app-menubar__brand">ClassicStack</span>
@@ -198,8 +198,8 @@ export class AppMenuBar extends HTMLElement {
     }
 
     if (act === 'toggle-show-hidden') {
-      const next = !(this.host.finder?.getShowHiddenFiles() ?? false);
-      this.host.finder?.setShowHiddenFiles(next);
+      const next = !(this.host.finder?.getShowHiddenFiles?.() ?? false);
+      this.host.finder?.setShowHiddenFiles?.(next);
       this.menuOpen = false;
       this.render();
       return;
@@ -210,7 +210,7 @@ export class AppMenuBar extends HTMLElement {
       this.render();
       void (async () => {
         await iconCache.clear();
-        this.host?.finder?.invalidateIcons();
+        this.host?.finder?.invalidateIcons?.();
         log.info('Cleared application icon cache', 'icons');
       })();
     }
