@@ -63,6 +63,18 @@ describe('tashtalk FCS', () => {
     // 0xFE → byte 31, bit 6
     expect(cmd[1 + 31]).toBe(1 << 6);
   });
+
+  it('discards on OmniTalk framing-error / abort escapes (0xFE / 0xFA)', () => {
+    const llap = new Uint8Array([0xfe, 0xfe, 0x81]);
+    const [b1, b2] = fcsBytes(llap);
+    const dec = new TashTalkDecoder();
+    dec.feed(new Uint8Array([0xfe, 0xfe, 0x00, 0xfe]));
+    expect(dec.take()).toBeUndefined();
+    dec.feed(new Uint8Array([...llap, b1, b2, 0x00, 0xfd]));
+    expect(dec.take()).toEqual(llap);
+    dec.feed(new Uint8Array([0x01, 0x00, 0xfa, ...llap, b1, b2, 0x00, 0xfd]));
+    expect(dec.take()).toEqual(llap);
+  });
 });
 
 describe('ddp', () => {

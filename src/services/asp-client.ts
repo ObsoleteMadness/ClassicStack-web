@@ -20,6 +20,12 @@ export class AspSession {
   /** Pending ASP Write data keyed by sequence (answered by WriteContinue). */
   private pendingWrites = new Map<number, Uint8Array>();
   private wssReady = false;
+  /**
+   * System 7 ASP accepts one Command/Write at a time and silently drops any
+   * other sequence (OmniTalk errata). Finder icon prefetch used to pipeline
+   * Enumerate + GetFileDirParms; the Mac then answered none of them.
+   */
+  private cmdTail: Promise<unknown> = Promise.resolve();
   opened = false;
   /** Fired after an SPAttention TReq is acked (attention code in the ASP word). */
   onAttention: ((code: number) => void) | null = null;
@@ -153,24 +159,40 @@ export class AspSession {
     return this.seq;
   }
 
+  /** Run Command/Write strictly one-at-a-time (same seq space). */
+  private enqueueCmd<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.cmdTail.then(fn, fn);
+    this.cmdTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   async command(
     block: Uint8Array,
     opts?: { bitmap?: number; timeoutMs?: number },
   ): Promise<{ result: number; data: Uint8Array }> {
     if (!this.opened) throw new Error('ASP session not open');
-    const seq = this.nextSeq();
-    const resp = await this.atp.request({
-      destNetwork: this.destNetwork,
-      destNode: this.destNode,
-      destSocket: this.destSocket,
-      srcSocket: this.wssSocket,
-      userData: asp.packCommand(this.sessionId, seq),
-      data: block,
-      xo: true,
-      bitmap: opts?.bitmap ?? 0x01,
-      timeoutMs: opts?.timeoutMs,
+    return this.enqueueCmd(async () => {
+      const seq = this.nextSeq();
+      log.trace(
+        `ASP Command sess=${this.sessionId} seq=${seq} ${block.length}b`,
+        'asp',
+      );
+      const resp = await this.atp.request({
+        destNetwork: this.destNetwork,
+        destNode: this.destNode,
+        destSocket: this.destSocket,
+        srcSocket: this.wssSocket,
+        userData: asp.packCommand(this.sessionId, seq),
+        data: block,
+        xo: true,
+        bitmap: opts?.bitmap ?? 0x01,
+        timeoutMs: opts?.timeoutMs,
+      });
+      return { result: u32ToI32(resp.userData), data: resp.data };
     });
-    return { result: u32ToI32(resp.userData), data: resp.data };
   }
 
   /**
@@ -182,24 +204,26 @@ export class AspSession {
   async write(cmdBlock: Uint8Array, writeData: Uint8Array): Promise<{ result: number; data: Uint8Array }> {
     if (!this.opened) throw new Error('ASP session not open');
     this.ensureWssHandler();
-    const seq = this.nextSeq();
-    this.pendingWrites.set(seq, writeData);
-    try {
-      const resp = await this.atp.request({
-        destNetwork: this.destNetwork,
-        destNode: this.destNode,
-        destSocket: this.destSocket,
-        srcSocket: this.wssSocket,
-        userData: asp.packWrite(this.sessionId, seq),
-        data: cmdBlock,
-        xo: true,
-        timeoutMs: 15000,
-        bitmap: 0x01,
-      });
-      return { result: u32ToI32(resp.userData), data: resp.data };
-    } finally {
-      this.pendingWrites.delete(seq);
-    }
+    return this.enqueueCmd(async () => {
+      const seq = this.nextSeq();
+      this.pendingWrites.set(seq, writeData);
+      try {
+        const resp = await this.atp.request({
+          destNetwork: this.destNetwork,
+          destNode: this.destNode,
+          destSocket: this.destSocket,
+          srcSocket: this.wssSocket,
+          userData: asp.packWrite(this.sessionId, seq),
+          data: cmdBlock,
+          xo: true,
+          timeoutMs: 15000,
+          bitmap: 0x01,
+        });
+        return { result: u32ToI32(resp.userData), data: resp.data };
+      } finally {
+        this.pendingWrites.delete(seq);
+      }
+    });
   }
 
   private stopTickle(): void {

@@ -82,6 +82,8 @@ export class TashTalkDecoder {
         if (b === ESC_NULL) {
           b = 0x00;
         } else {
+          // OmniTalk: 0xFD end-of-frame; 0xFE/0xFA/0xFC (and anything else)
+          // abort the accumulated frame. Firmware does not send a start marker.
           if (b === ESC_END) this.completeFrame();
           this.rdBuf = [];
           continue;
