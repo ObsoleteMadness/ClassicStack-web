@@ -6,6 +6,9 @@ import { escapeHostFilename, unescapeHostFilename } from '../protocol/host-filen
 import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appledouble';
 import { be32 } from '../protocol/binary';
 
+export type VfsChange = { parentIds: number[] };
+export type VfsChangeListener = (change: VfsChange) => void;
+
 export interface VNode {
   id: number;
   parentId: number;
@@ -16,14 +19,46 @@ export interface VNode {
   finderInfo: Uint8Array;
   createDate: number;
   modDate: number;
+  /** Enumerated fork sizes when `data`/`resource` are not loaded (remote AFP). */
+  dataBytes?: number;
+  resourceBytes?: number;
+}
+
+/** Finder catalog: local IndexedDB share and remote AFP volumes both implement this. */
+export interface Catalog {
+  rootId(): number;
+  subscribe(fn: VfsChangeListener): () => void;
+  beginBatch(): void;
+  endBatch(): void;
+  get(id: number): Promise<VNode | undefined>;
+  children(parentId: number): Promise<VNode[]>;
+  lookup(parentId: number, name: string): Promise<VNode | undefined>;
+  mkdir(parentId: number, name: string): Promise<VNode>;
+  ensureDir(parentId: number, name: string): Promise<VNode>;
+  createFile(
+    parentId: number,
+    name: string,
+    data: Uint8Array,
+    resource?: Uint8Array,
+    finderInfo?: Uint8Array,
+  ): Promise<VNode>;
+  put(node: VNode): Promise<void>;
+  rename(id: number, newName: string): Promise<void>;
+  move(id: number, newParent: number): Promise<void>;
+  remove(id: number): Promise<void>;
+  importDataTransfer(
+    parentId: number,
+    dt: DataTransfer,
+    opts?: {
+      onScan?: (total: number) => void;
+      onProgress?: (done: number, total: number) => void;
+    },
+  ): Promise<number>;
 }
 
 const ROOT_ID = 2;
 
-export type VfsChange = { parentIds: number[] };
-export type VfsChangeListener = (change: VfsChange) => void;
-
-export class VirtualFS {
+export class VirtualFS implements Catalog {
   private db!: IDBPDatabase;
   private nextId = 100;
   private listeners = new Set<VfsChangeListener>();
