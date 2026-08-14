@@ -97,6 +97,7 @@ export class FinderWindow extends HTMLElement {
   private folderLoadGen = new Map<number, number>();
   private columnLoading = false;
   private columnLoadGen = 0;
+  private folderOpening = false;
   private listChildCache = new Map<number, VNode[]>();
   /** Skip pushState while applying browser back/forward. */
   private historyQuiet = false;
@@ -178,6 +179,7 @@ export class FinderWindow extends HTMLElement {
     this.columnChildren = [];
     this.columnLoading = false;
     this.columnLoadGen++;
+    this.folderOpening = false;
     this.iconUrls.clear();
     this.iconLoadGen++;
   }
@@ -644,6 +646,9 @@ export class FinderWindow extends HTMLElement {
         <button class="btn primary" data-act="connect">${this.host.isConnected() ? 'Disconnect' : 'Connect Serial'}</button>
         <button class="btn" data-act="refresh" ${this.host.isConnected() ? '' : 'disabled'}>Refresh Network</button>
         <button class="btn" data-act="mkdir">New Folder</button>
+        <button class="btn" data-act="cut">Cut</button>
+        <button class="btn" data-act="copy">Copy</button>
+        <button class="btn" data-act="paste" ${this.clipboard ? '' : 'disabled'}>Paste</button>
         <button class="btn" data-act="delete">Delete</button>
         <button class="btn ${this.showProps ? 'active' : ''}" data-act="props" aria-pressed="${this.showProps}">Properties</button>
         <button class="btn" data-act="download">Download Zip</button>
@@ -682,6 +687,11 @@ export class FinderWindow extends HTMLElement {
     this.renderContent();
     this.renderContextMenu();
     this.bindToolbarExtras();
+  }
+
+  private syncClipboardButtons(): void {
+    const paste = this.querySelector('[data-act="paste"]') as HTMLButtonElement | null;
+    if (paste) paste.disabled = !this.clipboard;
   }
 
   private syncPropsButton(): void {
@@ -867,6 +877,13 @@ export class FinderWindow extends HTMLElement {
         const sel = this.selectedNode();
         if (sel) content.insertAdjacentHTML('beforeend', this.itemInfoHtml(sel, { variant: 'dialog' }));
       }
+    }
+
+    if (this.folderOpening && this.view !== 'column') {
+      content.insertAdjacentHTML(
+        'beforeend',
+        `<div class="content-loading">${this.spinnerHtml()}<span>Loading</span></div>`,
+      );
     }
 
     if (this.view === 'column') {
@@ -1271,9 +1288,10 @@ export class FinderWindow extends HTMLElement {
     if (ctxItem) {
       e.preventDefault();
       const action = ctxItem.getAttribute('data-ctx')!;
+      const ctxTarget = this.contextMenu?.targetId ?? null;
       this.contextMenu = null;
       this.renderContextMenu();
-      await this.handleContextAction(action);
+      await this.handleContextAction(action, ctxTarget);
       return;
     }
     if (this.contextMenu) {
@@ -1380,15 +1398,30 @@ export class FinderWindow extends HTMLElement {
       const beforePath = this.pathNamesForUrl().join('/');
       this.pathStack = this.pathStack.slice(0, colIndex + 1);
       this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
-      this.columnLoading = false;
       if (isDir) {
-        const node = this.findInColumns(id) ?? this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+        const node = this.findInColumns(id) ?? this.findNodeAnywhere(id);
         if (node?.isDir) {
           this.pathStack.push({ id: node.id, name: node.name });
           this.cwd = node.id;
           await this.loadColumnFolder(node.id, colIndex);
+        } else {
+          this.columnLoading = true;
+          this.renderPath();
+          this.renderContent();
+          const fetched = await this.vfs.get(id);
+          if (fetched?.isDir) {
+            this.pathStack.push({ id: fetched.id, name: fetched.name });
+            this.cwd = fetched.id;
+            await this.loadColumnFolder(fetched.id, colIndex);
+          } else {
+            this.columnLoading = false;
+            this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+            this.renderPath();
+            this.renderContent();
+          }
         }
       } else {
+        this.columnLoading = false;
         this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
         this.nodes = this.columnChildren[this.columnChildren.length - 1] ?? this.nodes;
         this.renderPath();
@@ -1439,6 +1472,7 @@ export class FinderWindow extends HTMLElement {
       return;
     }
     this.expandedIds.add(id);
+    this.selectedId = id;
     const cached = this.listChildCache.get(id);
     if (cached) {
       this.renderContent();
@@ -1509,7 +1543,14 @@ export class FinderWindow extends HTMLElement {
     this.pathStack.push({ id: node.id, name: node.name });
     this.selectedId = null;
     this.expandedIds.clear();
-    await this.reload();
+    this.folderOpening = true;
+    this.renderPath();
+    this.renderContent();
+    try {
+      await this.reload();
+    } finally {
+      this.folderOpening = false;
+    }
     this.renderPath();
     this.renderContent();
     this.syncHistory();
@@ -2293,6 +2334,15 @@ export class FinderWindow extends HTMLElement {
       case 'mkdir':
         await this.onMkdir();
         break;
+      case 'cut':
+        await this.cutSelection();
+        break;
+      case 'copy':
+        await this.copySelection();
+        break;
+      case 'paste':
+        await this.pasteClipboard();
+        break;
       case 'delete':
         await this.onDelete();
         break;
@@ -2522,9 +2572,10 @@ export class FinderWindow extends HTMLElement {
       this.clipboard = {
         mode,
         items: [item],
-        source: mode === 'cut' ? this.vfs : this.vfs,
+        source: this.vfs,
         sourceIds: [node.id],
       };
+      this.syncClipboardButtons();
       this.setStatus(
         `${mode === 'cut' ? 'Cut' : 'Copied'} “${node.name}” — paste in this share or another`,
       );
@@ -2647,7 +2698,7 @@ export class FinderWindow extends HTMLElement {
     root.innerHTML = `<div class="ctx-menu" style="left:${x}px;top:${y}px">${items.filter(Boolean).join('')}</div>`;
   }
 
-  private async handleContextAction(action: string): Promise<void> {
+  private async handleContextAction(action: string, targetId: number | null = null): Promise<void> {
     switch (action) {
       case 'rename':
         this.startRename();
@@ -2675,7 +2726,7 @@ export class FinderWindow extends HTMLElement {
         await this.copySelection();
         break;
       case 'paste':
-        await this.pasteClipboard();
+        await this.pasteClipboard(await this.pasteDestFromTarget(targetId));
         break;
       case 'mkdir':
         await this.onMkdir();
@@ -2683,7 +2734,14 @@ export class FinderWindow extends HTMLElement {
     }
   }
 
-  private async pasteClipboard(): Promise<void> {
+  private async pasteDestFromTarget(targetId: number | null): Promise<number> {
+    if (targetId == null) return this.cwd;
+    const node = this.findNodeAnywhere(targetId) ?? (await this.vfs.get(targetId));
+    if (node?.isDir) return node.id;
+    return node?.parentId ?? this.cwd;
+  }
+
+  private async pasteClipboard(destParent = this.cwd): Promise<void> {
     if (!this.clipboard?.items.length) return;
     const clip = this.clipboard;
     this.setStatus('Pasting…', { busy: true });
@@ -2692,23 +2750,23 @@ export class FinderWindow extends HTMLElement {
       if (clip.mode === 'cut' && sameShare) {
         for (const id of clip.sourceIds) {
           const src = await this.vfs.get(id);
-          if (!src || src.parentId === this.cwd) continue;
-          if (!this.isValidMoveTarget(id, this.cwd)) {
+          if (!src || src.parentId === destParent) continue;
+          if (!this.isValidMoveTarget(id, destParent)) {
             this.setStatus('Can’t move an item into itself');
             return;
           }
-          const clash = await this.vfs.lookup(this.cwd, src.name);
+          const clash = await this.vfs.lookup(destParent, src.name);
           if (clash && clash.id !== id) {
-            const name = await this.uniqueChildName(this.cwd, src.name);
+            const name = await this.uniqueChildName(destParent, src.name);
             await this.vfs.rename(id, name);
           }
-          await this.vfs.move(id, this.cwd);
+          await this.vfs.move(id, destParent);
         }
       } else {
         this.vfs.beginBatch();
         try {
           for (const item of clip.items) {
-            await this.writeClipNode(this.vfs, this.cwd, item);
+            await this.writeClipNode(this.vfs, destParent, item);
           }
         } finally {
           this.vfs.endBatch();
@@ -2720,6 +2778,7 @@ export class FinderWindow extends HTMLElement {
         }
       }
       if (clip.mode === 'cut') this.clipboard = null;
+      this.syncClipboardButtons();
       await this.reload();
       this.renderContent();
       this.setStatus('Paste complete');
