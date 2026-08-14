@@ -679,7 +679,7 @@ export class FinderWindow extends HTMLElement {
                 .join('')
             : '';
         const eject = connected
-          ? `<button type="button" class="side-eject" data-eject="${i}" title="Disconnect">Eject</button>`
+          ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">⏏️</button>`
           : '';
         return `
       <div class="side-item ${serverSel}" data-server="${i}">
