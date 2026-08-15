@@ -201,10 +201,15 @@ export class RemoteVfs implements Catalog {
   }
 
   async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
-    return importDataTransferInto(this, parentId, dt, (p, file, onBytes) => this.importBlob(p, file, onBytes), opts);
+    return importDataTransferInto(this, parentId, dt, (p, file, onBytes, resource) => this.importBlob(p, file, onBytes, resource), opts);
   }
 
-  private async importBlob(parentId: number, file: File, onBytes?: (n: number) => void): Promise<VNode> {
+  private async importBlob(
+    parentId: number,
+    file: File,
+    onBytes?: (n: number) => void,
+    resource?: Uint8Array,
+  ): Promise<VNode> {
     const buf = new Uint8Array(await file.arrayBuffer());
     const name = unescapeHostFilename(file.name);
     if (name.startsWith('._') && name.length > 2) {
@@ -229,7 +234,7 @@ export class RemoteVfs implements Catalog {
       const ad = parseAppleDouble(buf);
       if (ad) return this.createFile(parentId, name, new Uint8Array(), ad.resource, ad.finderInfo, onBytes);
     }
-    return this.createFile(parentId, name, buf, undefined, undefined, onBytes);
+    return this.createFile(parentId, name, buf, resource, undefined, onBytes);
   }
 
   private async hydrateForks(node: VNode, onBytes?: (n: number) => void): Promise<void> {

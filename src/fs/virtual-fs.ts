@@ -290,7 +290,12 @@ export class VirtualFS implements Catalog {
     return node;
   }
 
-  async importBlob(parentId: number, file: File, onBytes?: (n: number) => void): Promise<VNode> {
+  async importBlob(
+    parentId: number,
+    file: File,
+    onBytes?: (n: number) => void,
+    resource?: Uint8Array,
+  ): Promise<VNode> {
     const buf = await readBlobProgress(file, onBytes);
     // Host FS may store reserved Mac chars as OmniTalk "0xNN" tokens (Icon\r → Icon0x0D).
     const name = unescapeHostFilename(file.name);
@@ -323,16 +328,18 @@ export class VirtualFS implements Catalog {
 
     // Plain data fork: keep resource/FinderInfo if a sidecar arrived first, and
     // absorb any leftover ._Name sibling from an earlier incomplete import.
+    const hostResource = resource?.length ? resource : undefined;
     const existing = await this.lookup(parentId, name);
     if (existing && !existing.isDir) {
       existing.data = buf;
+      if (hostResource && existing.resource.length === 0) existing.resource = hostResource;
       existing.modDate = macTime();
       await this.put(existing);
       await this.consumeNamedSidecar(parentId, name, existing);
       return existing;
     }
 
-    const node = await this.createFile(parentId, name, buf);
+    const node = await this.createFile(parentId, name, buf, hostResource);
     await this.consumeNamedSidecar(parentId, name, node);
     return node;
   }
@@ -383,7 +390,7 @@ export class VirtualFS implements Catalog {
    * Notifications are batched for the whole import.
    */
   async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
-    return importDataTransferInto(this, parentId, dt, (p, file, onBytes) => this.importBlob(p, file, onBytes), opts);
+    return importDataTransferInto(this, parentId, dt, (p, file, onBytes, resource) => this.importBlob(p, file, onBytes, resource), opts);
   }
 
   async rename(id: number, newName: string): Promise<void> {

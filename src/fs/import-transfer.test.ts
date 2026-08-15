@@ -5,7 +5,13 @@ import { fileURLToPath } from 'node:url';
 import { be16 } from '../protocol/binary';
 import { fromMacTime, hfsTimeToAfp } from '../protocol/afp/constants';
 import { expandIncoming } from './expand-incoming';
-import { importExpandedTree } from './import-transfer';
+import {
+  importDataTransferInto,
+  importExpandedTree,
+  namedResourceForkPath,
+  readNamedResourceFork,
+  shouldProbeNamedResourceFork,
+} from './import-transfer';
 import { makeFinderInfo } from './mac-file';
 import type { Catalog, VNode } from './virtual-fs';
 
@@ -135,3 +141,163 @@ describe('hfsTimeToAfp', () => {
     expect(fromMacTime(hfsTimeToAfp(0xb3d2a000)).toISOString().slice(0, 10)).toBe('1999-08-08');
   });
 });
+
+describe('named resource fork', () => {
+  it('builds the Chrome/macOS parallel path', () => {
+    expect(namedResourceForkPath('SimpleText')).toBe('SimpleText/..namedfork/rsrc');
+  });
+
+  it('skips AppleDouble sidecars and named-fork directories', () => {
+    expect(shouldProbeNamedResourceFork('SimpleText')).toBe(true);
+    expect(shouldProbeNamedResourceFork('._SimpleText')).toBe(false);
+    expect(shouldProbeNamedResourceFork('..namedfork')).toBe(false);
+    expect(shouldProbeNamedResourceFork('')).toBe(false);
+  });
+
+  it('reads a non-empty named fork and ignores missing or empty ones', async () => {
+    const rsrc = Uint8Array.of(0xca, 0xfe, 0xba, 0xbe);
+    const dir = mockDirectoryEntry({
+      SimpleText: rsrc,
+      Empty: new Uint8Array(),
+    });
+    expect([...(await readNamedResourceFork(dir, 'SimpleText'))!]).toEqual([...rsrc]);
+    expect(await readNamedResourceFork(dir, 'Empty')).toBeNull();
+    expect(await readNamedResourceFork(dir, 'Missing')).toBeNull();
+    expect(await readNamedResourceFork(dir, '._SimpleText')).toBeNull();
+  });
+
+  it('imports a folder drop with the host resource fork attached to the data file', async () => {
+    const rsrc = Uint8Array.of(0x00, 0x00, 0x01, 0x00);
+    const folder = mockDirectoryEntry(
+      { SimpleText: rsrc },
+      [
+        mockFileEntry('SimpleText', ascii('hello')),
+        mockFileEntry('Notes.txt', ascii('hi')),
+      ],
+      'Apps',
+    );
+    const imported: { name: string; resource?: Uint8Array }[] = [];
+    await importDataTransferInto(
+      mockImportFs(),
+      2,
+      mockDataTransfer([folder]),
+      async (_parent, file, _onBytes, resource) => {
+        imported.push({ name: file.name, resource });
+      },
+    );
+    const app = imported.find((f) => f.name === 'SimpleText');
+    const notes = imported.find((f) => f.name === 'Notes.txt');
+    expect(app).toBeDefined();
+    expect([...(app!.resource ?? [])]).toEqual([...rsrc]);
+    expect(notes?.resource).toBeUndefined();
+  });
+});
+
+function mockFileEntry(name: string, data: Uint8Array): FileSystemFileEntry {
+  const file = new File([data], name);
+  return {
+    isFile: true,
+    isDirectory: false,
+    name,
+    fullPath: `/${name}`,
+    filesystem: null as unknown as FileSystem,
+    file(ok: (f: File) => void) {
+      ok(file);
+    },
+    getParent(_ok: (p: FileSystemDirectoryEntry) => void, err?: (e: DOMException) => void) {
+      err?.(new DOMException('no parent'));
+    },
+  } as FileSystemFileEntry;
+}
+
+function mockDirectoryEntry(
+  namedForks: Record<string, Uint8Array>,
+  children: FileSystemEntry[] = [],
+  name = 'Folder',
+): FileSystemDirectoryEntry {
+  return {
+    isFile: false,
+    isDirectory: true,
+    name,
+    fullPath: `/${name}`,
+    filesystem: null as unknown as FileSystem,
+    createReader() {
+      let sent = false;
+      return {
+        readEntries(ok: (batch: FileSystemEntry[]) => void) {
+          if (sent) {
+            ok([]);
+            return;
+          }
+          sent = true;
+          ok(children);
+        },
+      };
+    },
+    getFile(
+      path: string,
+      _opts: FileSystemFlags | undefined,
+      ok: (entry: FileSystemFileEntry) => void,
+      err?: (e: DOMException) => void,
+    ) {
+      const suffix = '/..namedfork/rsrc';
+      if (!path.endsWith(suffix)) {
+        err?.(new DOMException('not found'));
+        return;
+      }
+      const fileName = path.slice(0, -suffix.length);
+      const data = namedForks[fileName];
+      if (data == null) {
+        err?.(new DOMException('not found'));
+        return;
+      }
+      ok(mockFileEntry(fileName, data));
+    },
+    getDirectory() {
+      throw new Error('unused');
+    },
+    getParent(_ok: (p: FileSystemDirectoryEntry) => void, err?: (e: DOMException) => void) {
+      err?.(new DOMException('no parent'));
+    },
+  } as FileSystemDirectoryEntry;
+}
+
+function mockDataTransfer(entries: FileSystemEntry[]): DataTransfer {
+  const items = entries.map((entry) => ({
+    kind: 'file',
+    webkitGetAsEntry: () => entry,
+  }));
+  return {
+    items: Object.assign(items, { length: items.length }),
+    files: [] as unknown as FileList,
+  } as unknown as DataTransfer;
+}
+
+function mockImportFs() {
+  let nextId = 10;
+  return {
+    beginBatch() {},
+    endBatch() {},
+    async lookup() {
+      return undefined;
+    },
+    async remove() {},
+    async put() {},
+    async createFile() {
+      throw new Error('unused');
+    },
+    async ensureDir(_parentId: number, name: string) {
+      return {
+        id: nextId++,
+        parentId: 2,
+        name,
+        isDir: true,
+        data: new Uint8Array(),
+        resource: new Uint8Array(),
+        finderInfo: new Uint8Array(32),
+        createDate: 1,
+        modDate: 1,
+      };
+    },
+  };
+}
