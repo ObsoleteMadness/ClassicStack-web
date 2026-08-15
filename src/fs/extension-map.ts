@@ -29,6 +29,7 @@ export const DEFAULT_EXTENSION_MAP: readonly ExtensionMapping[] = [
   { extension: 'doc', creator: 'MSWD', type: 'WDBN', comment: 'Word Document' },
   { extension: 'txt', creator: 'ttxt', type: 'TEXT', comment: 'ASCII Text' },
   { extension: 'text', creator: 'ttxt', type: 'TEXT', comment: 'ASCII Text' },
+  { extension: 'ttro', creator: 'ttxt', type: 'ttro', comment: 'TeachText Read-Only' },
   { extension: 'md', creator: 'ttxt', type: 'TEXT', comment: 'Markdown Text' },
   { extension: 'wav', creator: 'TVOD', type: 'WAVE', comment: 'Windows WAV Sound' },
   { extension: 'mp3', creator: 'TVOD', type: 'MPG3', comment: 'MPEG-3 Audio' },

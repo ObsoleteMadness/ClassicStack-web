@@ -1,5 +1,6 @@
 import { downloadBytes, type PcapCapture } from '../util/pcap';
 import { log } from '../util/logger';
+import { loadPrefs, savePrefs } from '../util/prefs';
 import type { LogPanel } from './log-panel';
 import type { ActivityWindow } from './activity-window';
 import type { NetbootDialog } from './netboot-dialog';
@@ -71,6 +72,7 @@ export class AppMenuBar extends HTMLElement {
     const count = this.host?.pcap.packetCount ?? 0;
     const showHidden = this.host?.finder?.getShowHiddenFiles?.() ?? false;
     const autoExpand = this.host?.finder?.getAutoExpandFiles?.() ?? false;
+    const zipStyle = loadPrefs().zipExportStyle;
     this.innerHTML = `
       <div class="app-menubar__inner">
         <span class="app-menubar__brand">ClassicStack</span>
@@ -114,6 +116,16 @@ export class AppMenuBar extends HTMLElement {
                 <span class="app-menu__check">${autoExpand ? '✓' : ''}</span>
                 Auto-expand files
               </button>
+              <hr />
+              <button type="button" role="menuitemradio" aria-checked="${zipStyle === 'appledouble'}" data-act="zip-appledouble" class="app-menu__item">
+                <span class="app-menu__check">${zipStyle === 'appledouble' ? '✓' : ''}</span>
+                AppleDouble zip
+              </button>
+              <button type="button" role="menuitemradio" aria-checked="${zipStyle === 'macosx'}" data-act="zip-macosx" class="app-menu__item">
+                <span class="app-menu__check">${zipStyle === 'macosx' ? '✓' : ''}</span>
+                Mac OS X zip
+              </button>
+              <hr />
               <button type="button" role="menuitem" data-act="extension-editor" class="app-menu__item">
                 <span class="app-menu__check"></span>
                 Extension editor…
@@ -228,6 +240,12 @@ export class AppMenuBar extends HTMLElement {
       const next = !(this.host.finder?.getAutoExpandFiles?.() ?? false);
       this.host.finder?.setAutoExpandFiles?.(next);
       this.menuOpen = false;
+      this.render();
+      return;
+    }
+
+    if (act === 'zip-appledouble' || act === 'zip-macosx') {
+      savePrefs({ zipExportStyle: act === 'zip-macosx' ? 'macosx' : 'appledouble' });
       this.render();
       return;
     }

@@ -3,7 +3,7 @@ import type { LookupResult } from '../services/nbp';
 import type { AfpCredentials, AfpServerInfo } from '../services/afp-client/client';
 import { fromMacTime } from '../protocol/afp/constants';
 import { decodeMacRoman } from '../protocol/macroman';
-import { buildAppleDouble, zipStore } from '../fs/appledouble';
+import { buildAppleDouble, zipSidecarPath, zipStore, type ZipExportStyle } from '../fs/appledouble';
 import { formatBytes } from './format-bytes';
 import {
   iconCache,
@@ -15,6 +15,7 @@ import {
 } from '../fs/icon-cache';
 import { expandArchiveFile, expandFailureMessage, isExpandableArchive, type ExpandedNode } from '../fs/expand-incoming';
 import { importExpandedTree } from '../fs/import-transfer';
+import { filenameExtension } from '../fs/extension-map';
 import { loadPrefs, savePrefs } from '../util/prefs';
 import { log } from '../util/logger';
 import { uiIcons } from './lucide-icon';
@@ -40,7 +41,7 @@ export type ViewMode = 'icon' | 'list' | 'column';
 export type SortKey = 'name' | 'modified' | 'size';
 
 /** Finder file types that open in the Quick Look overlay. */
-const PREVIEW_TEXT_TYPES = new Set(['TEXT']);
+const PREVIEW_TEXT_TYPES = new Set(['TEXT', 'ttro']);
 const PREVIEW_MAX_BYTES = 512 * 1024;
 
 export interface FinderHost {
@@ -1108,6 +1109,8 @@ export class FinderWindow extends HTMLElement {
 
     if (this.view === 'column') {
       this.scrollColumnsToEnd();
+    } else {
+      this.refreshPropsPanel();
     }
     this.focusRenameInput();
     if (iconItems.length) this.prefetchIcons(iconItems);
@@ -1137,13 +1140,12 @@ export class FinderWindow extends HTMLElement {
       this.renderContent();
       return;
     }
-    const content = this.querySelector('.content');
-    if (!content) return;
-    content.querySelectorAll('.item-info--dialog').forEach((el) => el.remove());
-    if (this.showProps) {
-      const sel = this.selectedNode();
-      if (sel) content.insertAdjacentHTML('beforeend', this.itemInfoHtml(sel, { variant: 'dialog' }));
-    }
+    const layer = this.querySelector('.props-layer');
+    if (!layer) return;
+    layer.innerHTML = '';
+    if (!this.showProps) return;
+    const sel = this.selectedNode();
+    if (sel) layer.insertAdjacentHTML('beforeend', this.itemInfoHtml(sel, { variant: 'dialog' }));
   }
 
   private focusRenameInput(): void {
@@ -1821,6 +1823,9 @@ export class FinderWindow extends HTMLElement {
   private async toggleExpand(id: number): Promise<void> {
     const row = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
     const disclose = row?.querySelector('[data-disclose]') as HTMLElement | null;
+    if (this.dragDepth === 0 && this.dragNodeId == null) {
+      this.querySelectorAll('.list-table tr.drop-target').forEach((el) => el.classList.remove('drop-target'));
+    }
 
     if (this.expandedIds.has(id)) {
       this.expandedIds.delete(id);
@@ -1834,7 +1839,10 @@ export class FinderWindow extends HTMLElement {
     }
     this.expandedIds.add(id);
     this.selectedId = id;
-    if (row) this.paintSelection(row);
+    if (row) {
+      this.paintSelection(row);
+      if (this.dragDepth === 0 && this.dragNodeId == null) row.classList.remove('drop-target');
+    }
     this.setDiscloseState(disclose, 'open');
 
     const cached = this.listChildCache.get(id);
@@ -2414,7 +2422,7 @@ export class FinderWindow extends HTMLElement {
       .join('');
     row.insertAdjacentHTML('afterend', html);
     this.setDiscloseState(row.querySelector('[data-disclose]'), 'open');
-    this.paintDropTarget(folderId, false);
+    if (this.dragDepth > 0 || this.dragNodeId != null) this.paintDropTarget(folderId, false);
     this.prefetchIcons(
       kids.map((n) => ({
         key: String(n.id),
@@ -3012,7 +3020,8 @@ export class FinderWindow extends HTMLElement {
 
   private isPreviewable(node: VNode | null | undefined): node is VNode {
     if (!node || node.isDir) return false;
-    return PREVIEW_TEXT_TYPES.has(readTypeCreator(node.finderInfo).type);
+    if (PREVIEW_TEXT_TYPES.has(readTypeCreator(node.finderInfo).type)) return true;
+    return filenameExtension(node.name) === 'ttro';
   }
 
   private isExpandableArchive(node: VNode | null | undefined): node is VNode {
@@ -3301,6 +3310,7 @@ export class FinderWindow extends HTMLElement {
               transferActivity.setTotal(jobId, listed);
             }
           : undefined,
+        loadPrefs().zipExportStyle,
       );
       downloadZipEntries(zipName, entries);
       transferActivity.finish(jobId);
@@ -4019,10 +4029,11 @@ export function downloadAppleDoubleZip(
   data: Uint8Array,
   resource: Uint8Array,
   finderInfo: Uint8Array,
+  style: ZipExportStyle = loadPrefs().zipExportStyle,
 ): void {
   downloadZipEntries(name, [
     { name, data },
-    { name: `._${name}`, data: buildAppleDouble(finderInfo, resource) },
+    { name: zipSidecarPath(name, style), data: buildAppleDouble(finderInfo, resource) },
   ]);
 }
 
@@ -4045,6 +4056,7 @@ export async function collectFsZipEntries(
   prefix = '',
   onBytes?: (n: number) => void,
   onAddTotal?: (n: number) => void,
+  style: ZipExportStyle = 'appledouble',
 ): Promise<{ name: string; data: Uint8Array }[]> {
   const out: { name: string; data: Uint8Array }[] = [];
   const creditRead = vfs.reportsChunkedBytes ? onBytes : undefined;
@@ -4054,7 +4066,7 @@ export async function collectFsZipEntries(
     const dirPrefix = prefix ? `${prefix}${node.name}/` : `${node.name}/`;
     for (const kid of kids) {
       if (!kid.isDir) onAddTotal?.(nodeByteSize(kid));
-      out.push(...(await collectFsZipEntries(vfs, kid, dirPrefix, onBytes, onAddTotal)));
+      out.push(...(await collectFsZipEntries(vfs, kid, dirPrefix, onBytes, onAddTotal, style)));
     }
     return out;
   }
@@ -4063,7 +4075,7 @@ export async function collectFsZipEntries(
   const base = prefix ? `${prefix}${full.name}` : full.name;
   out.push({ name: base, data: full.data });
   out.push({
-    name: prefix ? `${prefix}._${full.name}` : `._${full.name}`,
+    name: zipSidecarPath(base, style),
     data: buildAppleDouble(full.finderInfo, full.resource),
   });
   return out;

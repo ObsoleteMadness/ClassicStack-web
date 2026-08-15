@@ -1,17 +1,22 @@
 /** Persisted UI preferences (localStorage). */
 
+import type { ZipExportStyle } from '../fs/appledouble';
+
 const STORAGE_KEY = 'classicstack.prefs';
 
 export interface AppPrefs {
   /** When false, Finder hides items with the AppleDouble/Finder kIsInvisible flag (and Icon\\r). */
   showHiddenFiles: boolean;
-  /** When true, dropped .hqx / MacBinary .bin / StuffIt .sit files are decoded. */
+  /** When true, dropped .hqx / MacBinary .bin / StuffIt .sit / ZIP .zip files are decoded. */
   autoExpandFiles: boolean;
+  /** Zip download layout: AppleDouble `._` beside files, or Mac OS X `__MACOSX/` folder. */
+  zipExportStyle: ZipExportStyle;
 }
 
 const DEFAULTS: AppPrefs = {
   showHiddenFiles: false,
   autoExpandFiles: true,
+  zipExportStyle: 'appledouble',
 };
 
 export function loadPrefs(): AppPrefs {
@@ -28,6 +33,7 @@ export function loadPrefs(): AppPrefs {
         typeof parsed.autoExpandFiles === 'boolean'
           ? parsed.autoExpandFiles
           : DEFAULTS.autoExpandFiles,
+      zipExportStyle: parsed.zipExportStyle === 'macosx' ? 'macosx' : DEFAULTS.zipExportStyle,
     };
   } catch {
     return { ...DEFAULTS };

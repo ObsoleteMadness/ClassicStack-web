@@ -10,7 +10,7 @@ Browser AppleTalk / AFP stack over **WebSerial → TashTalk → LocalTalk**.
 - Act as an **AFP client** to browse/upload/download/rename/delete on remote shares
 - **Netboot** (AppleTalk Boot Protocol + ChainBoot EBP): bundled `ChainLoader.bin`, downloadable `BootstrapFloppy.dsk`, user-selected System HFS; advertise as `BootServer`
 - Bundled **welcome pack** (`public/welcome/`) auto-imported into Browser Share; restore via sidebar **Add Welcome Pack Items**
-- AppleSingle / AppleDouble import; remote downloads as AppleDouble pairs in a zip
+- AppleSingle / AppleDouble import; zip downloads default to AppleDouble `._` pairs (Advanced → **Mac OS X zip** uses a `__MACOSX` folder instead)
 - Finder-style UI: icon / list / column views, properties (type/creator)
 - Advanced → **Extension editor…** maps filename suffixes to Macintosh creator/type plus a comment (saved in localStorage; used on import when there is no AppleDouble metadata)
 - Dropped BinHex (`.hqx`), MacBinary (`.bin`), StuffIt (`.sit`), and ZIP (`.zip`) are decoded into the inner Macintosh files (name, forks, type/creator); ZIP merges `._` and `__MACOSX` AppleDouble. Toggle via Advanced → **Auto-expand files**
