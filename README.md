@@ -34,6 +34,40 @@ npm test
 npm run build
 ```
 
+## Publish
+
+Pushes to `main` run tests, build the Vite site, and deploy to [GitHub Pages](https://pages.github.com/). Pull requests run the same test/build checks without publishing.
+
+### GitHub Pages
+
+In the repo: **Settings → Pages**.
+
+1. **Build and deployment → Source:** GitHub Actions
+2. **Custom domain:** `classicstack.app` (then wait for DNS check)
+3. Enable **Enforce HTTPS** after the certificate is issued
+
+The site is served from the repo root (`base: '/'`). A `CNAME` file is included in `public/` so the custom domain survives each deploy.
+
+### DNS for classicstack.app
+
+At the domain registrar, point the apex at GitHub Pages:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| A | `@` | `185.199.108.153` |
+| A | `@` | `185.199.109.153` |
+| A | `@` | `185.199.110.153` |
+| A | `@` | `185.199.111.153` |
+| AAAA | `@` | `2606:50c0:8000::153` |
+| AAAA | `@` | `2606:50c0:8001::153` |
+| AAAA | `@` | `2606:50c0:8002::153` |
+| AAAA | `@` | `2606:50c0:8003::153` |
+| CNAME | `www` | `obsoletemadness.github.io` |
+
+The `www` record lets GitHub redirect `www.classicstack.app` to the apex. Replace the CNAME target if GitHub shows a different default Pages domain after the first deploy.
+
+Web Serial requires a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts); GitHub Pages HTTPS satisfies that.
+
 ## Architecture
 
 See the plan: TashTalk → LLAP/DDP → NBP → ATP → ASP → AFP, with a VirtualFS + Desktop DB for the local share. Netboot rides DDP type 10 on sockets 10/11 beside AFP.
