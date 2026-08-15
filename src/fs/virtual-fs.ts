@@ -5,7 +5,8 @@ import { macTime } from '../protocol/afp/constants';
 import { escapeHostFilename, unescapeHostFilename } from '../protocol/host-filename';
 import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appledouble';
 import { be32 } from '../protocol/binary';
-import { importDataTransferInto } from './import-transfer';
+import { importDataTransferInto, readBlobProgress, type ImportProgress } from './import-transfer';
+import { finderInfoFromName } from './extension-map';
 
 export type VfsChange = { parentIds: number[] };
 export type VfsChangeListener = (change: VfsChange) => void;
@@ -33,9 +34,11 @@ export interface Catalog {
   endBatch(): void;
   get(id: number): Promise<VNode | undefined>;
   /** Load data/resource forks if the catalog stores them separately (remote AFP). */
-  ensureContent(id: number): Promise<VNode | undefined>;
+  ensureContent(id: number, onBytes?: (n: number) => void): Promise<VNode | undefined>;
   children(parentId: number): Promise<VNode[]>;
   lookup(parentId: number, name: string): Promise<VNode | undefined>;
+  /** Enough of the resource fork to decode Finder icons (optional; remote AFP). */
+  loadIconResources?(node: VNode): Promise<import('./resource-fork').ResourceFork | null>;
   mkdir(parentId: number, name: string): Promise<VNode>;
   ensureDir(parentId: number, name: string): Promise<VNode>;
   createFile(
@@ -44,19 +47,18 @@ export interface Catalog {
     data: Uint8Array,
     resource?: Uint8Array,
     finderInfo?: Uint8Array,
+    onBytes?: (n: number) => void,
   ): Promise<VNode>;
   put(node: VNode): Promise<void>;
   rename(id: number, newName: string): Promise<void>;
   move(id: number, newParent: number): Promise<void>;
   remove(id: number): Promise<void>;
-  importDataTransfer(
-    parentId: number,
-    dt: DataTransfer,
-    opts?: {
-      onScan?: (total: number) => void;
-      onProgress?: (done: number, total: number) => void;
-    },
-  ): Promise<number>;
+  importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number>;
+  /**
+   * True when createFile/ensureContent invoke onBytes per transferred chunk
+   * (AFP). Local IndexedDB catalogs write the whole buffer at once.
+   */
+  readonly reportsChunkedBytes?: boolean;
 }
 
 const ROOT_ID = 2;
@@ -151,6 +153,15 @@ export class VirtualFS implements Catalog {
     }
     const meta = await this.db.get('meta', 'nextId');
     if (meta) this.nextId = meta.value as number;
+  }
+
+  async getMeta(key: string): Promise<unknown> {
+    const row = await this.db.get('meta', key);
+    return row ? (row as { value: unknown }).value : undefined;
+  }
+
+  async setMeta(key: string, value: unknown): Promise<void> {
+    await this.db.put('meta', { key, value });
   }
 
   rootId(): number {
@@ -252,7 +263,8 @@ export class VirtualFS implements Catalog {
     name: string,
     data: Uint8Array,
     resource = new Uint8Array(),
-    finderInfo = defaultFinder(name),
+    finderInfo = finderInfoFromName(name),
+    _onBytes?: (n: number) => void,
   ): Promise<VNode> {
     const existing = await this.lookup(parentId, name);
     if (existing) {
@@ -278,8 +290,8 @@ export class VirtualFS implements Catalog {
     return node;
   }
 
-  async importBlob(parentId: number, file: File): Promise<VNode> {
-    const buf = new Uint8Array(await file.arrayBuffer());
+  async importBlob(parentId: number, file: File, onBytes?: (n: number) => void): Promise<VNode> {
+    const buf = await readBlobProgress(file, onBytes);
     // Host FS may store reserved Mac chars as OmniTalk "0xNN" tokens (Icon\r → Icon0x0D).
     const name = unescapeHostFilename(file.name);
 
@@ -360,7 +372,7 @@ export class VirtualFS implements Catalog {
     await this.remove(sidecar.id);
   }
 
-  async ensureContent(id: number): Promise<VNode | undefined> {
+  async ensureContent(id: number, _onBytes?: (n: number) => void): Promise<VNode | undefined> {
     return this.get(id);
   }
 
@@ -370,15 +382,8 @@ export class VirtualFS implements Catalog {
    * + webkitRelativePath. Returns the number of top-level items imported.
    * Notifications are batched for the whole import.
    */
-  async importDataTransfer(
-    parentId: number,
-    dt: DataTransfer,
-    opts?: {
-      onScan?: (total: number) => void;
-      onProgress?: (done: number, total: number) => void;
-    },
-  ): Promise<number> {
-    return importDataTransferInto(this, parentId, dt, (p, file) => this.importBlob(p, file), opts);
+  async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
+    return importDataTransferInto(this, parentId, dt, (p, file, onBytes) => this.importBlob(p, file, onBytes), opts);
   }
 
   async rename(id: number, newName: string): Promise<void> {
@@ -420,34 +425,6 @@ export class VirtualFS implements Catalog {
   async desktopSet(key: string, data: Uint8Array): Promise<void> {
     await this.db.put('desktop', { key, data });
   }
-}
-
-function defaultFinder(name: string): Uint8Array {
-  const fi = new Uint8Array(32);
-  const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : '';
-  const map: Record<string, [string, string]> = {
-    txt: ['TEXT', 'ttxt'],
-    text: ['TEXT', 'ttxt'],
-    md: ['TEXT', 'ttxt'],
-    html: ['TEXT', 'MOSS'],
-    htm: ['TEXT', 'MOSS'],
-    jpg: ['JPEG', 'ogle'],
-    jpeg: ['JPEG', 'ogle'],
-    png: ['PNGf', 'ogle'],
-    gif: ['GIFf', 'ogle'],
-    pdf: ['PDF ', 'CARO'],
-    sit: ['SIT!', 'SIT!'],
-    bin: ['BINA', 'hDmp'],
-    hqx: ['TEXT', 'BinH'],
-  };
-  const pair = map[ext] ?? ['????', '????'];
-  const type = pair[0];
-  const creator = pair[1];
-  for (let i = 0; i < 4; i++) {
-    fi[i] = type.charCodeAt(i) || 0x20;
-    fi[4 + i] = creator.charCodeAt(i) || 0x20;
-  }
-  return fi;
 }
 
 function nameCacheKey(parentId: number, lowerName: string): string {

@@ -33,12 +33,16 @@ export type AtpInboundTReq = {
   data: Uint8Array;
 };
 
+/** Wait after the last TResp before treating a contiguous prefix as complete (no EOM). */
+const BurstIdleMs = 400;
+
 type AtpPending = {
   parts: Map<number, Uint8Array>;
   userData: number;
   resolve: (r: AtpResponse) => void;
   reject: (e: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  idleTimer: ReturnType<typeof setTimeout> | null;
   eomSeq: number | null;
   maxResp: number;
   xo: boolean;
@@ -164,6 +168,7 @@ export class AtpClient {
             send(atp.missingBitmap(cur.maxResp, cur.parts, cur.eomSeq));
             armTimer();
           } else {
+            if (cur.idleTimer) clearTimeout(cur.idleTimer);
             this.pending.delete(tid);
             const msg = `ATP timeout tid=${tid} ${req.destNetwork}.${req.destNode}:${req.destSocket} xo=${xo} bm=0x${bitmap.toString(16)} after ${attempts} tries`;
             if (!quietTimeout) log.error(msg, 'atp');
@@ -179,6 +184,7 @@ export class AtpClient {
         resolve,
         reject,
         timer: undefined as unknown as ReturnType<typeof setTimeout>,
+        idleTimer: null,
         eomSeq: null,
         maxResp,
         xo,
@@ -220,6 +226,8 @@ export class AtpClient {
 
   private finishPending(tid: number, pend: AtpPending, out: Uint8Array): void {
     clearTimeout(pend.timer);
+    if (pend.idleTimer) clearTimeout(pend.idleTimer);
+    pend.idleTimer = null;
     this.pending.delete(tid);
     if (pend.xo) {
       const trel = atp.encodePacket({
@@ -278,5 +286,34 @@ export class AtpClient {
     if (seq === 0) pend.userData = header.userData;
     if (atp.hasEOM(header)) pend.eomSeq = seq;
     this.tryFinish(header.transId, pend);
+    if (!this.pending.has(header.transId)) return;
+    this.armIdleComplete(header.transId);
+  }
+
+  /**
+   * System 7 often omits EOM on a one-packet TResp. If we asked for 8 slots
+   * (AFP Enumerate/Read), that would otherwise stall until the 2s ATP retry.
+   * After a short quiet period, accept the contiguous prefix from slot 0.
+   */
+  private armIdleComplete(tid: number): void {
+    const pend = this.pending.get(tid);
+    if (!pend) return;
+    if (pend.idleTimer) clearTimeout(pend.idleTimer);
+    pend.idleTimer = setTimeout(() => {
+      const cur = this.pending.get(tid);
+      if (!cur) return;
+      if (atp.responseComplete(cur.maxResp, cur.parts, cur.eomSeq)) {
+        this.tryFinish(tid, cur);
+        return;
+      }
+      const inferred = atp.inferredEomSeq(cur.maxResp, cur.parts);
+      if (inferred == null) return;
+      log.trace(
+        `ATP idle-complete tid=${tid} slots=0..${inferred} of ${cur.maxResp} (no EOM)`,
+        'atp',
+      );
+      cur.eomSeq = inferred;
+      this.tryFinish(tid, cur);
+    }, BurstIdleMs);
   }
 }

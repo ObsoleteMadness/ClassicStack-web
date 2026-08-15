@@ -1,6 +1,7 @@
 import type { AfpServer } from '../services/afp-server/server';
 import type { TrafficStats } from '../util/traffic-stats';
 import { formatBytes, formatBytesPerSec } from './format-bytes';
+import { positionCallout } from './callout';
 
 export interface ActivityHost {
   traffic: TrafficStats;
@@ -20,29 +21,26 @@ function userLabel(userName: string, loggedIn: boolean): string {
   return loggedIn ? 'Guest' : '(connecting)';
 }
 
-/** Floating AFP / LocalTalk activity monitor. */
+/** AFP / LocalTalk activity monitor shown as a callout from Advanced. */
 export class ActivityWindow extends HTMLElement {
   private host: ActivityHost | null = null;
-  private drag: { ox: number; oy: number; sx: number; sy: number } | null = null;
-  private pos = { x: 56, y: 72 };
   private timer: ReturnType<typeof setInterval> | null = null;
+  private anchor: HTMLElement | null = null;
 
   connectedCallback(): void {
-    this.classList.add('activity-window');
+    this.classList.add('activity-window', 'is-callout');
     this.renderShell();
     this.addEventListener('click', (e) => this.onClick(e));
-    this.querySelector('.activity-window__chrome')?.addEventListener('pointerdown', (e) =>
-      this.onDragStart(e as PointerEvent),
-    );
-    window.addEventListener('pointermove', this.onDragMove);
-    window.addEventListener('pointerup', this.onDragEnd);
-    this.applyPosition();
+    window.addEventListener('pointerdown', this.onDocPointer, true);
+    window.addEventListener('keydown', this.onKey);
+    window.addEventListener('resize', this.onReposition);
   }
 
   disconnectedCallback(): void {
     this.stopTimer();
-    window.removeEventListener('pointermove', this.onDragMove);
-    window.removeEventListener('pointerup', this.onDragEnd);
+    window.removeEventListener('pointerdown', this.onDocPointer, true);
+    window.removeEventListener('keydown', this.onKey);
+    window.removeEventListener('resize', this.onReposition);
   }
 
   bind(host: ActivityHost): void {
@@ -51,9 +49,15 @@ export class ActivityWindow extends HTMLElement {
   }
 
   show(): void {
+    this.showCallout(this.anchor);
+  }
+
+  showCallout(anchor: HTMLElement | null): void {
+    this.anchor = anchor;
     this.hidden = false;
     this.refresh();
     this.startTimer();
+    this.reposition();
   }
 
   hide(): void {
@@ -61,10 +65,29 @@ export class ActivityWindow extends HTMLElement {
     this.stopTimer();
   }
 
-  toggle(): void {
-    if (this.hidden) this.show();
-    else this.hide();
+  toggleCallout(anchor: HTMLElement | null): void {
+    if (!this.hidden) this.hide();
+    else this.showCallout(anchor);
   }
+
+  private reposition = (): void => {
+    if (this.hidden || !this.anchor) return;
+    positionCallout(this, this.anchor);
+  };
+
+  private onReposition = (): void => this.reposition();
+
+  private onDocPointer = (e: PointerEvent): void => {
+    if (this.hidden) return;
+    const t = e.target as Node;
+    if (this.contains(t)) return;
+    if (this.anchor?.contains(t)) return;
+    this.hide();
+  };
+
+  private onKey = (e: KeyboardEvent): void => {
+    if (e.key === 'Escape' && !this.hidden) this.hide();
+  };
 
   private startTimer(): void {
     if (this.timer) return;
@@ -184,31 +207,6 @@ export class ActivityWindow extends HTMLElement {
     const t = (e.target as HTMLElement).closest('[data-act]') as HTMLElement | null;
     if (t?.dataset.act === 'close') this.hide();
   }
-
-  private applyPosition(): void {
-    this.style.left = `${this.pos.x}px`;
-    this.style.top = `${this.pos.y}px`;
-  }
-
-  private onDragStart(e: PointerEvent): void {
-    if ((e.target as HTMLElement).closest('button')) return;
-    this.drag = { ox: this.pos.x, oy: this.pos.y, sx: e.clientX, sy: e.clientY };
-    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-    e.preventDefault();
-  }
-
-  private onDragMove = (e: PointerEvent): void => {
-    if (!this.drag) return;
-    this.pos = {
-      x: Math.max(8, this.drag.ox + (e.clientX - this.drag.sx)),
-      y: Math.max(8, this.drag.oy + (e.clientY - this.drag.sy)),
-    };
-    this.applyPosition();
-  };
-
-  private onDragEnd = (): void => {
-    this.drag = null;
-  };
 }
 
 customElements.define('activity-window', ActivityWindow);

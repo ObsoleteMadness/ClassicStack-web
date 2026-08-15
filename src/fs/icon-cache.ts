@@ -6,6 +6,7 @@
 
 import { openDB, type IDBPDatabase } from './idb-shim';
 import { ResourceFork } from './resource-fork';
+import { forkBytesFromNode } from './resource-inspect';
 import { parseBndl } from './resource-types/bndl';
 import { decodedIconToDataUrl } from './resource-types/icon-decoder';
 import {
@@ -26,6 +27,9 @@ export function isCustomFolderIconName(name: string): boolean {
   return name === CUSTOM_FOLDER_ICON_NAME || name === CUSTOM_FOLDER_ICON_HOST_NAME;
 }
 
+const ICON_CACHE_DB = 'classicstack-icon-cache';
+/** Bump when decoded-icon preference or extract rules change so stale BW PNGs are dropped. */
+const ICON_CACHE_DB_VERSION = 3;
 const HAS_CUSTOM_ICON = 0x0400;
 /** Finder FileInfo/DInfo flag: item is invisible (AppleDouble FinderInfo). */
 export const FINDER_IS_INVISIBLE = 0x4000;
@@ -73,6 +77,63 @@ function cacheKey(creator: string, type: string): string {
   return `${padOsType(creator)}|${padOsType(type)}`;
 }
 
+/** Control panels, extensions, and chooser devices store their icon at -4064. */
+const CDEV_STYLE_TYPES = new Set(['cdev', 'INIT', 'rdev', 'adev', 'ddev', 'sdev']);
+
+export function isCdevStyleType(type: string): boolean {
+  return CDEV_STYLE_TYPES.has(padOsType(type));
+}
+
+function isSystemIconUrls(urls: IconUrls): boolean {
+  return urls.small.startsWith('/icons/') || urls.large.startsWith('/icons/');
+}
+
+function forkFromNode(
+  resource: Uint8Array,
+  data: Uint8Array | undefined,
+  loaded: ResourceFork | null,
+): ResourceFork | null {
+  if (loaded && loaded.allEntries.length > 0) return loaded;
+  const picked = forkBytesFromNode({ resource, data: data ?? new Uint8Array() });
+  if (picked.source === 'empty' || picked.bytes.length < 16) return null;
+  const rf = ResourceFork.fromBytes(picked.bytes);
+  return rf.allEntries.length > 0 ? rf : null;
+}
+
+/**
+ * Pick an icon family from a resource fork: BNDL/FREF, cdev id -4064, id 128,
+ * then any ICN# / icl8 / etc. in the fork.
+ */
+export function iconSetForFile(rf: ResourceFork, type: string, finderInfo: Uint8Array): IconSet | null {
+  const t = padOsType(type);
+  const bndl = parseBndl(rf, isCdevStyleType(t) ? CDEV_ICON_ID : DEFAULT_ICON_ID);
+  if (bndl) {
+    const fref = bndl.extractTypeToLocalMap(rf);
+    const icons = bndl.extractIcons(rf);
+    const localId = fref.get(t);
+    if (localId != null) {
+      const set = icons.get(localId);
+      if (set) return set;
+    }
+    if (isCdevStyleType(t)) {
+      const set = icons.get(0) ?? IconSet.fromResourceFork(CDEV_ICON_ID, rf);
+      if (set) return set;
+    }
+  }
+
+  const ids: number[] = [];
+  if ((finderFlags(finderInfo) & HAS_CUSTOM_ICON) !== 0) ids.push(CUSTOM_ICON_ID);
+  const fid = finderIconId(finderInfo);
+  if (fid) ids.push(fid);
+  if (isCdevStyleType(t)) ids.push(CDEV_ICON_ID);
+  ids.push(DEFAULT_ICON_ID);
+  for (const id of ids) {
+    const set = IconSet.fromResourceFork(id, rf);
+    if (set) return set;
+  }
+  return IconSet.fromFork(rf);
+}
+
 const KNOWN_SYSTEM_ICONS = new Set([
   'APPL16.png',
   'APPL32.png',
@@ -96,6 +157,15 @@ const KNOWN_SYSTEM_ICONS = new Set([
 
 function systemIconUrl(name: string): string {
   return `/icons/${name}`;
+}
+
+/** True when the cache fell back to the classic DIR16/DIR32 PNGs. */
+export function isDefaultFolderIcon(urls: IconUrls): boolean {
+  return isDefaultFolderIconUrl(urls.small) || isDefaultFolderIconUrl(urls.large);
+}
+
+function isDefaultFolderIconUrl(src: string): boolean {
+  return /(?:^|\/)DIR(?:16|32)\.png(?:\?|$)/i.test(src);
 }
 
 function pickSystemIcon(candidates: string[]): string {
@@ -147,11 +217,10 @@ export class IconCache {
   }
 
   private async openDb(): Promise<void> {
-    this.db = await openDB('classicstack-icon-cache', 1, {
+    this.db = await openDB(ICON_CACHE_DB, ICON_CACHE_DB_VERSION, {
       upgrade(db) {
-        if (!db.objectStoreNames.contains('typeIcons')) {
-          db.createObjectStore('typeIcons', { keyPath: 'key' });
-        }
+        if (db.objectStoreNames.contains('typeIcons')) db.deleteObjectStore('typeIcons');
+        db.createObjectStore('typeIcons', { keyPath: 'key' });
       },
     });
   }
@@ -186,7 +255,7 @@ export class IconCache {
     if (!this.db) return;
     // idb-shim lacks getAllKeys; use raw indexedDB
     await new Promise<void>((resolve, reject) => {
-      const req = indexedDB.open('classicstack-icon-cache', 1);
+      const req = indexedDB.open(ICON_CACHE_DB, ICON_CACHE_DB_VERSION);
       req.onerror = () => reject(req.error);
       req.onsuccess = () => {
         const db = req.result;
@@ -213,21 +282,32 @@ export class IconCache {
     return { small: row.small as string, large: row.large as string };
   }
 
-  /** Resolve icons for a VirtualFS node (local share). */
+  /** Resolve icons for a VirtualFS node (local share or remote AFP). */
   async getForNode(
     node: VNode,
     findChild?: (parentId: number, name: string) => Promise<VNode | undefined>,
+    loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
   ): Promise<IconUrls> {
     await this.ensureDefaults();
     if (node.isDir) {
-      return this.getForDirectory(String(node.id), node, findChild);
+      return this.getForDirectory(String(node.id), node, findChild, loadIconFork);
     }
     const { type, creator } = readTypeCreator(node.finderInfo);
+    let fork: ResourceFork | null = null;
+    if (node.resource.length < 16 && loadIconFork) {
+      try {
+        fork = await loadIconFork(node);
+      } catch {
+        fork = null;
+      }
+    }
     return this.getForFile({
       type,
       creator,
       resource: node.resource,
+      data: node.data,
       finderInfo: node.finderInfo,
+      fork,
     });
   }
 
@@ -245,7 +325,6 @@ export class IconCache {
       large: await resolveSystemIcon(type, 32),
     };
     this.memory.set(key, urls);
-    await this.persist(key, urls);
     return urls;
   }
 
@@ -253,13 +332,14 @@ export class IconCache {
     pathKey: string,
     node: VNode,
     findChild?: (parentId: number, name: string) => Promise<VNode | undefined>,
+    loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
   ): Promise<IconUrls> {
     const hit = this.dirMemory.get(pathKey);
     if (hit) return hit;
 
     // Classic Finder custom folder icon lives in a root file named "Icon\r"
     // (Icon + CR / 0x0D), resource id -16455.
-    const fromIconFile = await this.tryCustomFolderIconFile(node, findChild);
+    const fromIconFile = await this.tryCustomFolderIconFile(node, findChild, loadIconFork);
     if (fromIconFile) {
       this.dirMemory.set(pathKey, fromIconFile);
       return fromIconFile;
@@ -267,15 +347,22 @@ export class IconCache {
 
     // Rare: icon data stored on the directory's own resource fork
     const flags = finderFlags(node.finderInfo);
-    if ((flags & HAS_CUSTOM_ICON) !== 0 && node.resource.length > 16) {
+    if ((flags & HAS_CUSTOM_ICON) !== 0) {
       try {
-        const rf = ResourceFork.fromBytes(node.resource);
-        const set = IconSet.fromResourceFork(CUSTOM_ICON_ID, rf);
-        if (set) {
-          const urls = await iconSetToUrls(set);
-          if (urls) {
-            this.dirMemory.set(pathKey, urls);
-            return urls;
+        const rf =
+          node.resource.length > 16
+            ? ResourceFork.fromBytes(node.resource)
+            : loadIconFork
+              ? await loadIconFork(node)
+              : null;
+        if (rf) {
+          const set = IconSet.fromResourceFork(CUSTOM_ICON_ID, rf);
+          if (set) {
+            const urls = await iconSetToUrls(set);
+            if (urls) {
+              this.dirMemory.set(pathKey, urls);
+              return urls;
+            }
           }
         }
       } catch {
@@ -294,15 +381,25 @@ export class IconCache {
   private async tryCustomFolderIconFile(
     dir: VNode,
     findChild?: (parentId: number, name: string) => Promise<VNode | undefined>,
+    loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
   ): Promise<IconUrls | null> {
     if (!findChild) return null;
     try {
       const iconFile =
         (await findChild(dir.id, CUSTOM_FOLDER_ICON_NAME)) ??
         (await findChild(dir.id, CUSTOM_FOLDER_ICON_HOST_NAME));
-      if (!iconFile || iconFile.isDir || iconFile.resource.length < 16) return null;
-      const rf = ResourceFork.fromBytes(iconFile.resource);
+      if (!iconFile || iconFile.isDir) return null;
+      const rsrcLen = iconFile.resourceBytes ?? iconFile.resource.length;
+      if (iconFile.resource.length < 16 && rsrcLen < 16) return null;
+      const rf =
+        iconFile.resource.length >= 16
+          ? ResourceFork.fromBytes(iconFile.resource)
+          : loadIconFork
+            ? await loadIconFork(iconFile)
+            : null;
+      if (!rf) return null;
       const set =
+        IconSet.fromFork(rf) ??
         IconSet.fromResourceFork(CUSTOM_ICON_ID, rf) ??
         IconSet.fromResourceFork(DEFAULT_ICON_ID, rf);
       if (!set) return null;
@@ -316,64 +413,39 @@ export class IconCache {
     type: string;
     creator: string;
     resource: Uint8Array;
+    data?: Uint8Array;
     finderInfo: Uint8Array;
+    fork?: ResourceFork | null;
   }): Promise<IconUrls> {
     const key = cacheKey(args.creator, args.type);
+    const rf = forkFromNode(args.resource, args.data, args.fork ?? null);
     const cached = this.memory.get(key) ?? (await this.loadPersisted(key));
-    if (cached) {
+    if (cached && !(rf && isSystemIconUrls(cached))) {
       this.memory.set(key, cached);
       return cached;
     }
 
-    if (args.resource.length < 16) {
+    if (!rf) {
       const urls: IconUrls = {
         small: await resolveSystemIcon(args.type, 16),
         large: await resolveSystemIcon(args.type, 32),
       };
       this.memory.set(key, urls);
-      await this.persist(key, urls);
       return urls;
     }
 
     try {
-      const rf = ResourceFork.fromBytes(args.resource);
+      await this.tryBundle(rf, args.type, args.creator, key);
+      const hit = this.memory.get(key);
+      if (hit && !isSystemIconUrls(hit)) return hit;
 
-      // Bundle cache by creator
-      const bundleHit = this.bundleCache.get(args.creator);
-      if (bundleHit) {
-        const localId = bundleHit.fref.get(args.type);
-        if (localId != null) {
-          const set = bundleHit.icons.get(localId);
-          if (set) {
-            const urls = await iconSetToUrls(set);
-            if (urls) {
-              this.memory.set(key, urls);
-              await this.persist(key, urls);
-              return urls;
-            }
-          }
-        }
-      }
-
-      const fromBundle = await this.tryBundle(rf, args.type, args.creator, key);
-      if (fromBundle) return fromBundle;
-
-      const candidates: number[] = [];
-      if ((finderFlags(args.finderInfo) & HAS_CUSTOM_ICON) !== 0) candidates.push(CUSTOM_ICON_ID);
-      const fid = finderIconId(args.finderInfo);
-      if (fid) candidates.push(fid);
-      if (args.type === 'cdev') candidates.push(CDEV_ICON_ID);
-      candidates.push(DEFAULT_ICON_ID);
-
-      for (const id of candidates) {
-        const set = IconSet.fromResourceFork(id, rf);
-        if (set) {
-          const urls = await iconSetToUrls(set);
-          if (urls) {
-            this.memory.set(key, urls);
-            await this.persist(key, urls);
-            return urls;
-          }
+      const set = iconSetForFile(rf, args.type, args.finderInfo);
+      if (set) {
+        const urls = await iconSetToUrls(set);
+        if (urls) {
+          this.memory.set(key, urls);
+          await this.persist(key, urls);
+          return urls;
         }
       }
     } catch {
@@ -385,7 +457,6 @@ export class IconCache {
       large: await resolveSystemIcon(args.type, 32),
     };
     this.memory.set(key, urls);
-    await this.persist(key, urls);
     return urls;
   }
 
@@ -394,8 +465,8 @@ export class IconCache {
     type: string,
     creator: string,
     key: string,
-  ): Promise<IconUrls | null> {
-    const prefIds = type === 'cdev' ? [CDEV_ICON_ID, DEFAULT_ICON_ID] : [DEFAULT_ICON_ID];
+  ): Promise<void> {
+    const prefIds = isCdevStyleType(type) ? [CDEV_ICON_ID, DEFAULT_ICON_ID] : [DEFAULT_ICON_ID];
     let ent: ReturnType<ResourceFork['findById']>;
     for (const bid of prefIds) {
       const found = rf.findById('BNDL', bid);
@@ -405,46 +476,34 @@ export class IconCache {
       }
     }
     ent ??= rf.findByType('BNDL')[0];
-    if (!ent) return null;
+    if (!ent) return;
 
     const bndl = parseBndl(rf, ent.id);
-    if (!bndl) return null;
+    if (!bndl) return;
 
     const fref = bndl.extractTypeToLocalMap(rf);
     const icons = bndl.extractIcons(rf);
     const ownerKey = bndl.owner?.trim() ? bndl.owner : creator;
     this.bundleCache.set(ownerKey, { fref, icons });
+    if (ownerKey !== creator) this.bundleCache.set(creator, { fref, icons });
+
+    const persistSet = async (k: string, set: IconSet): Promise<void> => {
+      const urls = await iconSetToUrls(set);
+      if (!urls) return;
+      this.memory.set(k, urls);
+      await this.persist(k, urls);
+    };
 
     for (const [ftype, localId] of fref) {
       const set = icons.get(localId);
       if (!set) continue;
-      const urls = await iconSetToUrls(set);
-      if (!urls) continue;
-      const k = cacheKey(ownerKey, ftype);
-      this.memory.set(k, urls);
-      await this.persist(k, urls);
+      await persistSet(cacheKey(ownerKey, ftype), set);
+      if (ownerKey !== creator) await persistSet(cacheKey(creator, ftype), set);
     }
 
-    const after = this.memory.get(key);
-    if (after) return after;
-
-    if (icons.size > 0) {
-      let chosen: IconSet | undefined;
-      for (const bid of prefIds) {
-        chosen = icons.get(bid);
-        if (chosen) break;
-      }
-      chosen ??= icons.values().next().value;
-      if (chosen) {
-        const urls = await iconSetToUrls(chosen);
-        if (urls) {
-          this.memory.set(key, urls);
-          await this.persist(key, urls);
-          return urls;
-        }
-      }
-    }
-    return null;
+    if (this.memory.get(key)) return;
+    const set = iconSetForFile(rf, type, new Uint8Array(32));
+    if (set) await persistSet(key, set);
   }
 }
 

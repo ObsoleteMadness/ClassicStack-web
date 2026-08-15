@@ -6,14 +6,19 @@ import { AtpClient } from './services/atp-client';
 import { AfpServer } from './services/afp-server/server';
 import { AfpClient, type AfpCredentials, type AfpServerNotice } from './services/afp-client/client';
 import { VirtualFS } from './fs/virtual-fs';
+import { addWelcomePack, seedWelcomePackIfNeeded } from './fs/welcome-pack';
 import { RemoteVfs } from './fs/remote-vfs';
 import { FinderWindow, type FinderHost } from './ui/finder-window';
 import { AppMenuBar } from './ui/app-menubar';
 import { LogPanel } from './ui/log-panel';
 import { ActivityWindow } from './ui/activity-window';
+import { FileActivityWindow } from './ui/file-activity-window';
 import { AlertDialog } from './ui/alert-dialog';
 import { AfpSessionsDialog } from './ui/afp-sessions-dialog';
 import { LoginDialog } from './ui/login-dialog';
+import { NameConflictDialog } from './ui/name-conflict-dialog';
+import { ExtensionEditorDialog } from './ui/extension-editor-dialog';
+import { ResourceForkExplorer } from './ui/resource-fork-explorer';
 import {
   NetbootDialog,
   BUNDLED_BLOCK_SIZE,
@@ -23,6 +28,7 @@ import {
 import { PcapCapture } from './util/pcap';
 import { TrafficStats } from './util/traffic-stats';
 import { log } from './util/logger';
+import { startLayoutMode } from './ui/layout-mode';
 import * as asp from './protocol/asp';
 import { assemblePayload, MemoryDisk, NetbootService } from './services/netboot';
 
@@ -36,8 +42,12 @@ async function fetchBytes(url: string): Promise<Uint8Array> {
   return new Uint8Array(await res.arrayBuffer());
 }
 
+const WEB_SERIAL_HELP =
+  'ClassicStack needs the Web Serial API to connect a TashTalk adaptor. Use Google Chrome (desktop or Android) or Microsoft Edge, over HTTPS or localhost. On a phone, plug the adaptor in with USB-C / OTG; 1 Mbaud with hardware flow control may fail on some Android USB stacks.';
+
 async function main(): Promise<void> {
   log.installConsoleBridge();
+  startLayoutMode();
   log.info('ClassicStack starting', 'app');
 
   const app = document.querySelector('#app')!;
@@ -51,13 +61,19 @@ async function main(): Promise<void> {
   logPanel.hidden = true;
   const activityWindow = new ActivityWindow();
   activityWindow.hidden = true;
+  const fileActivityWindow = new FileActivityWindow();
+  fileActivityWindow.hidden = true;
   const netboot = new NetbootDialog();
   const alertDialog = new AlertDialog();
   const afpSessions = new AfpSessionsDialog();
   const loginDialog = new LoginDialog();
+  const nameConflictDialog = new NameConflictDialog();
+  const extensionEditor = new ExtensionEditorDialog();
+  const resourceExplorer = new ResourceForkExplorer();
+  resourceExplorer.hidden = true;
 
   stage.appendChild(finder);
-  app.append(menubar, stage, logPanel, activityWindow, netboot, alertDialog, afpSessions, loginDialog);
+  app.append(menubar, stage, logPanel, activityWindow, fileActivityWindow, netboot, alertDialog, afpSessions, loginDialog, nameConflictDialog, extensionEditor, resourceExplorer);
 
   const serial = new WebSerialPort();
   const pcap = new PcapCapture();
@@ -80,6 +96,8 @@ async function main(): Promise<void> {
     activityWindow,
     netboot,
     afpSessions,
+    extensionEditor,
+    resourceExplorer,
     finder,
     onCaptureChanged() {
       menubar.refreshCaptureStatus();
@@ -106,6 +124,7 @@ async function main(): Promise<void> {
   });
 
   await vfs.init();
+  await seedWelcomePackIfNeeded(vfs);
 
   function attachRemoteNotices(client: AfpClient): void {
     client.onNotice = (n: AfpServerNotice) => {
@@ -194,6 +213,7 @@ async function main(): Promise<void> {
     }
     afpScanBusy = false;
     lastAfpScanKey = '';
+    finder.setNetworkScanning(false);
   }
 
   async function scanAfpServers(kind: 'auto' | 'manual'): Promise<LookupResult[]> {
@@ -204,6 +224,7 @@ async function main(): Promise<void> {
     }
     if (!nbp) return [];
     afpScanBusy = true;
+    finder.setNetworkScanning(true);
     try {
       const list = await nbp.lookup('=', 'AFPServer');
       if (!nbp) return [];
@@ -223,6 +244,7 @@ async function main(): Promise<void> {
       return list;
     } finally {
       afpScanBusy = false;
+      finder.setNetworkScanning(false);
     }
   }
 
@@ -262,6 +284,10 @@ async function main(): Promise<void> {
         : null,
 
     async connectSerial() {
+      if (!WebSerialPort.supported()) {
+        alertDialog.show('Web Serial is not supported', WEB_SERIAL_HELP);
+        throw new Error('Web Serial is not supported');
+      }
       await serial.connect();
       stack = new LocalTalkStack(serial);
       nbp = new NbpService(stack);
@@ -330,6 +356,10 @@ async function main(): Promise<void> {
       return vfs;
     },
 
+    installWelcomePack() {
+      return addWelcomePack(vfs);
+    },
+
     promptCredentials(opts) {
       return loginDialog.prompt(opts);
     },
@@ -340,6 +370,10 @@ async function main(): Promise<void> {
 
     showAlert(title: string, text: string) {
       alertDialog.show(title, text);
+    },
+
+    promptNameConflict(opts) {
+      return nameConflictDialog.prompt(opts);
     },
 
     async findServer(nbpName: string) {
@@ -362,10 +396,12 @@ async function main(): Promise<void> {
   };
 
   finder.bind(vfs, host);
+  finder.bindResourceExplorer(resourceExplorer);
 
   if (!WebSerialPort.supported()) {
     log.warn('WebSerial unavailable — use Chrome/Edge over HTTPS or localhost', 'serial');
     finder.setStatus('WebSerial unavailable — use Chrome/Edge over HTTPS or localhost.');
+    alertDialog.show('Web Serial is not supported', WEB_SERIAL_HELP);
   }
 }
 

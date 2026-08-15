@@ -9,9 +9,13 @@ Browser AppleTalk / AFP stack over **WebSerial → TashTalk → LocalTalk**.
 - **NBP** discovery of remote `AFPServer` hosts
 - Act as an **AFP client** to browse/upload/download/rename/delete on remote shares
 - **Netboot** (AppleTalk Boot Protocol + ChainBoot EBP): bundled `ChainLoader.bin`, downloadable `BootstrapFloppy.dsk`, user-selected System HFS; advertise as `BootServer`
+- Bundled **welcome pack** (`public/welcome/`) auto-imported into Browser Share; restore via sidebar **Add Welcome Pack Items**
 - AppleSingle / AppleDouble import; remote downloads as AppleDouble pairs in a zip
 - Finder-style UI: icon / list / column views, properties (type/creator)
+- Advanced → **Extension editor…** maps filename suffixes to Macintosh creator/type plus a comment (saved in localStorage; used on import when there is no AppleDouble metadata)
+- Dropped BinHex (`.hqx`), MacBinary (`.bin`), and StuffIt (`.sit`) are decoded into the inner Macintosh files (name, forks, type/creator); toggle via Advanced → **Auto-expand files**
 - Resource-fork icons (BNDL / ICN# / icl8) with `./icons` system fallbacks and a clearable local type-icon cache
+- Advanced → **Resource Fork…** (or Get Info / context menu **Resources…**) lists every resource type, id, and BNDL mapping in the selected file
 
 ## Requirements
 
@@ -27,7 +31,7 @@ npm install
 npm run dev
 ```
 
-Open the printed localhost URL, click **Connect Serial**, pick the TashTalk port.
+Open the printed localhost URL, click **Connect TashTalk**, pick the TashTalk port.
 
 ```bash
 npm test
@@ -78,6 +82,8 @@ Protocol codecs mirror [ClassicStack / OmniTalk](https://github.com/ObsoleteMadn
 
 - Guest login (`No User Authent`) plus `Cleartxt Passwrd` and Randnum UAMs when connecting as a client
 - Resource-fork icon decoder (ICN# / icl8 / BNDL) for Finder icons; system glyphs from `./icons`; application type icons cached locally (Advanced → Clear icon cache)
+- Resource Fork explorer (Advanced → Resource Fork…) dumps types, ids, BNDL/FREF mappings, and decoded icon previews from the selected file
 - Desktop DB Add/GetIcon is implemented on the server
 - AFP Write uses a simplified path; full WriteContinue parity may need tuning against specific Mac OS versions
 - Netboot ChainBoot keeps the selected HFS image in browser memory for the session (writes are not persisted back to the file)
+- Default Browser Share files live in `public/welcome/` (see that folder’s README); new pack files are imported on next load, existing names are never overwritten

@@ -301,6 +301,36 @@ function parseParms(b: Uint8Array, bitmap: number, isDir: boolean): DirEntry {
   return entry;
 }
 
+export function getFileDirParms(
+  volId: number,
+  dirId: number,
+  fileBitmap: number,
+  dirBitmap: number,
+  path = '',
+): Uint8Array {
+  const out: number[] = [C.CmdGetFileDirParms, 0];
+  appendBe16(out, volId);
+  appendBe32(out, dirId);
+  appendBe16(out, fileBitmap);
+  appendBe16(out, dirBitmap);
+  putPath(out, path);
+  return new Uint8Array(out);
+}
+
+/** Reply: fileBitmap(2) dirBitmap(2) type(1) pad(1) params. */
+export function parseGetFileDirParms(
+  b: Uint8Array,
+  fileBitmap: number,
+  dirBitmap: number,
+): DirEntry | undefined {
+  if (b.length < 6) return undefined;
+  const fbm = be16(b, 0);
+  const dbm = be16(b, 2);
+  const isDir = (b[4]! & 0x80) !== 0;
+  const bm = isDir ? dbm || dirBitmap : fbm || fileBitmap;
+  return parseParms(b.subarray(6), bm, isDir);
+}
+
 export function createFile(volId: number, dirId: number, name: string, softCreate = 0): Uint8Array {
   const out: number[] = [C.CmdCreateFile, softCreate];
   appendBe16(out, volId);

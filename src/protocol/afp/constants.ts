@@ -37,6 +37,49 @@ export const CmdGetSrvrMsg = 38;
 export const CmdOpenDT = 48;
 export const CmdCloseDT = 49;
 
+const AFP_CMD_NAME: Record<number, string> = {
+  [CmdCloseVol]: 'FPCloseVol',
+  [CmdCloseFork]: 'FPCloseFork',
+  [CmdCreateDir]: 'FPCreateDir',
+  [CmdCreateFile]: 'FPCreateFile',
+  [CmdDelete]: 'FPDelete',
+  [CmdEnumerate]: 'FPEnumerate',
+  [CmdFlush]: 'FPFlush',
+  [CmdFlushFork]: 'FPFlushFork',
+  [CmdGetFileParms]: 'FPGetFileParms',
+  [CmdGetForkParms]: 'FPGetForkParms',
+  [CmdGetSrvrInfo]: 'FPGetSrvrInfo',
+  [CmdGetSrvrParms]: 'FPGetSrvrParms',
+  [CmdGetVolParms]: 'FPGetVolParms',
+  [CmdLogin]: 'FPLogin',
+  [CmdLoginCont]: 'FPLoginCont',
+  [CmdLogout]: 'FPLogout',
+  [CmdMoveAndRename]: 'FPMoveAndRename',
+  [CmdOpenVol]: 'FPOpenVol',
+  [CmdOpenFork]: 'FPOpenFork',
+  [CmdRead]: 'FPRead',
+  [CmdRename]: 'FPRename',
+  [CmdSetDirParms]: 'FPSetDirParms',
+  [CmdSetFileParms]: 'FPSetFileParms',
+  [CmdSetForkParms]: 'FPSetForkParms',
+  [CmdWrite]: 'FPWrite',
+  [CmdGetFileDirParms]: 'FPGetFileDirParms',
+  [CmdSetFileDirParms]: 'FPSetFileDirParms',
+  [CmdGetSrvrMsg]: 'FPGetSrvrMsg',
+  [CmdOpenDT]: 'FPOpenDT',
+  [CmdCloseDT]: 'FPCloseDT',
+  [CmdAddIcon]: 'FPAddIcon',
+  [CmdGetIcon]: 'FPGetIcon',
+  [CmdGetIconInfo]: 'FPGetIconInfo',
+  [CmdAddAPPL]: 'FPAddAPPL',
+  [CmdRemoveAPPL]: 'FPRemoveAPPL',
+  [CmdGetAPPL]: 'FPGetAPPL',
+};
+
+export function afpCmdName(cmd: number): string {
+  return AFP_CMD_NAME[cmd] ?? `FP#${cmd}`;
+}
+
 /** FPGetSrvrInfo Flags bit 3 — clients honour attentions / fetch FPGetSrvrMsg. */
 export const SrvrInfoSupportsSrvrMsg = 0x0008;
 export const SrvrMsgTypeLogin = 0;
@@ -82,6 +125,10 @@ export const VolBitmapName = 1 << 8;
 
 export const CNIDRoot = 2;
 export const AFP_EPOCH_MS = Date.UTC(2000, 0, 1);
+/** HFS / MacBinary / StuffIt: seconds since 1904-01-01. */
+export const HFS_EPOCH_MS = Date.UTC(1904, 0, 1);
+/** Seconds from the HFS epoch to the AFP epoch. */
+export const HFS_TO_AFP_SECONDS = (AFP_EPOCH_MS - HFS_EPOCH_MS) / 1000;
 export const NoBackupDate = 0x80000000;
 
 export const UAMNoUserAuthent = 'No User Authent';
@@ -139,6 +186,12 @@ export function macTime(d = new Date()): number {
 export function fromMacTime(mt: number): Date {
   if (mt === NoBackupDate) return new Date(0);
   return new Date(AFP_EPOCH_MS + ((mt << 0) >> 0) * 1000);
+}
+
+/** Convert an HFS/StuffIt/MacBinary timestamp (seconds since 1904) to AFP (seconds since 2000). */
+export function hfsTimeToAfp(hfs: number): number {
+  if (!hfs) return 0;
+  return ((hfs >>> 0) - HFS_TO_AFP_SECONDS) | 0;
 }
 
 export function pstring(s: string, macRoman: (s: string) => Uint8Array): Uint8Array {

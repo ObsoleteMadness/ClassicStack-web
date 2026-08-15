@@ -63,6 +63,19 @@ export class IconSet {
     return new IconSet(icons);
   }
 
+  /** Every supported icon in the fork (custom Icon\\r files, sparse extracts). */
+  static fromFork(fork: ResourceFork): IconSet | null {
+    const types = new Set<string>(SUPPORTED_ICON_TYPES);
+    const icons: DecodedIcon[] = [];
+    for (const entry of fork.allEntries) {
+      if (!types.has(entry.type)) continue;
+      const icon = decodeIcon(entry.type, fork.readBytes(entry));
+      if (icon) icons.push(icon);
+    }
+    if (!icons.length) return null;
+    return new IconSet(icons);
+  }
+
   getIcon(typeCode: string): DecodedIcon | undefined {
     return this.icons.find((c) => c.typeCode === typeCode);
   }

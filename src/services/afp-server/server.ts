@@ -10,41 +10,8 @@ import type { VirtualFS, VNode } from '../../fs/virtual-fs';
 import { log } from '../../util/logger';
 import * as atp from '../../protocol/atp';
 
-const AFP_CMD_NAME: Record<number, string> = {
-  [C.CmdCloseVol]: 'FPCloseVol',
-  [C.CmdCloseFork]: 'FPCloseFork',
-  [C.CmdCreateDir]: 'FPCreateDir',
-  [C.CmdCreateFile]: 'FPCreateFile',
-  [C.CmdDelete]: 'FPDelete',
-  [C.CmdEnumerate]: 'FPEnumerate',
-  [C.CmdFlush]: 'FPFlush',
-  [C.CmdFlushFork]: 'FPFlushFork',
-  [C.CmdGetFileParms]: 'FPGetFileParms',
-  [C.CmdGetForkParms]: 'FPGetForkParms',
-  [C.CmdGetSrvrParms]: 'FPGetSrvrParms',
-  [C.CmdGetVolParms]: 'FPGetVolParms',
-  [C.CmdLogin]: 'FPLogin',
-  [C.CmdLogout]: 'FPLogout',
-  [C.CmdSetDirParms]: 'FPSetDirParms',
-  [C.CmdSetFileParms]: 'FPSetFileParms',
-  [C.CmdSetForkParms]: 'FPSetForkParms',
-  [C.CmdOpenVol]: 'FPOpenVol',
-  [C.CmdOpenFork]: 'FPOpenFork',
-  [C.CmdRead]: 'FPRead',
-  [C.CmdRename]: 'FPRename',
-  [C.CmdWrite]: 'FPWrite',
-  [C.CmdGetFileDirParms]: 'FPGetFileDirParms',
-  [C.CmdSetFileDirParms]: 'FPSetFileDirParms',
-  [C.CmdGetSrvrMsg]: 'FPGetSrvrMsg',
-  [C.CmdOpenDT]: 'FPOpenDT',
-  [C.CmdCloseDT]: 'FPCloseDT',
-  [C.CmdAddIcon]: 'FPAddIcon',
-  [C.CmdGetIcon]: 'FPGetIcon',
-  [C.CmdGetIconInfo]: 'FPGetIconInfo',
-};
-
 function afpCmdName(cmd: number): string {
-  return AFP_CMD_NAME[cmd] ?? `FP#${cmd}`;
+  return C.afpCmdName(cmd);
 }
 
 function afpResultName(result: number): string {

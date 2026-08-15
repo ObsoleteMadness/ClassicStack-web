@@ -1,0 +1,9 @@
+Welcome to Browser Share
+
+This volume lives in this web browser. When a TashTalk adaptor is connected, ClassicStack shares it over LocalTalk AFP as “Browser Share” (server name “ClassicStack”).
+
+• Drag files here from this computer, or copy them from a Macintosh that has mounted the share.
+• Resource forks are preserved (AppleSingle / AppleDouble).
+• The Utilities folder is a home for starter tools such as archive expanders and disk utilities.
+
+To restore these starter files later, right-click Browser Share in the sidebar and choose “Add Welcome Pack Items”. Items you have changed or replaced are left alone.

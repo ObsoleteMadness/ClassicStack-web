@@ -1,12 +1,48 @@
 /** Shared DataTransfer import for local IndexedDB and remote AFP catalogs. */
 
+import { hfsTimeToAfp } from '../protocol/afp/constants';
 import { unescapeHostFilename } from '../protocol/host-filename';
-import type { Catalog } from './virtual-fs';
+import { loadPrefs } from '../util/prefs';
+import { log } from '../util/logger';
+import { expandIncoming, type ExpandedDir, type ExpandedFile, type ExpandedNode } from './expand-incoming';
+import { filenameExtension } from './extension-map';
+import type { Catalog, VNode } from './virtual-fs';
+import {
+  planItemPlacement,
+  TransferCancelled,
+  type NameConflictChoice,
+  type PlacementPlan,
+} from './name-conflict';
+
+export type ImportItemTrack = {
+  onBytes?: (n: number) => void;
+  onDone?: (err?: Error) => void;
+  /** Nested job while a dropped wrapper is decoded (BinHex / MacBinary / later StuffIt). */
+  onExpand?: (item: {
+    name: string;
+    isDir: boolean;
+    bytesTotal: number;
+    finderInfo?: Uint8Array;
+  }) => ImportItemTrack | undefined;
+};
 
 export type ImportProgress = {
   onScan?: (total: number) => void;
   onProgress?: (done: number, total: number) => void;
+  /** One callback per top-level drop item (a folder is a single item). */
+  onItem?: (item: { name: string; isDir: boolean; bytesTotal: number }) => ImportItemTrack | undefined;
+  resolveConflict?: (info: {
+    name: string;
+    isDir: boolean;
+    suggestedName: string;
+  }) => Promise<NameConflictChoice>;
 };
+
+type ImportBlob = (parentId: number, file: File, onBytes?: (n: number) => void) => Promise<unknown>;
+type ImportFs = Pick<
+  Catalog,
+  'beginBatch' | 'endBatch' | 'ensureDir' | 'lookup' | 'remove' | 'createFile' | 'put'
+>;
 
 /**
  * Import files and folders from a drag-and-drop DataTransfer.
@@ -14,84 +50,288 @@ export type ImportProgress = {
  * + webkitRelativePath. Returns the number of top-level items imported.
  */
 export async function importDataTransferInto(
-  fs: Pick<Catalog, 'beginBatch' | 'endBatch' | 'ensureDir'>,
+  fs: ImportFs,
   parentId: number,
   dt: DataTransfer,
-  importBlob: (parentId: number, file: File) => Promise<unknown>,
+  importBlob: ImportBlob,
   opts?: ImportProgress,
 ): Promise<number> {
   const entries = collectDataTransferEntries(dt);
   const total = entries.length > 0 ? await countFsEntries(entries) : dt.files.length;
   opts?.onScan?.(total);
 
-  fs.beginBatch();
   let done = 0;
   const tick = (): void => {
     done++;
     opts?.onProgress?.(done, total);
   };
-  try {
-    if (entries.length > 0) {
-      entries.sort(compareImportEntries);
-      for (const entry of entries) {
-        await importFsEntry(fs, parentId, entry, importBlob, tick);
-      }
-      return entries.length;
-    }
 
-    const files = [...dt.files].sort(compareImportFiles);
-    for (const file of files) {
-      await importFileWithRelativePath(fs, parentId, file, importBlob);
-      tick();
+  if (entries.length > 0) {
+    const groups = groupTopLevelEntries(entries.sort(compareImportEntries));
+    const plans = await planIncoming(fs, parentId, groups, opts?.resolveConflict);
+    fs.beginBatch();
+    try {
+      for (let i = 0; i < groups.length; i++) {
+        const group = groups[i]!;
+        const plan = plans[i]!;
+        await applyReplace(fs, plan);
+        const bytesTotal = await measureGroupBytes(group.entries);
+        const track = opts?.onItem?.({
+          name: plan.destName,
+          isDir: group.isDir,
+          bytesTotal,
+        });
+        try {
+          for (const entry of group.entries) {
+            const asName = mappedIncomingName(unescapeHostFilename(entry.name), group.name, plan.destName);
+            await importFsEntry(fs, parentId, entry, importBlob, tick, track, asName);
+          }
+          track?.onDone?.();
+        } catch (err) {
+          track?.onDone?.(err instanceof Error ? err : new Error(String(err)));
+          throw err;
+        }
+      }
+      return groups.length;
+    } finally {
+      fs.endBatch();
     }
-    return files.length;
+  }
+
+  const groups = groupFilesByTopLevel([...dt.files].sort(compareImportFiles));
+  const plans = await planIncoming(fs, parentId, groups, opts?.resolveConflict);
+  fs.beginBatch();
+  try {
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i]!;
+      const plan = plans[i]!;
+      await applyReplace(fs, plan);
+      const bytesTotal = group.files.reduce((n, f) => n + f.size, 0);
+      const track = opts?.onItem?.({
+        name: plan.destName,
+        isDir: group.isDir,
+        bytesTotal,
+      });
+      try {
+        for (const file of group.files) {
+          const destTop = mappedIncomingName(
+            topFileName(file),
+            group.name,
+            plan.destName,
+          );
+          await importFileWithRelativePath(fs, parentId, file, importBlob, track, destTop);
+          tick();
+        }
+        track?.onDone?.();
+      } catch (err) {
+        track?.onDone?.(err instanceof Error ? err : new Error(String(err)));
+        throw err;
+      }
+    }
+    return groups.length;
   } finally {
     fs.endBatch();
   }
 }
 
+async function planIncoming(
+  fs: ImportFs,
+  parentId: number,
+  groups: { name: string; isDir: boolean }[],
+  resolveConflict?: ImportProgress['resolveConflict'],
+): Promise<PlacementPlan[]> {
+  if (!resolveConflict) {
+    return groups.map((g) => ({ destName: g.name, replaceId: null }));
+  }
+  const reserved = new Set<string>();
+  const plans: PlacementPlan[] = [];
+  for (const g of groups) {
+    const plan = await planItemPlacement(fs, parentId, g.name, g.isDir, { reserved, resolveConflict });
+    if (!plan) throw new TransferCancelled();
+    reserved.add(plan.destName.toLowerCase());
+    plans.push(plan);
+  }
+  return plans;
+}
+
+async function applyReplace(fs: ImportFs, plan: PlacementPlan): Promise<void> {
+  if (plan.replaceId != null) await fs.remove(plan.replaceId);
+}
+
+function mappedIncomingName(rawName: string, original: string, destName: string): string {
+  if (destName === original) return rawName;
+  if (rawName === original) return destName;
+  if (isAppleDoubleSidecarName(rawName) && rawName.slice(2) === original) return `._${destName}`;
+  return rawName;
+}
+
+function topFileName(file: File): string {
+  const rel = file.webkitRelativePath;
+  if (rel && rel.includes('/')) return unescapeHostFilename(rel.split('/')[0]!);
+  return unescapeHostFilename(file.name);
+}
+
 async function importFsEntry(
-  fs: Pick<Catalog, 'ensureDir'>,
+  fs: ImportFs,
   parentId: number,
   entry: FileSystemEntry,
-  importBlob: (parentId: number, file: File) => Promise<unknown>,
+  importBlob: ImportBlob,
   onItem?: () => void,
+  track?: ImportItemTrack,
+  destName?: string,
 ): Promise<void> {
+  const name = destName ?? unescapeHostFilename(entry.name);
   if (entry.isDirectory) {
-    const dir = await fs.ensureDir(parentId, unescapeHostFilename(entry.name));
+    const dir = await fs.ensureDir(parentId, name);
     onItem?.();
     const kids = (await readDirectoryEntries(entry as FileSystemDirectoryEntry)).sort(compareImportEntries);
     for (const kid of kids) {
-      await importFsEntry(fs, dir.id, kid, importBlob, onItem);
+      await importFsEntry(fs, dir.id, kid, importBlob, onItem, track);
     }
     return;
   }
   if (entry.isFile) {
     const file = await readFileEntry(entry as FileSystemFileEntry);
-    await importBlob(parentId, file);
+    await importOneFile(fs, parentId, fileWithName(file, name), importBlob, track);
     onItem?.();
   }
 }
 
 async function importFileWithRelativePath(
-  fs: Pick<Catalog, 'ensureDir'>,
+  fs: ImportFs,
   parentId: number,
   file: File,
-  importBlob: (parentId: number, file: File) => Promise<unknown>,
+  importBlob: ImportBlob,
+  track?: ImportItemTrack,
+  destTop?: string,
 ): Promise<void> {
   const rel = file.webkitRelativePath;
   if (!rel || !rel.includes('/')) {
-    await importBlob(parentId, file);
+    const name = destTop ?? unescapeHostFilename(file.name);
+    await importOneFile(fs, parentId, fileWithName(file, name), importBlob, track);
     return;
   }
   const parts = rel.split('/');
+  if (destTop) parts[0] = destTop;
   let dirId = parentId;
   for (let i = 0; i < parts.length - 1; i++) {
     const part = parts[i]!;
     if (!part || part === '.' || part === '..') continue;
     dirId = (await fs.ensureDir(dirId, unescapeHostFilename(part))).id;
   }
-  await importBlob(dirId, file);
+  await importOneFile(fs, dirId, file, importBlob, track);
+}
+
+async function importOneFile(
+  fs: ImportFs,
+  parentId: number,
+  file: File,
+  importBlob: ImportBlob,
+  track?: ImportItemTrack,
+): Promise<void> {
+  const name = unescapeHostFilename(file.name);
+  const onBytes = track?.onBytes;
+  if (!loadPrefs().autoExpandFiles || !shouldTryExpand(name)) {
+    await importBlob(parentId, file, onBytes);
+    return;
+  }
+  const buf = await readBlobProgress(file, onBytes);
+  let expanded: ExpandedNode[] | null = null;
+  try {
+    expanded = expandIncoming(name, buf);
+  } catch (err) {
+    log.warn(`Couldn’t auto-expand “${name}”: ${err instanceof Error ? err.message : err}`, 'expand');
+  }
+  if (!expanded) {
+    await importBlob(parentId, new File([buf], name, { type: file.type, lastModified: file.lastModified }));
+    return;
+  }
+  const first = expanded[0];
+  log.info(
+    expanded.length === 1 && first?.kind === 'file'
+      ? `Expanded “${name}” → “${first.name}”`
+      : `Expanded “${name}” into ${expanded.length} item(s)`,
+    'expand',
+  );
+  await importExpandedTree(fs, parentId, expanded, track);
+}
+
+function shouldTryExpand(name: string): boolean {
+  const ext = filenameExtension(name);
+  return ext === 'hqx' || ext === 'bin' || ext === 'sit';
+}
+
+/** Write expanded Mac files/folders through Catalog.createFile / put (forks, Finder info, dates). */
+export async function importExpandedTree(
+  fs: Pick<Catalog, 'ensureDir' | 'createFile' | 'put'>,
+  parentId: number,
+  nodes: ExpandedNode[],
+  track?: ImportItemTrack,
+): Promise<void> {
+  for (const node of nodes) {
+    if (node.kind === 'dir') {
+      const dir = await fs.ensureDir(parentId, node.name);
+      await stampExpandedMeta(fs, dir, node, true);
+      await importExpandedTree(fs, dir.id, node.children, track);
+      continue;
+    }
+    await importExpandedFile(fs, parentId, node, track);
+  }
+}
+
+async function importExpandedFile(
+  fs: Pick<Catalog, 'createFile' | 'put'>,
+  parentId: number,
+  node: ExpandedFile,
+  track?: ImportItemTrack,
+): Promise<void> {
+  const bytesTotal = node.data.length + node.resource.length;
+  const child = track?.onExpand?.({
+    name: node.name,
+    isDir: false,
+    bytesTotal,
+    finderInfo: node.finderInfo,
+  });
+  let wrote = 0;
+  try {
+    const vnode = await fs.createFile(parentId, node.name, node.data, node.resource, node.finderInfo, (n) => {
+      wrote += n;
+      child?.onBytes?.(n);
+    });
+    if (wrote === 0 && bytesTotal > 0) child?.onBytes?.(bytesTotal);
+    await stampExpandedMeta(fs, vnode, node, false);
+    child?.onDone?.();
+  } catch (err) {
+    child?.onDone?.(err instanceof Error ? err : new Error(String(err)));
+    throw err;
+  }
+}
+
+async function stampExpandedMeta(
+  fs: Pick<Catalog, 'put'>,
+  vnode: VNode,
+  meta: ExpandedFile | ExpandedDir,
+  applyFinderInfo: boolean,
+): Promise<void> {
+  let dirty = false;
+  if (applyFinderInfo && meta.finderInfo && meta.finderInfo.some((b) => b !== 0)) {
+    vnode.finderInfo = meta.finderInfo;
+    dirty = true;
+  }
+  if (meta.createDate) {
+    vnode.createDate = hfsTimeToAfp(meta.createDate);
+    dirty = true;
+  }
+  if (meta.modDate) {
+    vnode.modDate = hfsTimeToAfp(meta.modDate);
+    dirty = true;
+  }
+  if (dirty) await fs.put(vnode);
+}
+
+function fileWithName(file: File, name: string): File {
+  if (file.name === name) return file;
+  return new File([file], name, { type: file.type, lastModified: file.lastModified });
 }
 
 function collectDataTransferEntries(dt: DataTransfer): FileSystemEntry[] {
@@ -115,6 +355,79 @@ async function countFsEntries(entries: FileSystemEntry[]): Promise<number> {
   };
   for (const entry of entries) await walk(entry);
   return total;
+}
+
+async function measureGroupBytes(entries: FileSystemEntry[]): Promise<number> {
+  let n = 0;
+  for (const entry of entries) n += await measureEntryBytes(entry);
+  return n;
+}
+
+async function measureEntryBytes(entry: FileSystemEntry): Promise<number> {
+  if (entry.isFile) {
+    const file = await readFileEntry(entry as FileSystemFileEntry);
+    return file.size;
+  }
+  if (!entry.isDirectory) return 0;
+  let n = 0;
+  const kids = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
+  for (const kid of kids) n += await measureEntryBytes(kid);
+  return n;
+}
+
+function groupTopLevelEntries(
+  entries: FileSystemEntry[],
+): { name: string; isDir: boolean; entries: FileSystemEntry[] }[] {
+  const map = new Map<string, { name: string; isDir: boolean; entries: FileSystemEntry[] }>();
+  const order: string[] = [];
+  for (const entry of entries) {
+    const raw = unescapeHostFilename(entry.name);
+    const logical = isAppleDoubleSidecarName(raw) ? raw.slice(2) : raw;
+    const key = logical.toLowerCase();
+    let g = map.get(key);
+    if (!g) {
+      g = { name: logical, isDir: false, entries: [] };
+      map.set(key, g);
+      order.push(key);
+    }
+    g.entries.push(entry);
+    if (entry.isDirectory && !isAppleDoubleSidecarName(raw)) g.isDir = true;
+  }
+  return order.map((k) => {
+    const g = map.get(k)!;
+    g.entries.sort(compareImportEntries);
+    return g;
+  });
+}
+
+function groupFilesByTopLevel(files: File[]): { name: string; isDir: boolean; files: File[] }[] {
+  const map = new Map<string, { name: string; isDir: boolean; files: File[] }>();
+  const order: string[] = [];
+  const bump = (logical: string, isDir: boolean, file: File) => {
+    const key = logical.toLowerCase();
+    let g = map.get(key);
+    if (!g) {
+      g = { name: logical, isDir, files: [] };
+      map.set(key, g);
+      order.push(key);
+    }
+    g.files.push(file);
+    if (isDir) g.isDir = true;
+  };
+  for (const file of files) {
+    const rel = file.webkitRelativePath;
+    if (rel && rel.includes('/')) {
+      bump(unescapeHostFilename(rel.split('/')[0]!), true, file);
+    } else {
+      const raw = unescapeHostFilename(file.name);
+      bump(isAppleDoubleSidecarName(raw) ? raw.slice(2) : raw, false, file);
+    }
+  }
+  return order.map((k) => {
+    const g = map.get(k)!;
+    g.files.sort(compareImportFiles);
+    return g;
+  });
 }
 
 function isAppleDoubleSidecarName(name: string): boolean {
@@ -160,4 +473,29 @@ function readFileEntry(entry: FileSystemFileEntry): Promise<File> {
   return new Promise((resolve, reject) => {
     entry.file(resolve, reject);
   });
+}
+
+/** Read a File, optionally reporting each stream chunk (not the full size up front). */
+export async function readBlobProgress(file: File, onBytes?: (n: number) => void): Promise<Uint8Array> {
+  if (!onBytes || typeof file.stream !== 'function') {
+    return new Uint8Array(await file.arrayBuffer());
+  }
+  const reader = file.stream().getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.byteLength) continue;
+    chunks.push(value);
+    total += value.byteLength;
+    onBytes(value.byteLength);
+  }
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
 }

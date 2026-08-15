@@ -6,7 +6,8 @@ import * as asp from '../../protocol/asp';
 import * as C from '../../protocol/afp/constants';
 import * as cmd from './commands';
 import { desEncryptBlock } from '../../hash/des';
-import { encodeMacRoman } from '../../protocol/macroman';
+import { encodeMacRoman, decodeMacRoman } from '../../protocol/macroman';
+import { be16, be32 } from '../../protocol/binary';
 import { log } from '../../util/logger';
 
 export type AfpCredentials =
@@ -50,6 +51,7 @@ export class AfpClient {
   private noticeHandler: ((n: AfpServerNotice) => void) | null = null;
   private pendingNotices: AfpServerNotice[] = [];
   private sawShutdown = false;
+  private inFlight = 0;
 
   private constructor(sess: AspSession) {
     this.sess = sess;
@@ -89,12 +91,97 @@ export class AfpClient {
     };
   }
 
+  private fpDetail(block: Uint8Array): string {
+    const op = block[0] ?? 0;
+    try {
+      if (op === C.CmdEnumerate && block.length >= 16) {
+        return ` vol=${be16(block, 2)} did=${be32(block, 4)} start=${be16(block, 14)} n=${be16(block, 12)}`;
+      }
+      if (op === C.CmdOpenFork && block.length >= 13) {
+        return ` ${block[1]! & 0x80 ? 'rsrc' : 'data'} did=${be32(block, 4)}`;
+      }
+      if ((op === C.CmdRead || op === C.CmdWrite) && block.length >= 12) {
+        return ` fork=${be16(block, 2)} off=${be32(block, 4)} n=${be32(block, 8)}`;
+      }
+      if (op === C.CmdOpenVol && block.length >= 5) {
+        const n = block[4]!;
+        return ` “${decodeMacRoman(block.subarray(5, 5 + n))}”`;
+      }
+      if (op === C.CmdCloseFork && block.length >= 4) {
+        return ` fork=${be16(block, 2)}`;
+      }
+      if (op === C.CmdGetFileDirParms && block.length >= 12) {
+        return ` did=${be32(block, 4)}`;
+      }
+    } catch {
+      /* keep name only */
+    }
+    return '';
+  }
+
+  private async fp(
+    block: Uint8Array,
+    opts?: { bitmap?: number; timeoutMs?: number },
+  ): Promise<{ result: number; data: Uint8Array }> {
+    const name = C.afpCmdName(block[0] ?? 0);
+    const detail = this.fpDetail(block);
+    this.inFlight++;
+    const t0 = performance.now();
+    log.trace(`→ ${name}${detail} ${block.length}b inFlight=${this.inFlight}`, 'afp');
+    try {
+      const r = await this.sess.command(block, opts);
+      log.trace(
+        `← ${name}${detail} ${C.afpResultName(r.result)} ${r.data.length}b ${Math.round(performance.now() - t0)}ms`,
+        'afp',
+      );
+      return r;
+    } catch (err) {
+      log.trace(
+        `← ${name}${detail} error ${err instanceof Error ? err.message : String(err)} ${Math.round(performance.now() - t0)}ms`,
+        'afp',
+      );
+      throw err;
+    } finally {
+      this.inFlight--;
+    }
+  }
+
+  private async fpWrite(
+    cmdBlock: Uint8Array,
+    writeData: Uint8Array,
+  ): Promise<{ result: number; data: Uint8Array }> {
+    const name = C.afpCmdName(cmdBlock[0] ?? 0);
+    const detail = this.fpDetail(cmdBlock);
+    this.inFlight++;
+    const t0 = performance.now();
+    log.trace(
+      `→ ${name}${detail} hdr=${cmdBlock.length}b data=${writeData.length}b inFlight=${this.inFlight}`,
+      'afp',
+    );
+    try {
+      const r = await this.sess.write(cmdBlock, writeData);
+      log.trace(
+        `← ${name}${detail} ${C.afpResultName(r.result)} ${r.data.length}b ${Math.round(performance.now() - t0)}ms`,
+        'afp',
+      );
+      return r;
+    } catch (err) {
+      log.trace(
+        `← ${name}${detail} error ${err instanceof Error ? err.message : String(err)} ${Math.round(performance.now() - t0)}ms`,
+        'afp',
+      );
+      throw err;
+    } finally {
+      this.inFlight--;
+    }
+  }
+
   private async handleAttention(code: number): Promise<void> {
     log.info(`ASP attention 0x${(code & 0xffff).toString(16)}`, 'afp');
     let text = '';
     if (code & asp.AttnMsg) {
       try {
-        const r = await this.sess.command(cmd.getSrvrMsg(C.SrvrMsgTypeServer));
+        const r = await this.fp(cmd.getSrvrMsg(C.SrvrMsgTypeServer));
         if (r.result === C.NoErr) text = cmd.parseGetSrvrMsg(r.data).text;
       } catch (err) {
         log.warn(`FPGetSrvrMsg failed: ${err instanceof Error ? err.message : String(err)}`, 'afp');
@@ -182,7 +269,7 @@ export class AfpClient {
     if (creds.kind === 'guest') {
       const uam = cmd.pickGuestUam(this.uams);
       log.info(`FPLogin guest (${this.version}, ${uam})`, 'afp');
-      const login = await this.sess.command(cmd.loginGuest(this.version, uam));
+      const login = await this.fp(cmd.loginGuest(this.version, uam));
       this.assertLoginOk(login.result, 'FPLogin');
     } else {
       await this.loginPassword(creds.username, creds.password);
@@ -203,7 +290,7 @@ export class AfpClient {
     if (advertisedClear || (!twoWay && !randnum)) {
       const uam = cmd.pickCleartextUam(this.uams);
       log.info(`FPLogin user “${username}” via ${uam} (${this.version})`, 'afp');
-      const login = await this.sess.command(cmd.loginCleartext(username, password, this.version, uam));
+      const login = await this.fp(cmd.loginCleartext(username, password, this.version, uam));
       this.assertLoginOk(login.result, 'FPLogin');
       return;
     }
@@ -228,7 +315,7 @@ export class AfpClient {
     uam: string,
     twoWay: boolean,
   ): Promise<void> {
-    const login = await this.sess.command(cmd.loginRandnum(username, this.version, uam));
+    const login = await this.fp(cmd.loginRandnum(username, this.version, uam));
     if (login.result !== C.ErrAuthContinue) {
       this.assertLoginOk(login.result, 'FPLogin');
       return;
@@ -245,7 +332,7 @@ export class AfpClient {
       auth.set(encrypted, 0);
       auth.set(clientNonce, 8);
     }
-    const cont = await this.sess.command(cmd.loginCont(id, auth));
+    const cont = await this.fp(cmd.loginCont(id, auth));
     this.assertLoginOk(cont.result, 'FPLoginCont');
   }
 
@@ -257,7 +344,7 @@ export class AfpClient {
   }
 
   async refreshVolumes(): Promise<{ flags: number; name: string }[]> {
-    const parms = await this.sess.command(cmd.getSrvrParms());
+    const parms = await this.fp(cmd.getSrvrParms());
     if (parms.result !== C.NoErr) {
       throw new Error(`FPGetSrvrParms ${C.afpResultName(parms.result)} (${parms.result})`);
     }
@@ -284,7 +371,7 @@ export class AfpClient {
       return already;
     }
     log.info(`FPOpenVol “${name}”`, 'afp');
-    const ov = await this.sess.command(cmd.openVol(name));
+    const ov = await this.fp(cmd.openVol(name));
     if (ov.result !== C.NoErr) {
       throw new Error(`FPOpenVol ${C.afpResultName(ov.result)} (${ov.result})`);
     }
@@ -295,7 +382,7 @@ export class AfpClient {
     log.info(`Opened volume “${name}” (id ${volId})`, 'afp');
     if (this.supportsSrvrMsg) {
       try {
-        const r = await this.sess.command(cmd.getSrvrMsg(C.SrvrMsgTypeLogin));
+        const r = await this.fp(cmd.getSrvrMsg(C.SrvrMsgTypeLogin));
         if (r.result === C.NoErr) {
           const greeting = cmd.parseGetSrvrMsg(r.data).text.trim();
           if (greeting) {
@@ -328,7 +415,7 @@ export class AfpClient {
     const all: cmd.DirEntry[] = [];
     let start = 1;
     for (;;) {
-      const r = await this.sess.command(
+      const r = await this.fp(
         cmd.enumerate(
           vol,
           dirId,
@@ -352,18 +439,63 @@ export class AfpClient {
     return all;
   }
 
+  async stat(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry | undefined> {
+    const vol = this.vid(volId);
+    if (!vol) return undefined;
+    const r = await this.fp(
+      cmd.getFileDirParms(vol, dirId, cmd.DEFAULT_FILE_BITMAP, cmd.DEFAULT_DIR_BITMAP, path),
+    );
+    if (r.result === C.ErrObjectNotFnd) return undefined;
+    if (r.result !== C.NoErr) {
+      throw new Error(`FPGetFileDirParms ${C.afpResultName(r.result)} (${r.result})`);
+    }
+    const entry = cmd.parseGetFileDirParms(r.data, cmd.DEFAULT_FILE_BITMAP, cmd.DEFAULT_DIR_BITMAP);
+    if (entry && !entry.name) entry.name = path.replace(/^\/+|\/+$/g, '') || path;
+    return entry;
+  }
+
+  /**
+   * Open a fork and run ranged FPReads (header / map / selected resources).
+   */
+  async withForkReader<T>(
+    path: string,
+    dirId: number,
+    resource: boolean,
+    fn: (read: (offset: number, count: number) => Promise<Uint8Array>) => Promise<T>,
+    volId?: number,
+  ): Promise<T> {
+    const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
+    const open = await this.fp(
+      cmd.openFork(this.vid(volId), dirId, 0, C.AccessRead, flag, path),
+    );
+    if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
+    const { forkRef } = cmd.parseOpenFork(open.data);
+    try {
+      const read = async (offset: number, count: number): Promise<Uint8Array> => {
+        const bitmap = count <= 578 ? 0x01 : 0xff;
+        const rr = await this.fp(cmd.readFork(forkRef, offset, count), { bitmap });
+        if (rr.result === C.ErrEOFErr) return rr.data;
+        if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
+        return rr.data;
+      };
+      return await fn(read);
+    } finally {
+      await this.fp(cmd.closeFork(forkRef));
+    }
+  }
+
   async mkdir(name: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
-    const r = await this.sess.command(cmd.createDir(this.vid(volId), dirId, name));
+    const r = await this.fp(cmd.createDir(this.vid(volId), dirId, name));
     if (r.result !== C.NoErr) throw new Error(`FPCreateDir ${r.result}`);
   }
 
   async remove(path: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
-    const r = await this.sess.command(cmd.deletePath(this.vid(volId), dirId, path));
+    const r = await this.fp(cmd.deletePath(this.vid(volId), dirId, path));
     if (r.result !== C.NoErr) throw new Error(`FPDelete ${r.result}`);
   }
 
   async rename(path: string, newName: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
-    const r = await this.sess.command(cmd.rename(this.vid(volId), dirId, path, newName));
+    const r = await this.fp(cmd.rename(this.vid(volId), dirId, path, newName));
     if (r.result !== C.NoErr) throw new Error(`FPRename ${r.result}`);
   }
 
@@ -374,15 +506,21 @@ export class AfpClient {
     newName: string,
     volId?: number,
   ): Promise<void> {
-    const r = await this.sess.command(cmd.moveAndRename(this.vid(volId), srcDir, srcName, dstDir, newName));
+    const r = await this.fp(cmd.moveAndRename(this.vid(volId), srcDir, srcName, dstDir, newName));
     if (r.result !== C.NoErr) {
       throw new Error(`FPMoveAndRename ${C.afpResultName(r.result)} (${r.result})`);
     }
   }
 
-  async readFile(path: string, dirId = C.CNIDRoot, resource = false, volId?: number): Promise<Uint8Array> {
+  async readFile(
+    path: string,
+    dirId = C.CNIDRoot,
+    resource = false,
+    volId?: number,
+    onBytes?: (n: number) => void,
+  ): Promise<Uint8Array> {
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
-    const open = await this.sess.command(
+    const open = await this.fp(
       cmd.openFork(this.vid(volId), dirId, C.FileBitmapDataForkLen | C.FileBitmapRsrcForkLen, C.AccessRead, flag, path),
     );
     if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
@@ -391,19 +529,23 @@ export class AfpClient {
     let offset = 0;
     try {
       for (;;) {
-        const rr = await this.sess.command(cmd.readFork(forkRef, offset, 4096), { bitmap: 0xff });
+        const rr = await this.fp(cmd.readFork(forkRef, offset, 4096), { bitmap: 0xff });
         if (rr.result === C.ErrEOFErr) {
-          if (rr.data.length) chunks.push(rr.data);
+          if (rr.data.length) {
+            chunks.push(rr.data);
+            onBytes?.(rr.data.length);
+          }
           break;
         }
         if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
         if (rr.data.length === 0) break;
         chunks.push(rr.data);
+        onBytes?.(rr.data.length);
         offset += rr.data.length;
         if (rr.data.length < 4096) break;
       }
     } finally {
-      await this.sess.command(cmd.closeFork(forkRef));
+      await this.fp(cmd.closeFork(forkRef));
     }
     const total = chunks.reduce((n, c) => n + c.length, 0);
     const out = new Uint8Array(total);
@@ -421,14 +563,15 @@ export class AfpClient {
     dirId = C.CNIDRoot,
     resource = false,
     volId?: number,
+    onBytes?: (n: number) => void,
   ): Promise<void> {
     const vol = this.vid(volId);
-    const cr = await this.sess.command(cmd.createFile(vol, dirId, path, 0));
+    const cr = await this.fp(cmd.createFile(vol, dirId, path, 0));
     if (cr.result !== C.NoErr && cr.result !== C.ErrObjectExists) {
       throw new Error(`FPCreateFile ${cr.result}`);
     }
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
-    const open = await this.sess.command(
+    const open = await this.fp(
       cmd.openFork(vol, dirId, 0, C.AccessRead | C.AccessWrite, flag, path),
     );
     if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
@@ -439,26 +582,35 @@ export class AfpClient {
       let offset = 0;
       while (offset < data.length) {
         const chunk = data.subarray(offset, Math.min(offset + chunkSize, data.length));
-        const wr = await this.sess.write(cmd.writeFork(forkRef, offset, chunk.length), chunk);
+        const wr = await this.fpWrite(cmd.writeFork(forkRef, offset, chunk.length), chunk);
         if (wr.result !== C.NoErr) throw new Error(`FPWrite ${wr.result}`);
         const last = cmd.parseWriteReply(wr.data);
-        offset = last > offset ? last : offset + chunk.length;
+        const next = last > offset ? last : offset + chunk.length;
+        onBytes?.(next - offset);
+        offset = next;
       }
     } finally {
-      await this.sess.command(cmd.closeFork(forkRef));
+      await this.fp(cmd.closeFork(forkRef));
     }
   }
 
-  async setFinderInfo(path: string, finderInfo: Uint8Array, dirId = C.CNIDRoot, volId?: number): Promise<void> {
-    const r = await this.sess.command(
-      cmd.setFileDirParms(this.vid(volId), dirId, C.FDBitmapFinderInfo, path, finderInfo),
-    );
+  async setFinderInfo(
+    path: string,
+    finderInfo: Uint8Array,
+    dirId = C.CNIDRoot,
+    volId?: number,
+    dates?: { createDate?: number; modDate?: number },
+  ): Promise<void> {
+    let bitmap = C.FDBitmapFinderInfo;
+    if (dates?.createDate) bitmap |= C.FDBitmapCreateDate;
+    if (dates?.modDate) bitmap |= C.FDBitmapModDate;
+    const r = await this.fp(cmd.setFileDirParms(this.vid(volId), dirId, bitmap, path, finderInfo, dates));
     if (r.result !== C.NoErr) throw new Error(`FPSetFileDirParms ${r.result}`);
   }
 
   async close(): Promise<void> {
     if (this.loggedIn) {
-      await this.sess.command(cmd.logout()).catch(() => undefined);
+      await this.fp(cmd.logout()).catch(() => undefined);
       this.loggedIn = false;
     }
     this.volId = 0;

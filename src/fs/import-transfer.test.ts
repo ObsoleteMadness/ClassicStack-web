@@ -1,0 +1,137 @@
+import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { be16 } from '../protocol/binary';
+import { fromMacTime, hfsTimeToAfp } from '../protocol/afp/constants';
+import { expandIncoming } from './expand-incoming';
+import { importExpandedTree } from './import-transfer';
+import { makeFinderInfo } from './mac-file';
+import type { Catalog, VNode } from './virtual-fs';
+
+function ascii(s: string): Uint8Array {
+  const b = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+  return b;
+}
+
+function mockCatalog() {
+  let nextId = 10;
+  const nodes = new Map<number, VNode>();
+  const created: VNode[] = [];
+  const fs: Pick<Catalog, 'ensureDir' | 'createFile' | 'put'> = {
+    async ensureDir(parentId, name) {
+      const node: VNode = {
+        id: nextId++,
+        parentId,
+        name,
+        isDir: true,
+        data: new Uint8Array(),
+        resource: new Uint8Array(),
+        finderInfo: new Uint8Array(32),
+        createDate: 1,
+        modDate: 1,
+      };
+      nodes.set(node.id, node);
+      return node;
+    },
+    async createFile(parentId, name, data, resource = new Uint8Array(), finderInfo = new Uint8Array(32)) {
+      const node: VNode = {
+        id: nextId++,
+        parentId,
+        name,
+        isDir: false,
+        data,
+        resource,
+        finderInfo,
+        createDate: 1,
+        modDate: 1,
+      };
+      nodes.set(node.id, node);
+      created.push(node);
+      return node;
+    },
+    async put(node) {
+      nodes.set(node.id, { ...node });
+    },
+  };
+  return { fs, nodes, created };
+}
+
+describe('importExpandedTree', () => {
+  it('writes data fork, resource fork, Finder info, and Mac dates via createFile', async () => {
+    const { fs, nodes, created } = mockCatalog();
+    const finderInfo = makeFinderInfo('APPL', 'CARO', 0x0400);
+    await importExpandedTree(fs, 2, [
+      {
+        kind: 'file',
+        name: 'App',
+        data: Uint8Array.of(1, 2, 3),
+        resource: Uint8Array.of(0xca, 0xfe),
+        finderInfo,
+        createDate: 0xb3d2a000,
+        modDate: 0xb3d2b000,
+      },
+    ]);
+    expect(created).toHaveLength(1);
+    expect(created[0]!.name).toBe('App');
+    expect([...created[0]!.data]).toEqual([1, 2, 3]);
+    expect([...created[0]!.resource]).toEqual([0xca, 0xfe]);
+    expect(String.fromCharCode(...created[0]!.finderInfo.subarray(0, 8))).toBe('APPLCARO');
+    const stamped = nodes.get(created[0]!.id)!;
+    expect(stamped.createDate).toBe(hfsTimeToAfp(0xb3d2a000));
+    expect(stamped.modDate).toBe(hfsTimeToAfp(0xb3d2b000));
+    expect(fromMacTime(stamped.createDate).getUTCFullYear()).toBe(1999);
+    expect(fromMacTime(stamped.modDate).getUTCFullYear()).toBe(1999);
+  });
+
+  it('applies folder Finder flags after ensureDir', async () => {
+    const { fs, nodes } = mockCatalog();
+    const folderInfo = makeFinderInfo('    ', '    ', 0x0400);
+    await importExpandedTree(fs, 2, [
+      {
+        kind: 'dir',
+        name: 'Disk',
+        finderInfo: folderInfo,
+        createDate: 0xb3d2a000,
+        children: [
+          {
+            kind: 'file',
+            name: 'Notes',
+            data: ascii('hi'),
+            resource: new Uint8Array(),
+            finderInfo: makeFinderInfo('TEXT', 'ttxt'),
+          },
+        ],
+      },
+    ]);
+    const disk = [...nodes.values()].find((n) => n.isDir && n.name === 'Disk');
+    expect(disk).toBeDefined();
+    expect(be16(disk!.finderInfo, 8)).toBe(0x0400);
+    expect(disk!.createDate).toBe(hfsTimeToAfp(0xb3d2a000));
+    expect(fromMacTime(disk!.createDate).getUTCFullYear()).toBe(1999);
+    const notes = [...nodes.values()].find((n) => n.name === 'Notes');
+    expect(notes?.parentId).toBe(disk!.id);
+  });
+
+  it('converts StuffIt HFS dates so Finder shows the archive year, not the 1950s', async () => {
+    const packed = new Uint8Array(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'testdata/stuffit45.sit')),
+    );
+    const expanded = expandIncoming('Archive.sit', packed);
+    expect(expanded?.length).toBeGreaterThan(0);
+    const { fs, nodes } = mockCatalog();
+    await importExpandedTree(fs, 2, expanded!);
+    const image = [...nodes.values()].find((n) => n.name === 'Test Image');
+    expect(image).toBeDefined();
+    expect(fromMacTime(image!.createDate).getUTCFullYear()).toBe(2023);
+    expect(fromMacTime(image!.modDate).getUTCFullYear()).toBe(2023);
+  });
+});
+
+describe('hfsTimeToAfp', () => {
+  it('maps seconds-since-1904 onto AFP seconds-since-2000', () => {
+    expect(hfsTimeToAfp(0)).toBe(0);
+    expect(fromMacTime(hfsTimeToAfp(0xb3d2a000)).toISOString().slice(0, 10)).toBe('1999-08-08');
+  });
+});

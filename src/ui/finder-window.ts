@@ -2,14 +2,46 @@ import type { Catalog, VNode } from '../fs/virtual-fs';
 import type { LookupResult } from '../services/nbp';
 import type { AfpCredentials, AfpServerInfo } from '../services/afp-client/client';
 import { fromMacTime } from '../protocol/afp/constants';
+import { decodeMacRoman } from '../protocol/macroman';
 import { buildAppleDouble, zipStore } from '../fs/appledouble';
 import { formatBytes } from './format-bytes';
-import { iconCache, readTypeCreator, isCustomFolderIconName, isFinderInvisible, type IconUrls } from '../fs/icon-cache';
+import {
+  iconCache,
+  readTypeCreator,
+  isCustomFolderIconName,
+  isFinderInvisible,
+  isDefaultFolderIcon,
+  type IconUrls,
+} from '../fs/icon-cache';
+import { expandArchiveFile, expandFailureMessage, isExpandableArchive, type ExpandedNode } from '../fs/expand-incoming';
+import { importExpandedTree } from '../fs/import-transfer';
 import { loadPrefs, savePrefs } from '../util/prefs';
 import { log } from '../util/logger';
+import { uiIcons } from './lucide-icon';
+import { enableWindowResize } from './window-resize';
+import type { ResourceForkExplorer } from './resource-fork-explorer';
+import { isCompactUi, onLayoutModeChange } from './layout-mode';
+import { positionCallout } from './callout';
+import { transferListHtml } from './transfer-list';
+import {
+  transferActivity,
+  TRANSFER_FILE_ICON,
+} from '../util/transfer-activity';
+import {
+  isTransferCancelled,
+  planItemPlacement,
+  uniqueCopyName,
+  TransferCancelled,
+  type NameConflictChoice,
+  type PlacementPlan,
+} from '../fs/name-conflict';
 
 export type ViewMode = 'icon' | 'list' | 'column';
 export type SortKey = 'name' | 'modified' | 'size';
+
+/** Finder file types that open in the Quick Look overlay. */
+const PREVIEW_TEXT_TYPES = new Set(['TEXT']);
+const PREVIEW_MAX_BYTES = 512 * 1024;
 
 export interface FinderHost {
   connectSerial(): Promise<void>;
@@ -38,6 +70,13 @@ export interface FinderHost {
   isConnected(): boolean;
   nodeLabel(): string;
   showAlert(title: string, text: string): void;
+  promptNameConflict(opts: {
+    name: string;
+    isDir: boolean;
+    suggestedName: string;
+  }): Promise<NameConflictChoice>;
+  /** Copy bundled public/welcome files into Browser Share (skips existing names). */
+  installWelcomePack(): Promise<{ imported: number; skipped: number }>;
 }
 
 interface ListItem {
@@ -63,6 +102,11 @@ interface ClipNode {
 function nodeByteSize(n: VNode): number {
   if (n.isDir) return 0;
   return (n.dataBytes ?? n.data.length) + (n.resourceBytes ?? n.resource.length);
+}
+
+function clipByteSize(item: ClipNode): number {
+  if (item.isDir) return (item.kids ?? []).reduce((n, k) => n + clipByteSize(k), 0);
+  return item.data.length + item.resource.length;
 }
 
 export class FinderWindow extends HTMLElement {
@@ -97,6 +141,15 @@ export class FinderWindow extends HTMLElement {
   private folderLoadGen = new Map<number, number>();
   private columnLoading = false;
   private columnLoadGen = 0;
+  /** Per-column widths in column view (`"0"`, `"1"`, …, `"preview"`). */
+  private columnWidths = new Map<string, number>();
+  private columnResize: {
+    col: HTMLElement;
+    handle: HTMLElement;
+    key: string;
+    startX: number;
+    startW: number;
+  } | null = null;
   private folderOpening = false;
   private listChildCache = new Map<number, VNode[]>();
   /** Skip pushState while applying browser back/forward. */
@@ -115,9 +168,11 @@ export class FinderWindow extends HTMLElement {
     sourceIds: number[];
   } | null = null;
   private catalogs = new Map<string, Catalog>();
-  private contextMenu: { x: number; y: number; targetId: number | null } | null = null;
+  private contextMenu: { x: number; y: number; targetId: number | null; local?: boolean } | null = null;
   /** Show Finder-invisible / Icon\\r items (persisted via prefs). */
   private showHiddenFiles = loadPrefs().showHiddenFiles;
+  /** Decode dropped BinHex / MacBinary (persisted via prefs). */
+  private autoExpandFiles = loadPrefs().autoExpandFiles;
   /** Local item being dragged (null for external file drops). */
   private dragNodeId: number | null = null;
   private dragNode: VNode | null = null;
@@ -130,9 +185,39 @@ export class FinderWindow extends HTMLElement {
   private vfsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   /** Parent folder ids coalesced from VFS change events until the debounced refresh. */
   private pendingVfsParents = new Set<number>();
+  /** Nested Finder-initiated catalog writes; echoed VFS events are ignored while > 0. */
+  private ownVfsMutation = 0;
   /** Resolved icon URLs keyed by ListItem.key (or type|creator). */
   private iconUrls = new Map<string, IconUrls>();
   private iconLoadGen = 0;
+  private networkScanning = false;
+  private preview: { id: number; name: string; text: string | null; truncated?: boolean; error?: string } | null =
+    null;
+  private previewGen = 0;
+  /** Desktop view to restore when leaving compact layout. */
+  private desktopView: ViewMode | null = null;
+  private sidebarOpen = false;
+  private openCallout: null | 'transfers' | 'actions' | 'share' = null;
+  private unsubTransfer: (() => void) | null = null;
+  private unsubLayout: (() => void) | null = null;
+  private transferIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastTransferPct = 0;
+  private transferBtnVisible = false;
+  private resourceExplorer: ResourceForkExplorer | null = null;
+
+  bindResourceExplorer(panel: ResourceForkExplorer): void {
+    this.resourceExplorer = panel;
+  }
+
+  /** Open the resource-fork explorer on the current (or given) item. */
+  openResourceExplorer(id?: number | null): void {
+    const node = id != null ? this.findNodeAnywhere(id) : this.selectedNode();
+    this.resourceExplorer?.open(this.vfs, node);
+  }
+
+  private syncResourceExplorer(): void {
+    this.resourceExplorer?.followSelection(this.vfs, this.selectedNode());
+  }
 
   /** Drop resolved icons after Advanced → Clear icon cache. */
   invalidateIcons(): void {
@@ -158,13 +243,23 @@ export class FinderWindow extends HTMLElement {
     });
   }
 
+  getAutoExpandFiles(): boolean {
+    return this.autoExpandFiles;
+  }
+
+  setAutoExpandFiles(expand: boolean): void {
+    if (this.autoExpandFiles === expand) return;
+    this.autoExpandFiles = expand;
+    savePrefs({ autoExpandFiles: expand });
+  }
+
   bind(vfs: Catalog, host: FinderHost): void {
     this.localVfs = vfs;
     this.catalogs.set('local', vfs);
     this.attachCatalog(vfs);
     this.host = host;
     this.ensureShellEvents();
-    void this.bootstrapFromLocation();
+    void this.bootstrapFromLocation().then(() => this.applyCompactView());
   }
 
   private attachCatalog(next: Catalog): void {
@@ -227,6 +322,15 @@ export class FinderWindow extends HTMLElement {
   disconnectedCallback(): void {
     this.vfsUnsub?.();
     this.vfsUnsub = null;
+    this.unsubTransfer?.();
+    this.unsubTransfer = null;
+    this.unsubLayout?.();
+    this.unsubLayout = null;
+    window.removeEventListener('pointerdown', this.onWinPointer, true);
+    window.removeEventListener('pointermove', this.onColumnResizeMove);
+    window.removeEventListener('pointerup', this.onColumnResizeUp);
+    window.removeEventListener('pointercancel', this.onColumnResizeUp);
+    if (this.transferIdleTimer) clearTimeout(this.transferIdleTimer);
     if (this.vfsRefreshTimer) {
       clearTimeout(this.vfsRefreshTimer);
       this.vfsRefreshTimer = null;
@@ -235,6 +339,7 @@ export class FinderWindow extends HTMLElement {
 
   /** AFP / local mutations land here; debounce so fork writes don't thrash the UI. */
   private onVfsChanged(change: { parentIds: number[] }): void {
+    if (this.ownVfsMutation > 0) return;
     for (const id of change.parentIds) this.pendingVfsParents.add(id);
     if (this.vfsRefreshTimer) clearTimeout(this.vfsRefreshTimer);
     this.vfsRefreshTimer = setTimeout(() => {
@@ -247,6 +352,25 @@ export class FinderWindow extends HTMLElement {
       this.iconLoadGen++;
       void this.refreshAfterMutation();
     }, 150);
+  }
+
+  /** Run a Finder-initiated catalog write without treating its VFS echo as a remote change. */
+  private async withOwnVfsMutation<T>(fn: () => Promise<T>): Promise<T> {
+    this.ownVfsMutation++;
+    try {
+      return await fn();
+    } finally {
+      this.ownVfsMutation--;
+    }
+  }
+
+  /** Drop a coalesced observer refresh; the caller already reloaded visible folders. */
+  private discardPendingVfsRefresh(): void {
+    if (this.vfsRefreshTimer) {
+      clearTimeout(this.vfsRefreshTimer);
+      this.vfsRefreshTimer = null;
+    }
+    this.pendingVfsParents.clear();
   }
 
   /** True when a mutation's parent is a folder whose children are currently shown. */
@@ -285,6 +409,66 @@ export class FinderWindow extends HTMLElement {
       : this.escape(this.status);
   }
 
+  private startTransfer(
+    name: string,
+    isDir: boolean,
+    bytesTotal: number,
+    finderInfo?: Uint8Array,
+    parentId?: string,
+    detail?: string,
+  ): string {
+    const id = transferActivity.start({
+      name,
+      kind: isDir ? 'folder' : 'file',
+      bytesTotal,
+      iconSrc: isDir ? undefined : TRANSFER_FILE_ICON,
+      parentId,
+      detail,
+    });
+    if (!isDir && finderInfo && finderInfo.length >= 8) {
+      const { type, creator } = readTypeCreator(finderInfo);
+      void iconCache.getForTypeCreator(type, creator).then((urls) => {
+        transferActivity.setIcon(id, urls.small);
+      });
+    }
+    return id;
+  }
+
+  private trackImportItem(item: { name: string; isDir: boolean; bytesTotal: number }): {
+    onBytes: (n: number) => void;
+    onDone: (err?: Error) => void;
+    onExpand: (sub: {
+      name: string;
+      isDir: boolean;
+      bytesTotal: number;
+      finderInfo?: Uint8Array;
+    }) => { onBytes: (n: number) => void; onDone: (err?: Error) => void };
+  } {
+    const id = this.startTransfer(item.name, item.isDir, item.bytesTotal);
+    const bind = (jobId: string) => ({
+      onBytes: (n: number) => transferActivity.addBytes(jobId, n),
+      onDone: (err?: Error) => {
+        if (err) transferActivity.fail(jobId, err.message);
+        else transferActivity.finish(jobId);
+      },
+    });
+    return {
+      ...bind(id),
+      onExpand: (sub) => {
+        const childId = this.startTransfer(sub.name, sub.isDir, sub.bytesTotal, sub.finderInfo, id, 'Expanding');
+        return bind(childId);
+      },
+    };
+  }
+
+  setNetworkScanning(busy: boolean): void {
+    this.networkScanning = busy;
+    const btn = this.querySelector('.side-refresh');
+    if (!btn) return;
+    btn.classList.toggle('spinning', busy);
+    btn.setAttribute('aria-busy', String(busy));
+  }
+
   setServers(list: LookupResult[]): void {
     this.servers = list;
     if (
@@ -306,6 +490,7 @@ export class FinderWindow extends HTMLElement {
     if (this.eventsBound) return;
     this.eventsBound = true;
     this.addEventListener('click', (e) => void this.onClick(e));
+    this.addEventListener('pointerdown', (e) => this.onColumnResizeDown(e));
     this.addEventListener('dblclick', (e) => void this.onDblClick(e));
     this.addEventListener('contextmenu', (e) => void this.onContextMenu(e));
     this.addEventListener('dragstart', (e) => this.onDragStart(e));
@@ -316,6 +501,9 @@ export class FinderWindow extends HTMLElement {
     this.addEventListener('drop', (e) => void this.onDrop(e));
     window.addEventListener('popstate', (e) => void this.onPopState(e));
     window.addEventListener('keydown', (e) => void this.onKeyDown(e));
+    window.addEventListener('pointerdown', this.onWinPointer, true);
+    this.unsubTransfer = transferActivity.subscribe(() => this.syncTransferButton());
+    this.unsubLayout = onLayoutModeChange(() => this.applyCompactView());
     this.ensureRenameBlur();
   }
 
@@ -558,6 +746,7 @@ export class FinderWindow extends HTMLElement {
 
   private async reload(): Promise<void> {
     if (!this.vfs) return;
+    this.discardPendingVfsRefresh();
     this.nodes = this.sortNodes(await this.vfs.children(this.cwd));
     this.listChildCache.set(this.cwd, this.nodes);
     for (const id of [...this.expandedIds]) {
@@ -643,35 +832,45 @@ export class FinderWindow extends HTMLElement {
         <span class="node-label" style="font-size:12px;color:var(--text-muted)">${this.escape(this.host.nodeLabel())}</span>
       </div>
       <div class="toolbar">
-        <button class="btn primary" data-act="connect">${this.host.isConnected() ? 'Disconnect' : 'Connect Serial'}</button>
-        <button class="btn" data-act="refresh" ${this.host.isConnected() ? '' : 'disabled'}>Refresh Network</button>
-        <button class="btn" data-act="mkdir">New Folder</button>
-        <button class="btn" data-act="cut">Cut</button>
-        <button class="btn" data-act="copy">Copy</button>
-        <button class="btn" data-act="paste" ${this.clipboard ? '' : 'disabled'}>Paste</button>
-        <button class="btn" data-act="delete">Delete</button>
-        <button class="btn ${this.showProps ? 'active' : ''}" data-act="props" aria-pressed="${this.showProps}">Properties</button>
-        <button class="btn" data-act="download">Download Zip</button>
-        <label class="sort-wrap">
+        <button type="button" class="btn primary" data-act="connect" aria-label="${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}" title="${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}">
+          <span class="connect-icon">${uiIcons.usb}</span>
+          <span class="connect-label">${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}</span>
+        </button>
+        <button type="button" class="btn icon-btn" data-act="import" aria-label="Upload" title="Upload">${uiIcons.import}</button>
+        <button type="button" class="btn transfer-btn" data-act="transfers" hidden aria-label="File transfers" title="File transfers"></button>
+        <button type="button" class="btn icon-btn" data-act="mkdir" aria-label="New Folder" title="New Folder">${uiIcons.mkdir}</button>
+        <button type="button" class="btn icon-btn toolbar-wide" data-act="cut" aria-label="Cut" title="Cut" ${this.selectedId == null ? 'disabled' : ''}>${uiIcons.cut}</button>
+        <button type="button" class="btn icon-btn toolbar-wide" data-act="copy" aria-label="Copy" title="Copy" ${this.selectedId == null ? 'disabled' : ''}>${uiIcons.copy}</button>
+        <button type="button" class="btn icon-btn toolbar-wide" data-act="paste" aria-label="Paste" title="Paste" ${this.clipboard ? '' : 'disabled'}>${uiIcons.paste}</button>
+        <button type="button" class="btn icon-btn toolbar-wide" data-act="delete" aria-label="Delete" title="Delete" ${this.selectedId == null ? 'disabled' : ''}>${uiIcons.delete}</button>
+        <button type="button" class="btn icon-btn ${this.showProps ? 'active' : ''}" data-act="props" aria-label="Get Info" title="Get Info" aria-pressed="${this.showProps}" ${this.selectedId == null ? 'disabled' : ''}>${uiIcons.props}</button>
+        <button type="button" class="btn icon-btn" data-act="download" aria-label="Download Zip" title="Download Zip">${uiIcons.downloadZip}</button>
+        <label class="sort-wrap toolbar-wide">
           <span>Sort</span>
-          <select data-sort>
+          <select data-sort aria-label="Sort">
             <option value="name" ${this.sortKey === 'name' ? 'selected' : ''}>Name</option>
             <option value="modified" ${this.sortKey === 'modified' ? 'selected' : ''}>Date Modified</option>
             <option value="size" ${this.sortKey === 'size' ? 'selected' : ''}>Size</option>
           </select>
         </label>
         <div class="spacer"></div>
-        <div class="view-toggle">
-          <button type="button" data-view="icon" class="${this.view === 'icon' ? 'active' : ''}">Icons</button>
-          <button type="button" data-view="list" class="${this.view === 'list' ? 'active' : ''}">List</button>
-          <button type="button" data-view="column" class="${this.view === 'column' ? 'active' : ''}">Columns</button>
+        <div class="view-toggle" role="group" aria-label="View">
+          <button type="button" data-view="icon" class="view-icon ${this.view === 'icon' ? 'active' : ''}" aria-label="Icons" title="Icons" aria-pressed="${this.view === 'icon'}">${uiIcons.viewIcon}</button>
+          <button type="button" data-view="list" class="${this.view === 'list' ? 'active' : ''}" aria-label="List" title="List" aria-pressed="${this.view === 'list'}">${uiIcons.viewList}</button>
+          <button type="button" data-view="column" class="${this.view === 'column' ? 'active' : ''}" aria-label="Columns" title="Columns" aria-pressed="${this.view === 'column'}">${uiIcons.viewColumn}</button>
         </div>
+        <button type="button" class="btn icon-btn toolbar-compact-only" data-act="actions" aria-label="Actions" title="Actions">${uiIcons.more}</button>
+        <input type="file" multiple hidden data-import-files aria-label="Import files" />
       </div>
       <div class="body">
+        <div class="sidebar-backdrop" data-act="close-sidebar"></div>
         <aside class="sidebar"></aside>
         <section class="main">
           <div class="pathbar"></div>
-          <div class="content" tabindex="0"></div>
+          <div class="file-plane">
+            <div class="content" tabindex="0"></div>
+            <div class="props-layer"></div>
+          </div>
         </section>
       </div>
       <div class="status${this.statusBusy ? ' status--busy' : ''}">${
@@ -680,24 +879,42 @@ export class FinderWindow extends HTMLElement {
           : this.escape(this.status)
       }</div>
       <div class="ctx-root"></div>
+      <div class="callout-root"></div>
+      <div class="quicklook-root"></div>
       <div class="drag-portal" aria-hidden="true"></div>
     `;
+    this.classList.toggle('sidebar-open', this.sidebarOpen);
     this.renderSidebar();
     this.renderPath();
     this.renderContent();
     this.renderContextMenu();
+    this.renderCallouts();
+    this.renderPreview();
     this.bindToolbarExtras();
+    this.syncTransferButton();
+    enableWindowResize(this, { minWidth: 560, minHeight: 360 });
   }
 
   private syncClipboardButtons(): void {
+    const hasSel = this.selectedId != null;
+    const cut = this.querySelector('[data-act="cut"]') as HTMLButtonElement | null;
+    const copy = this.querySelector('[data-act="copy"]') as HTMLButtonElement | null;
     const paste = this.querySelector('[data-act="paste"]') as HTMLButtonElement | null;
+    const del = this.querySelector('[data-act="delete"]') as HTMLButtonElement | null;
+    const props = this.querySelector('[data-act="props"]') as HTMLButtonElement | null;
+    if (cut) cut.disabled = !hasSel;
+    if (copy) copy.disabled = !hasSel;
     if (paste) paste.disabled = !this.clipboard;
+    if (del) del.disabled = !hasSel;
+    if (props) props.disabled = !hasSel;
   }
 
   private syncPropsButton(): void {
-    const btn = this.querySelector('[data-act="props"]');
-    btn?.classList.toggle('active', this.showProps);
-    btn?.setAttribute('aria-pressed', String(this.showProps));
+    const btn = this.querySelector('[data-act="props"]') as HTMLButtonElement | null;
+    if (!btn) return;
+    btn.classList.toggle('active', this.showProps);
+    btn.setAttribute('aria-pressed', String(this.showProps));
+    btn.disabled = this.selectedId == null;
   }
 
   private bindToolbarExtras(): void {
@@ -706,6 +923,12 @@ export class FinderWindow extends HTMLElement {
       this.sortKey = (sel.value as SortKey) || 'name';
       this.sortDir = 'asc';
       void this.reload().then(() => this.renderContent());
+    });
+    const importInput = this.querySelector('[data-import-files]') as HTMLInputElement | null;
+    importInput?.addEventListener('change', () => {
+      if (!importInput.files?.length) return;
+      void this.importPickedFiles(importInput.files);
+      importInput.value = '';
     });
   }
 
@@ -751,29 +974,33 @@ export class FinderWindow extends HTMLElement {
                   (v, vi) => `
       <div class="side-item side-item--child ${!viewingLocal && openVol === v ? 'selected' : ''}" data-vol="${vi}">
         <span class="dot"></span>
-        <span class="side-item-label">${this.escape(v)}</span>
+        <span class="side-item-label" aria-label="${this.escape(v)}">${this.escape(v)}</span>
       </div>`,
                 )
                 .join('')
             : '';
         const eject = connected
-          ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">⏏️</button>`
+          ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
           : '';
         return `
       <div class="side-item ${serverSel}" data-server="${i}">
         <span class="dot"></span>
-        <span class="side-item-label">${this.escape(s.object)}</span>
+        <span class="side-item-label" aria-label="${this.escape(s.object)}">${this.escape(s.object)}</span>
         ${eject}
       </div>${kids}`;
       })
       .join('');
     side.innerHTML = `
-      <div class="side-label">Favorites</div>
+      <div class="side-label">Local</div>
       <div class="side-item ${viewingLocal ? 'selected' : ''}" data-local>
         <span class="dot"></span>
-        <span>Browser Share</span>
+        <span class="side-item-label" aria-label="Browser Share">Browser Share</span>
+        <button type="button" class="side-more" data-act="share-actions" aria-label="Share actions" title="Share actions">${uiIcons.more}</button>
       </div>
-      <div class="side-label">LocalTalk</div>
+      <div class="side-label side-label--with-action">
+        <span>LocalTalk</span>
+        <button type="button" class="side-refresh${this.networkScanning ? ' spinning' : ''}" data-act="refresh" aria-label="Refresh network" aria-busy="${this.networkScanning}" ${this.host?.isConnected() ? '' : 'disabled'}>${uiIcons.refresh}</button>
+      </div>
       ${servers || '<div class="side-item"><span class="dot off"></span><span>No AFP servers</span></div>'}
     `;
   }
@@ -791,17 +1018,20 @@ export class FinderWindow extends HTMLElement {
       index: i,
     }));
 
-    bar.innerHTML = crumbs
+    bar.innerHTML =
+      `<button type="button" class="locations-btn" data-act="locations" aria-label="Locations" title="Locations">${uiIcons.menu}</button>` +
+      crumbs
       .map((p, i) => {
         const label = this.escape(p.name);
         const current = i === crumbs.length - 1;
         const dropAttr = p.id != null ? `data-path-id="${p.id}"` : '';
         const sep = i > 0 ? `<span class="crumb-sep" aria-hidden="true">&gt;</span>` : '';
         const urls = p.id != null ? this.iconUrls.get(String(p.id)) : undefined;
-        const icon = urls
-          ? `<img class="crumb-icon-img" src="${this.escape(urls.small)}" alt="" width="16" height="16" draggable="false" />`
-          : `<span class="crumb-icon ${i === 0 ? 'root' : 'folder'}" aria-hidden="true"></span>`;
-        return `${sep}<button type="button" class="crumb${current ? ' current' : ''}" data-path-index="${p.index}" ${dropAttr} title="${label}">
+        const icon =
+          urls && !isDefaultFolderIcon(urls)
+            ? `<img class="crumb-icon-img" src="${this.escape(urls.small)}" alt="" width="16" height="16" draggable="false" />`
+            : this.folderGlyphHtml('small', 'crumb');
+        return `${sep}<button type="button" class="crumb${current ? ' current' : ''}" data-path-index="${p.index}" ${dropAttr} title="${label}" aria-label="${label}">
           ${icon}
           <span class="crumb-label">${label}</span>
         </button>`;
@@ -822,15 +1052,10 @@ export class FinderWindow extends HTMLElement {
         try {
           await iconCache.init();
           const node = await this.vfs.get(c.id!);
-          if (!node) {
-            const urls = { small: '/icons/DIR16.png', large: '/icons/DIR32.png' };
-            if (gen !== this.iconLoadGen) return;
-            this.iconUrls.set(key, urls);
-            this.patchIconInDom(key, urls);
-            return;
-          }
+          if (!node) return;
           const urls = await this.iconLookup(node);
           if (gen !== this.iconLoadGen) return;
+          if (isDefaultFolderIcon(urls)) return;
           this.iconUrls.set(key, urls);
           this.patchIconInDom(key, urls);
         } catch {
@@ -873,13 +1098,7 @@ export class FinderWindow extends HTMLElement {
           .join('')}</div></div>`;
       }
 
-      if (this.showProps) {
-        const sel = this.selectedNode();
-        if (sel) content.insertAdjacentHTML('beforeend', this.itemInfoHtml(sel, { variant: 'dialog' }));
-      }
-    }
-
-    if (this.folderOpening && this.view !== 'column') {
+      if (this.folderOpening && this.view !== 'column') {
       content.insertAdjacentHTML(
         'beforeend',
         `<div class="content-loading">${this.spinnerHtml()}<span>Loading</span></div>`,
@@ -936,11 +1155,17 @@ export class FinderWindow extends HTMLElement {
     });
   }
 
-  private nameLabelHtml(it: ListItem): string {
+  private nameLabelHtml(it: ListItem, extraClass = 'row-name'): string {
     if (this.renamingId != null && it.key === String(this.renamingId)) {
-      return `<input class="rename-input" data-rename="${it.key}" value="${this.escape(it.name)}" />`;
+      const safe = this.escape(it.name);
+      return `<input class="rename-input" data-rename="${it.key}" value="${safe}" aria-label="${safe}" />`;
     }
-    return `<span class="row-name item-label">${this.escape(it.name)}</span>`;
+    return this.fileNameLabel(it.name, extraClass);
+  }
+
+  private fileNameLabel(name: string, extraClass: string): string {
+    const safe = this.escape(name);
+    return `<span class="${extraClass} item-label" aria-label="${safe}">${safe}</span>`;
   }
 
   private scrollColumnsToEnd(): void {
@@ -990,9 +1215,9 @@ export class FinderWindow extends HTMLElement {
     const disclose = it.isDir
       ? `<button type="button" class="disclose ${expanded ? 'open' : ''}${loading ? ' loading' : ''}" data-disclose="${it.key}" aria-busy="${loading}" aria-label="${
           loading ? 'Loading' : expanded ? 'Collapse' : 'Expand'
-        }">${loading ? this.spinnerHtml('disclose-spinner') : expanded ? '▾' : '▸'}</button>`
+        }">${loading ? this.spinnerHtml('disclose-spinner') : uiIcons.disclose}</button>`
       : `<span class="disclose spacer"></span>`;
-    return `<tr data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" class="${sel}" style="--depth:${depth}" ${drag}>
+    return `<tr data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" class="${sel}" style="--depth:${depth}" aria-label="${this.escape(it.name)}" ${drag}>
       <td class="name-cell">${disclose}${this.glyphHtml(it, 'small', 'row')}${this.nameLabelHtml(it)}</td>
       <td>${it.isDir ? '—' : formatBytes(it.size)}</td>
       <td>${it.mod.toLocaleString()}</td>
@@ -1002,27 +1227,40 @@ export class FinderWindow extends HTMLElement {
   private colItemHtml(it: ListItem, colIndex: number, selectedInColumn: number | null): string {
     const sel = selectedInColumn != null && it.key === String(selectedInColumn) ? 'selected' : '';
     const drag = 'draggable="true"';
-    const label =
-      this.renamingId != null && it.key === String(this.renamingId)
-        ? `<input class="rename-input" data-rename="${it.key}" value="${this.escape(it.name)}" />`
-        : `<span class="col-name item-label">${this.escape(it.name)}</span>`;
-    return `<div class="col-item ${sel}" data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" data-col="${colIndex}" ${drag}>
+    const label = this.nameLabelHtml(it, 'col-name');
+    return `<div class="col-item ${sel}" data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" data-col="${colIndex}" aria-label="${this.escape(it.name)}" ${drag}>
       ${this.glyphHtml(it, 'small', 'col')}${label}
     </div>`;
+  }
+
+  private folderGlyphHtml(size: 'small' | 'large', kind: 'icon' | 'row' | 'col' | 'crumb' | 'preview'): string {
+    const svg = size === 'large' ? uiIcons.folderLarge : uiIcons.folder;
+    const cls =
+      kind === 'icon'
+        ? 'icon-glyph-svg'
+        : kind === 'col'
+          ? 'col-icon-svg'
+          : kind === 'row'
+            ? 'row-icon-svg'
+            : kind === 'crumb'
+              ? 'crumb-icon-svg'
+              : 'preview-glyph-svg';
+    return `<span class="${cls}" aria-hidden="true">${svg}</span>`;
   }
 
   private glyphHtml(it: ListItem, size: 'small' | 'large', kind: 'icon' | 'row' | 'col'): string {
     const urls = this.iconUrls.get(it.key);
     const px = size === 'large' ? 32 : 16;
-    if (urls) {
+    if (urls && !(it.isDir && isDefaultFolderIcon(urls))) {
       const src = size === 'large' ? urls.large : urls.small;
       const imgCls = kind === 'icon' ? 'icon-glyph-img' : kind === 'col' ? 'col-icon-img' : 'row-icon-img';
       return `<img class="${imgCls}" src="${this.escape(src)}" alt="" width="${px}" height="${px}" draggable="false" />`;
     }
+    if (it.isDir) return this.folderGlyphHtml(size, kind);
     if (kind === 'icon') {
-      return `<div class="icon-glyph ${it.isDir ? 'folder' : ''}">${it.isDir ? 'DIR' : 'DOC'}</div>`;
+      return `<div class="icon-glyph">DOC</div>`;
     }
-    const cls = kind === 'col' ? (it.isDir ? 'col-icon folder' : 'col-icon file') : it.isDir ? 'row-icon folder' : 'row-icon file';
+    const cls = kind === 'col' ? 'col-icon file' : 'row-icon file';
     return `<span class="${cls}" aria-hidden="true"></span>`;
   }
 
@@ -1048,16 +1286,14 @@ export class FinderWindow extends HTMLElement {
             if (it.node) {
               urls = await this.iconLookup(it.node);
             } else if (it.isDir) {
-              urls = {
-                small: '/icons/DIR16.png',
-                large: '/icons/DIR32.png',
-              };
+              return;
             } else {
               const fi = it.finderInfo ?? new Uint8Array(32);
               const { type, creator } = readTypeCreator(fi);
               urls = await iconCache.getForTypeCreator(type, creator);
             }
             if (gen !== this.iconLoadGen) return;
+            if (it.isDir && isDefaultFolderIcon(urls)) return;
             this.iconUrls.set(it.key, urls);
             changed = true;
             this.patchIconInDom(it.key, urls);
@@ -1075,7 +1311,7 @@ export class FinderWindow extends HTMLElement {
   private patchIconInDom(key: string, urls: IconUrls): void {
     const nodes = this.querySelectorAll(`[data-id="${key}"], [data-path-id="${key}"]`);
     for (const el of nodes) {
-      const large = el.querySelector('.icon-glyph, .icon-glyph-img');
+      const large = el.querySelector('.icon-glyph, .icon-glyph-img, .icon-glyph-svg');
       if (large) {
         const img = document.createElement('img');
         img.className = 'icon-glyph-img';
@@ -1086,7 +1322,7 @@ export class FinderWindow extends HTMLElement {
         img.draggable = false;
         large.replaceWith(img);
       }
-      const preview = el.querySelector('.preview-glyph, .preview-glyph-img');
+      const preview = el.querySelector('.preview-glyph, .preview-glyph-img, .preview-glyph-svg');
       if (preview) {
         const img = document.createElement('img');
         img.className = 'preview-glyph-img';
@@ -1097,7 +1333,7 @@ export class FinderWindow extends HTMLElement {
         img.draggable = false;
         preview.replaceWith(img);
       }
-      const crumb = el.querySelector('.crumb-icon, .crumb-icon-img');
+      const crumb = el.querySelector('.crumb-icon, .crumb-icon-img, .crumb-icon-svg');
       if (crumb) {
         const img = document.createElement('img');
         img.className = 'crumb-icon-img';
@@ -1108,11 +1344,13 @@ export class FinderWindow extends HTMLElement {
         img.draggable = false;
         crumb.replaceWith(img);
       }
-      const small = el.querySelector('.row-icon, .col-icon, .row-icon-img, .col-icon-img');
+      const small = el.querySelector('.row-icon, .col-icon, .row-icon-img, .col-icon-img, .row-icon-svg, .col-icon-svg');
       if (small) {
         const img = document.createElement('img');
         img.className =
-          small.classList.contains('col-icon') || small.classList.contains('col-icon-img')
+          small.classList.contains('col-icon') ||
+          small.classList.contains('col-icon-img') ||
+          small.classList.contains('col-icon-svg')
             ? 'col-icon-img'
             : 'row-icon-img';
         img.src = urls.small;
@@ -1154,14 +1392,16 @@ export class FinderWindow extends HTMLElement {
   /** Shared item info card — used by column-view preview and Properties. */
   private itemInfoHtml(node: VNode, opts: { variant: 'column' | 'dialog' }): string {
     const fi = node.finderInfo;
-    const type = String.fromCharCode(...fi.subarray(0, 4));
-    const creator = String.fromCharCode(...fi.subarray(4, 8));
-    const kind = node.isDir ? 'Folder' : 'File';
+    const { type, creator } = readTypeCreator(fi);
+    const kind = node.isDir ? 'Folder' : type === 'APPL' ? 'Application' : 'File';
     const glyphClass = node.isDir ? 'folder' : 'file';
     const urls = this.iconUrls.get(String(node.id));
-    const glyph = urls
+    const custom = urls && !isDefaultFolderIcon(urls);
+    const glyph = custom
       ? `<img class="preview-glyph-img" src="${this.escape(urls.large)}" alt="" width="32" height="32" draggable="false" />`
-      : `<div class="preview-glyph ${glyphClass}"></div>`;
+      : node.isDir
+        ? this.folderGlyphHtml('large', 'preview')
+        : `<div class="preview-glyph ${glyphClass}"></div>`;
     const closeBtn =
       opts.variant === 'dialog'
         ? `<button type="button" class="btn item-info-close" data-act="close-props">Close</button>`
@@ -1171,25 +1411,38 @@ export class FinderWindow extends HTMLElement {
         ? 'column column-preview item-info'
         : 'item-info item-info--dialog';
     if (!urls) this.ensureNodeIcon(node);
+    const expandBtn = this.isExpandableArchive(node)
+      ? `<button type="button" class="btn" data-act="expand">Expand</button>`
+      : '';
     const typeCreatorFields = node.isDir
       ? ''
       : `<div class="preview-fields">
         <label>Type</label>
-        <input data-prop="type" maxlength="4" value="${this.escape(type)}" />
+        <input type="text" data-prop="type" maxlength="4" spellcheck="false" autocomplete="off" value="${this.escape(type)}" />
         <label>Creator</label>
-        <input data-prop="creator" maxlength="4" value="${this.escape(creator)}" />
+        <input type="text" data-prop="creator" maxlength="4" spellcheck="false" autocomplete="off" value="${this.escape(creator)}" />
         <div class="preview-actions">
+          ${expandBtn}
           <button type="button" class="btn primary" data-act="apply-props">Apply</button>
+          <button type="button" class="btn" data-act="resources">Resources…</button>
           ${closeBtn}
         </div>
       </div>`;
     const folderActions = node.isDir && closeBtn
       ? `<div class="preview-actions">${closeBtn}</div>`
       : '';
-    return `<div class="${shellClass}" data-preview data-id="${node.id}">
+    const colAttrs =
+      opts.variant === 'column'
+        ? ` style="${this.colWidthStyle('preview')}"`
+        : '';
+    const resizer = opts.variant === 'column' ? this.colResizerHtml('preview') : '';
+    const paneOpen = opts.variant === 'column' ? `<div class="column-pane">` : '';
+    const paneClose = opts.variant === 'column' ? `</div>` : '';
+    return `<div class="${shellClass}" data-preview data-id="${node.id}"${colAttrs}>
+      ${paneOpen}
       <div class="preview-hero">
         ${glyph}
-        <div class="preview-title">${this.escape(node.name)}</div>
+        <div class="preview-title" aria-label="${this.escape(node.name)}">${this.escape(node.name)}</div>
       </div>
       <div class="preview-meta">
         <div class="preview-row"><span>Kind</span><span>${kind}</span></div>
@@ -1200,6 +1453,8 @@ export class FinderWindow extends HTMLElement {
       </div>
       ${typeCreatorFields}
       ${folderActions}
+      ${paneClose}
+      ${resizer}
     </div>`;
   }
 
@@ -1213,6 +1468,7 @@ export class FinderWindow extends HTMLElement {
         await iconCache.init();
         const urls = await this.iconLookup(node);
         if (gen !== this.iconLoadGen) return;
+        if (node.isDir && isDefaultFolderIcon(urls)) return;
         this.iconUrls.set(key, urls);
         this.patchIconInDom(key, urls);
       } catch {
@@ -1221,9 +1477,82 @@ export class FinderWindow extends HTMLElement {
     })();
   }
 
+  private colWidthPx(key: string): number {
+    const fallback = key === 'preview' ? 240 : 200;
+    return this.columnWidths.get(key) ?? fallback;
+  }
+
+  private colWidthStyle(key: string): string {
+    return `--col-width:${this.colWidthPx(key)}px`;
+  }
+
+  private colResizerHtml(key: string): string {
+    if (isCompactUi()) return '';
+    return `<div class="column-resizer" data-col-resize="${key}" role="separator" aria-orientation="vertical"></div>`;
+  }
+
+  private columnHtml(colIndex: number, body: string, extraClass = ''): string {
+    const key = String(colIndex);
+    const loading = extraClass.includes('column--loading');
+    const cls = extraClass ? `column ${extraClass}` : 'column';
+    return `<div class="${cls}" data-col-index="${colIndex}"${loading ? ' aria-busy="true"' : ''} style="${this.colWidthStyle(key)}"><div class="column-pane">${body}</div>${this.colResizerHtml(key)}</div>`;
+  }
+
+  private mountColumnEl(colIndex: number, body: string): HTMLElement {
+    const el = document.createElement('div');
+    el.className = 'column';
+    el.setAttribute('data-col-index', String(colIndex));
+    el.style.setProperty('--col-width', `${this.colWidthPx(String(colIndex))}px`);
+    el.innerHTML = `<div class="column-pane">${body}</div>${this.colResizerHtml(String(colIndex))}`;
+    return el;
+  }
+
+  private onColumnResizeDown(e: PointerEvent): void {
+    const handle = (e.target as HTMLElement | null)?.closest?.('[data-col-resize]') as HTMLElement | null;
+    if (!handle || isCompactUi()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const col = handle.closest('.column') as HTMLElement | null;
+    if (!col) return;
+    const key = handle.getAttribute('data-col-resize') ?? '0';
+    this.columnResize = {
+      col,
+      handle,
+      key,
+      startX: e.clientX,
+      startW: col.getBoundingClientRect().width,
+    };
+    handle.classList.add('dragging');
+    this.querySelector('.column-view')?.classList.add('is-resizing');
+    handle.setPointerCapture?.(e.pointerId);
+    window.addEventListener('pointermove', this.onColumnResizeMove);
+    window.addEventListener('pointerup', this.onColumnResizeUp);
+    window.addEventListener('pointercancel', this.onColumnResizeUp);
+  }
+
+  private onColumnResizeMove = (e: PointerEvent): void => {
+    if (!this.columnResize) return;
+    e.preventDefault();
+    const w = Math.round(
+      Math.max(140, Math.min(560, this.columnResize.startW + (e.clientX - this.columnResize.startX))),
+    );
+    this.columnWidths.set(this.columnResize.key, w);
+    this.columnResize.col.style.setProperty('--col-width', `${w}px`);
+  };
+
+  private onColumnResizeUp = (): void => {
+    if (!this.columnResize) return;
+    this.columnResize.handle.classList.remove('dragging');
+    this.querySelector('.column-view')?.classList.remove('is-resizing');
+    this.columnResize = null;
+    window.removeEventListener('pointermove', this.onColumnResizeMove);
+    window.removeEventListener('pointerup', this.onColumnResizeUp);
+    window.removeEventListener('pointercancel', this.onColumnResizeUp);
+  };
+
   private renderColumnView(): string {
     if (this.columnChildren.length === 0) {
-      return `<div class="column-view"><div class="column"><div class="empty">Drop files or folders here</div></div></div>`;
+      return `<div class="column-view">${this.columnHtml(0, `<div class="empty">Drop files or folders here</div>`)}</div>`;
     }
     const listColCount = this.columnChildren.length;
     const cols = this.columnChildren
@@ -1241,7 +1570,7 @@ export class FinderWindow extends HTMLElement {
           items.length === 0
             ? `<div class="empty" style="padding:16px;font-size:12px">Empty</div>`
             : items.map((it) => this.colItemHtml(it, colIndex, selectedInColumn)).join('');
-        return `<div class="column" data-col-index="${colIndex}">${body}</div>`;
+        return this.columnHtml(colIndex, body);
       })
       .join('');
 
@@ -1258,9 +1587,11 @@ export class FinderWindow extends HTMLElement {
   }
 
   private columnLoadingHtml(colIndex: number): string {
-    return `<div class="column column--loading" data-col-index="${colIndex}" aria-busy="true">
-      <div class="column-loading">${this.spinnerHtml()}<span>Loading</span></div>
-    </div>`;
+    return this.columnHtml(
+      colIndex,
+      `<div class="column-loading">${this.spinnerHtml()}<span>Loading</span></div>`,
+      'column--loading',
+    );
   }
 
   private nextFolderLoad(id: number): number {
@@ -1281,8 +1612,8 @@ export class FinderWindow extends HTMLElement {
   private async onClick(e: MouseEvent): Promise<void> {
     const t = e.target as HTMLElement;
 
-    // Ignore clicks inside rename field (handled by blur/enter)
-    if (t.closest('[data-rename]')) return;
+    // Ignore clicks inside rename / type-creator fields (handled by blur/enter)
+    if (t.closest('[data-rename], [data-prop], [data-col-resize]')) return;
 
     const ctxItem = t.closest('[data-ctx]') as HTMLElement | null;
     if (ctxItem) {
@@ -1316,6 +1647,18 @@ export class FinderWindow extends HTMLElement {
       return;
     }
 
+    const calloutAct = t.closest('[data-callout-act]')?.getAttribute('data-callout-act');
+    if (calloutAct) {
+      e.preventDefault();
+      const target = this.openCallout === 'share' ? null : this.selectedId;
+      const local = this.openCallout === 'share';
+      this.openCallout = null;
+      this.renderCallouts();
+      if (local) await this.handleContextAction(calloutAct, null);
+      else await this.handleContextAction(calloutAct, target);
+      return;
+    }
+
     const act = t.closest('[data-act]')?.getAttribute('data-act');
     if (act) {
       await this.handleAction(act);
@@ -1330,6 +1673,7 @@ export class FinderWindow extends HTMLElement {
     }
     if (t.closest('[data-local]')) {
       this.showLocalShare();
+      this.closeSidebar();
       await this.reload();
       this.syncHistory();
       this.render();
@@ -1349,6 +1693,7 @@ export class FinderWindow extends HTMLElement {
       if (!name) return;
       try {
         await this.mountRemoteVolume(name);
+        this.closeSidebar();
         await this.reload();
         this.syncHistory();
         this.render();
@@ -1370,6 +1715,7 @@ export class FinderWindow extends HTMLElement {
         return;
       }
       await this.connectServerWithLogin(s);
+      this.closeSidebar();
       this.render();
       return;
     }
@@ -1388,12 +1734,21 @@ export class FinderWindow extends HTMLElement {
 
     const item = this.itemFromEvent(e);
     if (!item || !this.querySelector('.content')?.contains(item)) return;
+    if (item.matches('[data-preview], .item-info') || item.closest('[data-preview], .item-info')) return;
 
     const id = Number(item.getAttribute('data-id'));
     const isDir = item.getAttribute('data-dir') === '1';
+    const wasSelected = this.selectedId === id;
     this.selectedId = id;
 
+    if (isCompactUi() && this.view !== 'column' && isDir && wasSelected) {
+      const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+      if (node?.isDir) await this.openFolder(node);
+      return;
+    }
+
     if (this.view === 'column') {
+      this.syncResourceExplorer();
       const colIndex = Number(item.getAttribute('data-col') ?? '0');
       const beforePath = this.pathNamesForUrl().join('/');
       this.pathStack = this.pathStack.slice(0, colIndex + 1);
@@ -1463,24 +1818,34 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async toggleExpand(id: number): Promise<void> {
+    const row = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
+    const disclose = row?.querySelector('[data-disclose]') as HTMLElement | null;
+
     if (this.expandedIds.has(id)) {
       this.expandedIds.delete(id);
       this.loadingIds.delete(id);
       this.nextFolderLoad(id);
       this.collapseDescendants(id);
-      this.renderContent();
+      this.setDiscloseState(disclose, 'closed');
+      if (row) this.removeListChildRows(row);
+      else this.renderContent();
       return;
     }
     this.expandedIds.add(id);
     this.selectedId = id;
+    if (row) this.paintSelection(row);
+    this.setDiscloseState(disclose, 'open');
+
     const cached = this.listChildCache.get(id);
     if (cached) {
-      this.renderContent();
+      if (row) this.insertListChildRows(row, cached, id);
+      else this.renderContent();
       return;
     }
     const gen = this.nextFolderLoad(id);
     this.loadingIds.add(id);
-    this.renderContent();
+    this.setDiscloseState(disclose, 'loading');
+    if (!row) this.renderContent();
     try {
       const kids = this.sortNodes(await this.vfs.children(id));
       if (!this.folderLoadIsCurrent(id, gen)) return;
@@ -1490,11 +1855,37 @@ export class FinderWindow extends HTMLElement {
       this.expandedIds.delete(id);
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus(`Couldn’t expand folder: ${msg}`);
+      this.setDiscloseState(disclose, 'closed');
     } finally {
       if (this.folderLoadIsCurrent(id, gen)) this.loadingIds.delete(id);
     }
     if (!this.folderLoadIsCurrent(id, gen)) return;
-    this.renderContent();
+    if (row?.parentElement && this.expandedIds.has(id)) this.insertListChildRows(row, this.listChildCache.get(id) ?? [], id);
+    else this.renderContent();
+  }
+
+  private setDiscloseState(disclose: Element | null, state: 'open' | 'closed' | 'loading'): void {
+    if (!(disclose instanceof HTMLElement)) return;
+    disclose.classList.toggle('open', state !== 'closed');
+    disclose.classList.toggle('loading', state === 'loading');
+    disclose.setAttribute('aria-busy', String(state === 'loading'));
+    disclose.setAttribute(
+      'aria-label',
+      state === 'loading' ? 'Loading' : state === 'open' ? 'Collapse' : 'Expand',
+    );
+    if (!disclose.querySelector('svg')) disclose.innerHTML = uiIcons.disclose;
+  }
+
+  private removeListChildRows(row: HTMLTableRowElement): void {
+    const depth = Number(String(row.style.getPropertyValue('--depth') || '0'));
+    let next = row.nextElementSibling as HTMLTableRowElement | null;
+    while (next) {
+      const d = Number(String(next.style.getPropertyValue('--depth') || '0'));
+      if (d <= depth) break;
+      const remove = next;
+      next = next.nextElementSibling as HTMLTableRowElement | null;
+      remove.remove();
+    }
   }
 
   private collapseDescendants(id: number): void {
@@ -1521,6 +1912,8 @@ export class FinderWindow extends HTMLElement {
       el.classList.remove('selected');
     });
     item.classList.add('selected');
+    this.syncClipboardButtons();
+    this.syncResourceExplorer();
   }
 
   private async onDblClick(e: MouseEvent): Promise<void> {
@@ -1542,6 +1935,7 @@ export class FinderWindow extends HTMLElement {
     this.cwd = node.id;
     this.pathStack.push({ id: node.id, name: node.name });
     this.selectedId = null;
+    this.syncResourceExplorer();
     this.expandedIds.clear();
     this.folderOpening = true;
     this.renderPath();
@@ -1553,6 +1947,7 @@ export class FinderWindow extends HTMLElement {
     }
     this.renderPath();
     this.renderContent();
+    this.syncClipboardButtons();
     this.syncHistory();
   }
 
@@ -1562,7 +1957,7 @@ export class FinderWindow extends HTMLElement {
 
   private onDragStart(e: DragEvent): void {
     const t = e.target as HTMLElement;
-    if (t.closest('[data-rename], [data-disclose]')) {
+    if (t.closest('[data-rename], [data-disclose], [data-preview], .item-info, [data-col-resize]')) {
       e.preventDefault();
       return;
     }
@@ -1972,10 +2367,7 @@ export class FinderWindow extends HTMLElement {
     this.loadingIds.add(id);
     const disclose = row?.querySelector('[data-disclose]');
     if (disclose) {
-      disclose.classList.add('open', 'loading');
-      disclose.setAttribute('aria-busy', 'true');
-      disclose.setAttribute('aria-label', 'Loading');
-      disclose.innerHTML = this.spinnerHtml('disclose-spinner');
+      this.setDiscloseState(disclose, 'loading');
     } else {
       this.renderContent();
     }
@@ -2020,15 +2412,19 @@ export class FinderWindow extends HTMLElement {
       )
       .join('');
     row.insertAdjacentHTML('afterend', html);
-    const disclose = row.querySelector('[data-disclose]');
-    if (disclose) {
-      disclose.classList.add('open');
-      disclose.classList.remove('loading');
-      disclose.setAttribute('aria-busy', 'false');
-      disclose.setAttribute('aria-label', 'Collapse');
-      disclose.textContent = '▾';
-    }
+    this.setDiscloseState(row.querySelector('[data-disclose]'), 'open');
     this.paintDropTarget(folderId, false);
+    this.prefetchIcons(
+      kids.map((n) => ({
+        key: String(n.id),
+        name: n.name,
+        isDir: n.isDir,
+        size: nodeByteSize(n),
+        mod: fromMacTime(n.modDate),
+        node: n,
+        finderInfo: n.finderInfo,
+      })),
+    );
   }
 
   /** Navigate into a folder in icon view; park drag source so the gesture survives. */
@@ -2048,6 +2444,7 @@ export class FinderWindow extends HTMLElement {
     await this.reload();
     this.renderPath();
     this.renderContent();
+    this.syncClipboardButtons();
     this.syncHistory();
     this.clearSpringTimer();
     this.clearDropUi();
@@ -2119,10 +2516,7 @@ export class FinderWindow extends HTMLElement {
                 ),
               )
               .join('');
-      const newCol = document.createElement('div');
-      newCol.className = 'column';
-      newCol.setAttribute('data-col-index', String(colIndex + 1));
-      newCol.innerHTML = body;
+      const newCol = this.mountColumnEl(colIndex + 1, body);
       if (loadingCol) loadingCol.replaceWith(newCol);
       else parentCol?.after(newCol);
     } catch (err) {
@@ -2172,6 +2566,24 @@ export class FinderWindow extends HTMLElement {
     return true;
   }
 
+  private async planPlacement(
+    fs: Catalog,
+    parentId: number,
+    name: string,
+    isDir: boolean,
+    ignoreId?: number,
+    reserved?: Set<string>,
+  ): Promise<PlacementPlan> {
+    const plan = await planItemPlacement(fs, parentId, name, isDir, {
+      ignoreId,
+      reserved,
+      resolveConflict: (info) => this.host.promptNameConflict(info),
+    });
+    if (!plan) throw new TransferCancelled();
+    reserved?.add(plan.destName.toLowerCase());
+    return plan;
+  }
+
   private async moveNodeTo(id: number, destParent: number, fs: Catalog = this.vfs): Promise<void> {
     const node = (this.dragNodeId === id ? this.dragNode : null) ?? (await fs.get(id));
     if (!node) return;
@@ -2180,12 +2592,12 @@ export class FinderWindow extends HTMLElement {
       this.setStatus('Can’t move an item into itself');
       return;
     }
-    const clash = await fs.lookup(destParent, node.name);
-    if (clash && clash.id !== id) {
-      const name = await this.uniqueChildName(destParent, node.name, fs);
-      await fs.rename(id, name);
-    }
-    await fs.move(id, destParent);
+    const plan = await this.planPlacement(fs, destParent, node.name, node.isDir, id);
+    await this.withOwnVfsMutation(async () => {
+      if (plan.replaceId != null) await fs.remove(plan.replaceId);
+      if (plan.destName !== node.name) await fs.rename(id, plan.destName);
+      await fs.move(id, destParent);
+    });
   }
 
   private async copyNodeAcross(
@@ -2198,12 +2610,36 @@ export class FinderWindow extends HTMLElement {
       (this.dragNodeId === id && this.dragCatalog === src ? this.dragNode : null) ??
       (await src.get(id));
     if (!node) return;
-    dest.beginBatch();
-    try {
-      await this.writeClipNode(dest, destParent, await this.snapshotNode(src, node));
-    } finally {
-      dest.endBatch();
-    }
+    const plan = await this.planPlacement(dest, destParent, node.name, node.isDir);
+    const expected = node.isDir ? 0 : nodeByteSize(node);
+    const jobId = this.startTransfer(plan.destName, node.isDir, expected, node.finderInfo);
+    await this.withOwnVfsMutation(async () => {
+      dest.beginBatch();
+      try {
+        if (plan.replaceId != null) await dest.remove(plan.replaceId);
+        const creditRead = !!src.reportsChunkedBytes && !dest.reportsChunkedBytes;
+        const creditWrite = !!dest.reportsChunkedBytes || !creditRead;
+        const snap = await this.snapshotNode(
+          src,
+          node,
+          creditRead ? (n) => transferActivity.addBytes(jobId, n) : undefined,
+        );
+        transferActivity.setTotal(jobId, clipByteSize(snap));
+        await this.writeClipNode(
+          dest,
+          destParent,
+          snap,
+          creditWrite ? (n) => transferActivity.addBytes(jobId, n) : undefined,
+          plan.destName,
+        );
+        transferActivity.finish(jobId);
+      } catch (err) {
+        transferActivity.fail(jobId, err instanceof Error ? err.message : String(err));
+        throw err;
+      } finally {
+        dest.endBatch();
+      }
+    });
   }
 
   private async refreshAfterMutation(): Promise<void> {
@@ -2274,25 +2710,29 @@ export class FinderWindow extends HTMLElement {
       }
       this.setStatus('Scanning…', { busy: true });
       let lastPaint = 0;
-      const count = await destCat.importDataTransfer(destParent, dt, {
-        onScan: (total) => {
-          this.setStatus(
-            total > 0 ? `Importing… 0/${total} (0%)` : 'Importing…',
-            { busy: true },
-          );
-        },
-        onProgress: (done, total) => {
-          const now = performance.now();
-          if (done === 1 || done === total || now - lastPaint > 80) {
-            lastPaint = now;
-            const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+      const count = await this.withOwnVfsMutation(() =>
+        destCat.importDataTransfer(destParent, dt, {
+          onScan: (total) => {
             this.setStatus(
-              total > 0 ? `Importing… ${done}/${total} (${pct}%)` : `Importing… ${done} item(s)`,
+              total > 0 ? `Importing… 0/${total} (0%)` : 'Importing…',
               { busy: true },
             );
-          }
-        },
-      });
+          },
+          onProgress: (done, total) => {
+            const now = performance.now();
+            if (done === 1 || done === total || now - lastPaint > 80) {
+              lastPaint = now;
+              const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+              this.setStatus(
+                total > 0 ? `Importing… ${done}/${total} (${pct}%)` : `Importing… ${done} item(s)`,
+                { busy: true },
+              );
+            }
+          },
+          onItem: (item) => this.trackImportItem(item),
+          resolveConflict: (info) => this.host.promptNameConflict(info),
+        }),
+      );
       if (count === 0) {
         this.setStatus('No files in drop');
         return;
@@ -2302,19 +2742,15 @@ export class FinderWindow extends HTMLElement {
         this.expandedIds.add(destParent);
       }
       if (this.vfs !== destCat) return;
-      if (this.vfsRefreshTimer) {
-        clearTimeout(this.vfsRefreshTimer);
-        this.vfsRefreshTimer = null;
-      }
-      const parents = [...this.pendingVfsParents];
-      this.pendingVfsParents.clear();
-      if (this.changeImpactsVisibleFolders(parents.length ? parents : [destParent])) {
-        iconCache.clearDirectoryCache();
-        this.iconUrls.clear();
-        this.iconLoadGen++;
-        await this.refreshAfterMutation();
-      }
+      iconCache.clearDirectoryCache();
+      this.iconUrls.clear();
+      this.iconLoadGen++;
+      await this.refreshAfterMutation();
     } catch (err) {
+      if (isTransferCancelled(err)) {
+        this.setStatus('Transfer cancelled');
+        return;
+      }
       console.error(err);
       this.setStatus(`Drop failed: ${(err as Error).message}`);
     } finally {
@@ -2347,8 +2783,8 @@ export class FinderWindow extends HTMLElement {
         await this.onDelete();
         break;
       case 'props':
-        if (this.selectedId == null && !this.showProps) {
-          this.setStatus('Select an item for Properties');
+        if (this.selectedId == null) {
+          this.setStatus('Select an item for Get Info');
           break;
         }
         this.showProps = !this.showProps;
@@ -2363,8 +2799,36 @@ export class FinderWindow extends HTMLElement {
       case 'apply-props':
         await this.applyProps();
         break;
+      case 'resources':
+        this.openResourceExplorer();
+        break;
       case 'download':
         await this.onDownload();
+        break;
+      case 'close-preview':
+        this.closePreview();
+        break;
+      case 'locations':
+        this.sidebarOpen = !this.sidebarOpen;
+        this.classList.toggle('sidebar-open', this.sidebarOpen);
+        break;
+      case 'close-sidebar':
+        this.closeSidebar();
+        break;
+      case 'transfers':
+        this.toggleCallout('transfers');
+        break;
+      case 'actions':
+        this.toggleCallout('actions');
+        break;
+      case 'share-actions':
+        this.toggleCallout('share');
+        break;
+      case 'import':
+        this.querySelector<HTMLInputElement>('[data-import-files]')?.click();
+        break;
+      case 'expand':
+        await this.expandArchive();
         break;
     }
   }
@@ -2379,7 +2843,7 @@ export class FinderWindow extends HTMLElement {
       sel.finderInfo[i] = type.charCodeAt(i);
       sel.finderInfo[4 + i] = creator.charCodeAt(i);
     }
-    await this.vfs.put(sel);
+    await this.withOwnVfsMutation(() => this.vfs.put(sel));
     this.setStatus('Finder info updated');
     await this.reload();
     this.refreshPropsPanel();
@@ -2505,6 +2969,7 @@ export class FinderWindow extends HTMLElement {
     await this.reload();
     this.renderPath();
     this.renderContent();
+    this.syncClipboardButtons();
     this.syncHistory();
   }
 
@@ -2544,9 +3009,164 @@ export class FinderWindow extends HTMLElement {
     this.renderContent();
   }
 
+  private isPreviewable(node: VNode | null | undefined): node is VNode {
+    if (!node || node.isDir) return false;
+    return PREVIEW_TEXT_TYPES.has(readTypeCreator(node.finderInfo).type);
+  }
+
+  private isExpandableArchive(node: VNode | null | undefined): node is VNode {
+    if (!node || node.isDir) return false;
+    return isExpandableArchive(node.name, node.finderInfo);
+  }
+
+  private async expandArchive(id: number | null = this.selectedId): Promise<void> {
+    if (id == null) return;
+    const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+    if (!node || node.isDir) return;
+    const fail = (err?: unknown): void => {
+      const text = expandFailureMessage(err);
+      this.host.showAlert(`Couldn’t Expand “${node.name}”`, text);
+      this.setStatus(`Couldn’t expand “${node.name}”`);
+    };
+    const bytesTotal = nodeByteSize(node);
+    const track = this.trackImportItem({ name: node.name, isDir: false, bytesTotal });
+    this.setStatus(`Expanding “${node.name}”…`, { busy: true });
+    try {
+      const full = (await this.vfs.ensureContent(id, track.onBytes)) ?? node;
+      let expanded;
+      try {
+        expanded = expandArchiveFile(full.name, full.data);
+      } catch (err) {
+        track.onDone(err instanceof Error ? err : new Error(expandFailureMessage(err)));
+        fail(err);
+        return;
+      }
+      const parentId = full.parentId;
+      const reserved = new Set<string>();
+      const planned: { item: ExpandedNode; replaceId: number | null }[] = [];
+      for (const item of expanded) {
+        const plan = await planItemPlacement(this.vfs, parentId, item.name, item.kind === 'dir', {
+          reserved,
+          resolveConflict: (info) => this.host.promptNameConflict(info),
+        });
+        if (!plan) throw new TransferCancelled();
+        reserved.add(plan.destName.toLowerCase());
+        planned.push({ item: { ...item, name: plan.destName }, replaceId: plan.replaceId });
+      }
+      await this.withOwnVfsMutation(async () => {
+        this.vfs.beginBatch();
+        try {
+          for (const row of planned) {
+            if (row.replaceId != null) await this.vfs.remove(row.replaceId);
+          }
+          await importExpandedTree(
+            this.vfs,
+            parentId,
+            planned.map((row) => row.item),
+            track,
+          );
+        } finally {
+          this.vfs.endBatch();
+        }
+      });
+      track.onDone();
+      this.setStatus(`Expanded “${node.name}”`);
+      iconCache.clearDirectoryCache();
+      this.iconUrls.clear();
+      this.iconLoadGen++;
+      await this.refreshAfterMutation();
+    } catch (err) {
+      if (isTransferCancelled(err)) {
+        track.onDone();
+        this.setStatus('Transfer cancelled');
+        return;
+      }
+      track.onDone(err instanceof Error ? err : new Error(String(err)));
+      fail(err);
+    }
+  }
+
+  private async openPreview(id: number | null = this.selectedId): Promise<void> {
+    if (id == null) return;
+    const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+    if (!this.isPreviewable(node)) return;
+    const gen = ++this.previewGen;
+    this.preview = { id: node.id, name: node.name, text: null };
+    this.renderPreview();
+    try {
+      const full = (await this.vfs.ensureContent(node.id)) ?? node;
+      if (gen !== this.previewGen) return;
+      if (!full.data.length) {
+        this.preview = { id: full.id, name: full.name, text: '' };
+        this.renderPreview();
+        return;
+      }
+      const truncated = full.data.length > PREVIEW_MAX_BYTES;
+      const slice = truncated ? full.data.subarray(0, PREVIEW_MAX_BYTES) : full.data;
+      this.preview = {
+        id: full.id,
+        name: full.name,
+        text: decodePreviewText(slice),
+        truncated,
+      };
+      this.renderPreview();
+    } catch (err) {
+      if (gen !== this.previewGen) return;
+      this.preview = {
+        id: node.id,
+        name: node.name,
+        text: null,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      this.renderPreview();
+    }
+  }
+
+  private closePreview(): void {
+    if (!this.preview) return;
+    this.previewGen++;
+    this.preview = null;
+    this.renderPreview();
+  }
+
+  private renderPreview(): void {
+    const root = this.querySelector('.quicklook-root');
+    if (!root) return;
+    const preview = this.preview;
+    if (!preview) {
+      root.innerHTML = '';
+      return;
+    }
+    let body: string;
+    if (preview.error) {
+      body = `<p class="quicklook__empty">${this.escape(preview.error)}</p>`;
+    } else if (preview.text == null) {
+      body = `<div class="quicklook__loading">${this.spinnerHtml()}<span>Loading</span></div>`;
+    } else if (!preview.text) {
+      body = `<p class="quicklook__empty">This file is empty</p>`;
+    } else {
+      const note = preview.truncated
+        ? `<p class="quicklook__note">Showing the first ${formatBytes(PREVIEW_MAX_BYTES)}</p>`
+        : '';
+      body = `${note}<pre class="quicklook__text">${this.escape(preview.text)}</pre>`;
+    }
+    root.innerHTML = `
+      <div class="quicklook">
+        <div class="quicklook__backdrop" data-act="close-preview"></div>
+        <div class="quicklook__card" role="dialog" aria-labelledby="quicklook-title" aria-modal="true">
+          <header class="quicklook__header">
+            <h2 id="quicklook-title" aria-label="${this.escape(preview.name)}">${this.escape(preview.name)}</h2>
+            <button type="button" class="btn" data-act="close-preview" aria-label="Close">✕</button>
+          </header>
+          <div class="quicklook__body">${body}          </div>
+        </div>
+      </div>
+    `;
+  }
+
   private showPropertiesPanel(): void {
     if (this.selectedId == null) {
-      this.setStatus('Select an item for Properties');
+      this.setStatus('Select an item for Get Info');
       return;
     }
     this.showProps = true;
@@ -2567,8 +3187,14 @@ export class FinderWindow extends HTMLElement {
     const node = this.findNodeAnywhere(this.selectedId) ?? (await this.vfs.get(this.selectedId));
     if (!node) return;
     this.setStatus(mode === 'cut' ? 'Cutting…' : 'Copying…', { busy: true });
+    const jobId = this.startTransfer(node.name, node.isDir, nodeByteSize(node), node.finderInfo);
     try {
-      const item = await this.snapshotNode(this.vfs, node);
+      const item = await this.snapshotNode(
+        this.vfs,
+        node,
+        this.vfs.reportsChunkedBytes ? (n) => transferActivity.addBytes(jobId, n) : undefined,
+      );
+      transferActivity.finish(jobId);
       this.clipboard = {
         mode,
         items: [item],
@@ -2580,17 +3206,22 @@ export class FinderWindow extends HTMLElement {
         `${mode === 'cut' ? 'Cut' : 'Copied'} “${node.name}” — paste in this share or another`,
       );
     } catch (err) {
+      transferActivity.fail(jobId, err instanceof Error ? err.message : String(err));
       this.setStatus(`${mode === 'cut' ? 'Cut' : 'Copy'} failed: ${(err as Error).message}`);
     }
   }
 
-  private async snapshotNode(fs: Catalog, node: VNode): Promise<ClipNode> {
+  private async snapshotNode(
+    fs: Catalog,
+    node: VNode,
+    onBytes?: (n: number) => void,
+  ): Promise<ClipNode> {
     if (node.isDir) {
       const kids = await fs.children(node.id);
       const out: ClipNode[] = [];
       for (const k of kids) {
-        const full = k.isDir ? k : ((await fs.ensureContent(k.id)) ?? k);
-        out.push(await this.snapshotNode(fs, full));
+        const full = k.isDir ? k : ((await fs.ensureContent(k.id, onBytes)) ?? k);
+        out.push(await this.snapshotNode(fs, full, onBytes));
       }
       return {
         name: node.name,
@@ -2601,7 +3232,7 @@ export class FinderWindow extends HTMLElement {
         kids: out,
       };
     }
-    const full = (await fs.ensureContent(node.id)) ?? node;
+    const full = (await fs.ensureContent(node.id, onBytes)) ?? node;
     return {
       name: full.name,
       isDir: false,
@@ -2613,7 +3244,7 @@ export class FinderWindow extends HTMLElement {
 
   private async onMkdir(): Promise<void> {
     const name = await this.uniqueChildName(this.cwd, 'New folder');
-    const node = await this.vfs.mkdir(this.cwd, name);
+    const node = await this.withOwnVfsMutation(() => this.vfs.mkdir(this.cwd, name));
     this.selectedId = node.id;
     this.renamingId = node.id;
     await this.reload();
@@ -2631,35 +3262,262 @@ export class FinderWindow extends HTMLElement {
 
   private async onDelete(): Promise<void> {
     if (this.selectedId == null) return;
-    const node = this.findNodeAnywhere(this.selectedId) ?? (await this.vfs.get(this.selectedId));
+    const id = this.selectedId;
+    const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
     if (!node) return;
     if (!confirm(`Delete “${node.name}”?`)) return;
-    await this.vfs.remove(this.selectedId);
+    await this.withOwnVfsMutation(() => this.vfs.remove(id));
     this.selectedId = null;
     this.showProps = false;
+    this.closePreview();
     this.syncPropsButton();
+    this.syncClipboardButtons();
     await this.reload();
     this.renderContent();
   }
 
   private async onDownload(): Promise<void> {
-    if (this.selectedId == null) {
-      this.setStatus('Select an item to download');
+    const node =
+      this.selectedId != null
+        ? (this.findNodeAnywhere(this.selectedId) ?? (await this.vfs.get(this.selectedId)))
+        : await this.vfs.get(this.cwd);
+    if (!node) {
+      this.setStatus('Nothing to download');
       return;
     }
-    const node = await this.vfs.get(this.selectedId);
-    if (!node) return;
-    const entries = await collectFsZipEntries(this.vfs, node);
-    downloadZipEntries(node.name, entries);
-    this.setStatus(`Downloaded ${node.name}.zip`);
+    const zipName = node.name || 'archive';
+    const jobId = this.startTransfer(zipName, node.isDir, node.isDir ? 0 : nodeByteSize(node), node.finderInfo);
+    try {
+      let listed = node.isDir ? 0 : nodeByteSize(node);
+      const entries = await collectFsZipEntries(
+        this.vfs,
+        node,
+        '',
+        (n) => transferActivity.addBytes(jobId, n),
+        node.isDir
+          ? (n) => {
+              listed += n;
+              transferActivity.setTotal(jobId, listed);
+            }
+          : undefined,
+      );
+      downloadZipEntries(zipName, entries);
+      transferActivity.finish(jobId);
+      this.setStatus(`Downloaded ${zipName}.zip`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      transferActivity.fail(jobId, msg);
+      this.setStatus(`Download failed: ${msg}`);
+    }
+  }
+
+  private applyCompactView(): void {
+    const compact = isCompactUi();
+    if (compact) {
+      if (this.desktopView == null) {
+        this.desktopView = this.view;
+        if (this.view !== 'icon') {
+          this.view = 'icon';
+          this.syncHistory(true);
+          this.render();
+          return;
+        }
+      } else if (this.view === 'list') {
+        this.view = 'icon';
+        this.syncHistory(true);
+        this.render();
+        return;
+      }
+    } else {
+      this.sidebarOpen = false;
+      this.classList.remove('sidebar-open');
+      if (this.desktopView != null) {
+        const restore = this.desktopView;
+        this.desktopView = null;
+        if (this.view !== restore) {
+          this.view = restore;
+          this.openCallout = null;
+          this.syncHistory(true);
+          this.render();
+          return;
+        }
+      }
+    }
+    this.classList.toggle('sidebar-open', compact && this.sidebarOpen);
+    this.syncTransferButton();
+  }
+
+  private closeSidebar(): void {
+    if (!this.sidebarOpen) return;
+    this.sidebarOpen = false;
+    this.classList.remove('sidebar-open');
+  }
+
+  private toggleCallout(kind: 'transfers' | 'actions' | 'share'): void {
+    this.openCallout = this.openCallout === kind ? null : kind;
+    this.renderCallouts();
+  }
+
+  private onWinPointer = (e: PointerEvent): void => {
+    if (!this.openCallout) return;
+    const t = e.target as Node;
+    if (this.querySelector('.callout')?.contains(t)) return;
+    const triggers = this.querySelectorAll(
+      '[data-act="transfers"], [data-act="actions"], [data-act="share-actions"]',
+    );
+    for (const el of triggers) {
+      if (el.contains(t)) return;
+    }
+    this.openCallout = null;
+    this.renderCallouts();
+  };
+
+  private syncTransferButton(): void {
+    const btn = this.querySelector('[data-act="transfers"]') as HTMLButtonElement | null;
+    if (!btn) return;
+    const agg = transferActivity.aggregateProgress();
+    const show = agg.running || this.openCallout === 'transfers' || this.transferBtnVisible;
+    if (agg.running) {
+      this.transferBtnVisible = true;
+      if (!agg.indeterminate) this.lastTransferPct = agg.pct;
+      if (this.transferIdleTimer) {
+        clearTimeout(this.transferIdleTimer);
+        this.transferIdleTimer = null;
+      }
+    } else if (this.transferBtnVisible && this.openCallout !== 'transfers' && !this.transferIdleTimer) {
+      this.transferIdleTimer = setTimeout(() => {
+        this.transferIdleTimer = null;
+        this.transferBtnVisible = false;
+        if (this.openCallout !== 'transfers') this.syncTransferButton();
+        if (!transferActivity.hasRunning()) transferActivity.clearFinished();
+      }, 1800);
+    }
+    btn.hidden = !show;
+    btn.classList.toggle('indeterminate', agg.indeterminate);
+    const pct = agg.running && !agg.indeterminate ? agg.pct : this.lastTransferPct;
+    const label = agg.indeterminate ? 'File transfers in progress' : `File transfers, ${pct}%`;
+    btn.textContent = agg.indeterminate ? '…' : `${pct}%`;
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
+    if (this.openCallout === 'transfers') this.renderCallouts();
+  }
+
+  private renderCallouts(): void {
+    const root = this.querySelector('.callout-root');
+    if (!root) return;
+    if (!this.openCallout) {
+      root.innerHTML = '';
+      return;
+    }
+    if (this.openCallout === 'transfers') {
+      root.innerHTML = `<div class="callout callout--transfers">${transferListHtml()}</div>`;
+      const el = root.querySelector('.callout') as HTMLElement;
+      const anchor = this.querySelector('[data-act="transfers"]') as HTMLElement | null;
+      if (el && anchor) positionCallout(el, anchor);
+      return;
+    }
+    if (this.openCallout === 'share') {
+      root.innerHTML = `<div class="callout">
+        <button type="button" class="callout__item" data-callout-act="welcome-pack">Add Welcome Pack Items</button>
+        <hr />
+        <button type="button" class="callout__item callout__item--danger" data-callout-act="erase-local">Erase All Items…</button>
+      </div>`;
+      const el = root.querySelector('.callout') as HTMLElement;
+      const anchor =
+        (this.querySelector('[data-act="share-actions"]') as HTMLElement | null) ??
+        (this.querySelector('[data-act="locations"]') as HTMLElement | null);
+      if (el && anchor) positionCallout(el, anchor);
+      return;
+    }
+    const sel = this.selectedNode();
+    const items =
+      sel != null
+        ? [
+            this.isExpandableArchive(sel)
+              ? `<button type="button" class="callout__item" data-callout-act="expand">Expand</button>`
+              : '',
+            this.isPreviewable(sel) ? `<button type="button" class="callout__item" data-callout-act="preview">Preview…</button>` : '',
+            `<button type="button" class="callout__item" data-callout-act="rename">Rename</button>`,
+            `<button type="button" class="callout__item" data-callout-act="delete">Delete…</button>`,
+            `<button type="button" class="callout__item" data-callout-act="props">Get Info…</button>`,
+            sel && !sel.isDir
+              ? `<button type="button" class="callout__item" data-callout-act="resources">Resources…</button>`
+              : '',
+            `<hr/>`,
+            `<button type="button" class="callout__item" data-callout-act="cut">Cut</button>`,
+            `<button type="button" class="callout__item" data-callout-act="copy">Copy</button>`,
+            this.clipboard ? `<button type="button" class="callout__item" data-callout-act="paste">Paste</button>` : '',
+          ]
+        : [
+            `<button type="button" class="callout__item" data-callout-act="mkdir">New Folder</button>`,
+            this.clipboard ? `<button type="button" class="callout__item" data-callout-act="paste">Paste</button>` : '',
+            `<button type="button" class="callout__item" data-callout-act="props-blank">Get Info</button>`,
+          ];
+    root.innerHTML = `<div class="callout">${items.filter(Boolean).join('')}</div>`;
+    const el = root.querySelector('.callout') as HTMLElement;
+    const anchor = this.querySelector('[data-act="actions"]') as HTMLElement | null;
+    if (el && anchor) positionCallout(el, anchor);
+  }
+
+  private async importPickedFiles(files: FileList): Promise<void> {
+    const dt = new DataTransfer();
+    for (const f of Array.from(files)) dt.items.add(f);
+    const destParent = this.cwd;
+    this.setStatus('Scanning…', { busy: true });
+    try {
+      const count = await this.withOwnVfsMutation(() =>
+        this.vfs.importDataTransfer(destParent, dt, {
+          onScan: (total) => {
+            this.setStatus(total > 0 ? `Importing… 0/${total} (0%)` : 'Importing…', { busy: true });
+          },
+          onProgress: (done, total) => {
+            const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+            this.setStatus(
+              total > 0 ? `Importing… ${done}/${total} (${pct}%)` : `Importing… ${done} item(s)`,
+              { busy: true },
+            );
+          },
+          onItem: (item) => this.trackImportItem(item),
+          resolveConflict: (info) => this.host.promptNameConflict(info),
+        }),
+      );
+      if (count === 0) {
+        this.setStatus('No files to import');
+        return;
+      }
+      this.setStatus(`Imported ${count} item(s)`);
+      iconCache.clearDirectoryCache();
+      this.iconUrls.clear();
+      this.iconLoadGen++;
+      await this.refreshAfterMutation();
+    } catch (err) {
+      if (isTransferCancelled(err)) {
+        this.setStatus('Transfer cancelled');
+        return;
+      }
+      this.setStatus(`Import failed: ${(err as Error).message}`);
+    }
   }
 
   private async onContextMenu(e: MouseEvent): Promise<void> {
+    if (isCompactUi()) {
+      e.preventDefault();
+      return;
+    }
+    const t = e.target as HTMLElement;
+    if (t.closest('[data-local]')) {
+      e.preventDefault();
+      this.contextMenu = { x: e.clientX, y: e.clientY, targetId: null, local: true };
+      this.renderContextMenu();
+      return;
+    }
     const content = this.querySelector('.content');
     if (!content?.contains(e.target as Node)) return;
     e.preventDefault();
     const item = this.itemFromEvent(e);
-    if (item) {
+    if (item && (item.matches('[data-preview], .item-info') || item.closest('[data-preview], .item-info'))) {
+      this.contextMenu = { x: e.clientX, y: e.clientY, targetId: this.selectedId };
+    } else if (item) {
       const id = Number(item.getAttribute('data-id'));
       this.selectedId = id;
       this.paintSelection(item);
@@ -2678,13 +3536,27 @@ export class FinderWindow extends HTMLElement {
       root.innerHTML = '';
       return;
     }
-    const { x, y, targetId } = this.contextMenu;
-    const items =
-      targetId != null
+    const { x, y, targetId, local } = this.contextMenu;
+    const targetNode = targetId != null ? this.findNodeAnywhere(targetId) : null;
+    const canPreview = this.isPreviewable(targetNode);
+    const items = local
+      ? [
+          `<button type="button" data-ctx="welcome-pack">Add Welcome Pack Items</button>`,
+          `<hr/>`,
+          `<button type="button" data-ctx="erase-local">Erase All Items…</button>`,
+        ]
+      : targetId != null
         ? [
+            this.isExpandableArchive(targetNode)
+              ? `<button type="button" data-ctx="expand">Expand</button>`
+              : '',
+            canPreview ? `<button type="button" data-ctx="preview">Preview…</button>` : '',
             `<button type="button" data-ctx="rename">Rename</button>`,
             `<button type="button" data-ctx="delete">Delete…</button>`,
-            `<button type="button" data-ctx="props">Properties…</button>`,
+            `<button type="button" data-ctx="props">Get Info…</button>`,
+            targetNode && !targetNode.isDir
+              ? `<button type="button" data-ctx="resources">Resources…</button>`
+              : '',
             `<hr/>`,
             `<button type="button" data-ctx="cut">Cut</button>`,
             `<button type="button" data-ctx="copy">Copy</button>`,
@@ -2693,13 +3565,19 @@ export class FinderWindow extends HTMLElement {
         : [
             `<button type="button" data-ctx="mkdir">New Folder</button>`,
             this.clipboard ? `<button type="button" data-ctx="paste">Paste</button>` : '',
-            `<button type="button" data-ctx="props-blank">Properties</button>`,
+            `<button type="button" data-ctx="props-blank">Get Info</button>`,
           ];
     root.innerHTML = `<div class="ctx-menu" style="left:${x}px;top:${y}px">${items.filter(Boolean).join('')}</div>`;
   }
 
   private async handleContextAction(action: string, targetId: number | null = null): Promise<void> {
     switch (action) {
+      case 'expand':
+        await this.expandArchive(targetId);
+        break;
+      case 'preview':
+        await this.openPreview(targetId);
+        break;
       case 'rename':
         this.startRename();
         break;
@@ -2708,6 +3586,9 @@ export class FinderWindow extends HTMLElement {
         break;
       case 'props':
         this.showPropertiesPanel();
+        break;
+      case 'resources':
+        this.openResourceExplorer(targetId);
         break;
       case 'props-blank': {
         this.showProps = true;
@@ -2731,7 +3612,83 @@ export class FinderWindow extends HTMLElement {
       case 'mkdir':
         await this.onMkdir();
         break;
+      case 'erase-local':
+        await this.eraseLocalShare();
+        break;
+      case 'welcome-pack':
+        await this.addWelcomePack();
+        break;
     }
+  }
+
+  private async addWelcomePack(): Promise<void> {
+    this.setStatus('Adding Welcome Pack Items…', { busy: true });
+    try {
+      const { imported, skipped } = await this.host.installWelcomePack();
+      if (imported === 0 && skipped === 0) {
+        this.setStatus('Welcome pack is empty');
+        return;
+      }
+      if (imported === 0) {
+        this.setStatus('Welcome pack items already present');
+        return;
+      }
+      const extra = skipped > 0 ? ` (${skipped} already present)` : '';
+      this.setStatus(`Added ${imported} welcome pack item${imported === 1 ? '' : 's'}${extra}`);
+    } catch (err) {
+      this.setStatus(`Welcome pack failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async eraseLocalShare(): Promise<void> {
+    const cat = this.localVfs ?? this.host?.localCatalog();
+    if (!cat) return;
+    const root = cat.rootId();
+    const kids = await cat.children(root);
+    if (!kids.length) {
+      this.setStatus('Browser Share is empty');
+      return;
+    }
+    if (!confirm('Erase all items in Browser Share? This cannot be undone.')) {
+      return;
+    }
+    this.setStatus('Erasing Browser Share…', { busy: true });
+    if (this.source === 'local') {
+      this.cwd = root;
+      this.pathStack = [{ id: root, name: 'Browser Share' }];
+      this.selectedId = null;
+      this.expandedIds.clear();
+      this.loadingIds.clear();
+      this.listChildCache.clear();
+      this.columnChildren = [];
+      this.showProps = false;
+      this.syncPropsButton();
+    }
+    if (this.clipboard?.source === cat) {
+      this.clipboard = null;
+      this.syncClipboardButtons();
+    }
+    let failed = false;
+    await this.withOwnVfsMutation(async () => {
+      cat.beginBatch();
+      try {
+        for (const k of kids) await cat.remove(k.id);
+      } catch (err) {
+        failed = true;
+        this.setStatus(`Erase failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        cat.endBatch();
+      }
+    });
+    iconCache.clearDirectoryCache();
+    this.iconUrls.clear();
+    this.iconLoadGen++;
+    if (this.source === 'local') {
+      await this.reload();
+      this.syncHistory();
+      this.render();
+    }
+    if (!failed) this.setStatus('Erased Browser Share');
   }
 
   private async pasteDestFromTarget(targetId: number | null): Promise<number> {
@@ -2747,7 +3704,9 @@ export class FinderWindow extends HTMLElement {
     this.setStatus('Pasting…', { busy: true });
     try {
       const sameShare = clip.source === this.vfs;
+      const reserved = new Set<string>();
       if (clip.mode === 'cut' && sameShare) {
+        const moves: { id: number; name: string; plan: PlacementPlan }[] = [];
         for (const id of clip.sourceIds) {
           const src = await this.vfs.get(id);
           if (!src || src.parentId === destParent) continue;
@@ -2755,27 +3714,53 @@ export class FinderWindow extends HTMLElement {
             this.setStatus('Can’t move an item into itself');
             return;
           }
-          const clash = await this.vfs.lookup(destParent, src.name);
-          if (clash && clash.id !== id) {
-            const name = await this.uniqueChildName(destParent, src.name);
-            await this.vfs.rename(id, name);
-          }
-          await this.vfs.move(id, destParent);
+          const plan = await this.planPlacement(this.vfs, destParent, src.name, src.isDir, id, reserved);
+          moves.push({ id, name: src.name, plan });
+        }
+        for (const { id, name, plan } of moves) {
+          await this.withOwnVfsMutation(async () => {
+            if (plan.replaceId != null) await this.vfs.remove(plan.replaceId);
+            if (plan.destName !== name) await this.vfs.rename(id, plan.destName);
+            await this.vfs.move(id, destParent);
+          });
         }
       } else {
-        this.vfs.beginBatch();
-        try {
-          for (const item of clip.items) {
-            await this.writeClipNode(this.vfs, destParent, item);
-          }
-        } finally {
-          this.vfs.endBatch();
+        const planned: { item: ClipNode; plan: PlacementPlan }[] = [];
+        for (const item of clip.items) {
+          planned.push({
+            item,
+            plan: await this.planPlacement(this.vfs, destParent, item.name, item.isDir, undefined, reserved),
+          });
         }
-        if (clip.mode === 'cut' && clip.source) {
-          for (const id of clip.sourceIds) {
-            await clip.source.remove(id).catch(() => undefined);
+        await this.withOwnVfsMutation(async () => {
+          this.vfs.beginBatch();
+          try {
+            for (const { item, plan } of planned) {
+              if (plan.replaceId != null) await this.vfs.remove(plan.replaceId);
+              const jobId = this.startTransfer(plan.destName, item.isDir, clipByteSize(item), item.finderInfo);
+              try {
+                await this.writeClipNode(
+                  this.vfs,
+                  destParent,
+                  item,
+                  (n) => transferActivity.addBytes(jobId, n),
+                  plan.destName,
+                );
+                transferActivity.finish(jobId);
+              } catch (err) {
+                transferActivity.fail(jobId, err instanceof Error ? err.message : String(err));
+                throw err;
+              }
+            }
+          } finally {
+            this.vfs.endBatch();
           }
-        }
+          if (clip.mode === 'cut' && clip.source) {
+            for (const id of clip.sourceIds) {
+              await clip.source.remove(id).catch(() => undefined);
+            }
+          }
+        });
       }
       if (clip.mode === 'cut') this.clipboard = null;
       this.syncClipboardButtons();
@@ -2783,18 +3768,36 @@ export class FinderWindow extends HTMLElement {
       this.renderContent();
       this.setStatus('Paste complete');
     } catch (err) {
+      if (isTransferCancelled(err)) {
+        this.setStatus('Transfer cancelled');
+        return;
+      }
       this.setStatus(`Paste failed: ${(err as Error).message}`);
     }
   }
 
-  private async writeClipNode(fs: Catalog, parentId: number, item: ClipNode): Promise<void> {
-    const name = await this.uniqueChildName(parentId, item.name, fs);
+  private async writeClipNode(
+    fs: Catalog,
+    parentId: number,
+    item: ClipNode,
+    onBytes?: (n: number) => void,
+    destName = item.name,
+  ): Promise<void> {
+    const clash = await fs.lookup(parentId, destName);
+    const name = clash ? await uniqueCopyName(fs, parentId, destName) : destName;
     if (item.isDir) {
       const dir = await fs.mkdir(parentId, name);
-      for (const kid of item.kids ?? []) await this.writeClipNode(fs, dir.id, kid);
+      for (const kid of item.kids ?? []) await this.writeClipNode(fs, dir.id, kid, onBytes);
       return;
     }
-    await fs.createFile(parentId, name, item.data.slice(), item.resource.slice(), item.finderInfo.slice());
+    await fs.createFile(
+      parentId,
+      name,
+      item.data.slice(),
+      item.resource.slice(),
+      item.finderInfo.slice(),
+      onBytes,
+    );
   }
 
   private isEditingField(t: EventTarget | null): boolean {
@@ -2826,9 +3829,23 @@ export class FinderWindow extends HTMLElement {
       }
       return;
     }
+    if (t instanceof HTMLInputElement && t.hasAttribute('data-prop')) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        await this.applyProps();
+      }
+      return;
+    }
 
     if (!this.finderHasFocus()) return;
     if (this.isEditingField(t)) return;
+    if (this.preview) {
+      if (e.key === 'Escape' || e.key === ' ') {
+        e.preventDefault();
+        this.closePreview();
+      }
+      return;
+    }
     if (this.contextMenu) {
       if (e.key === 'Escape') {
         e.preventDefault();
@@ -2837,10 +3854,25 @@ export class FinderWindow extends HTMLElement {
       }
       return;
     }
+    if (this.openCallout) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        this.openCallout = null;
+        this.renderCallouts();
+      }
+      return;
+    }
 
     const mod = e.metaKey || e.ctrlKey;
     const key = e.key;
     const lower = key.length === 1 ? key.toLowerCase() : key;
+
+    // Quick Look: Space
+    if (key === ' ' && !mod && !e.altKey) {
+      e.preventDefault();
+      await this.openPreview();
+      return;
+    }
 
     // Delete: Delete | ⌘⌫ | Ctrl+D
     if (
@@ -2860,7 +3892,7 @@ export class FinderWindow extends HTMLElement {
       return;
     }
 
-    // Properties: ⌘I | Alt+Enter
+    // Get Info: ⌘I | Alt+Enter
     if ((mod && lower === 'i' && !e.shiftKey) || (e.altKey && key === 'Enter')) {
       e.preventDefault();
       this.showPropertiesPanel();
@@ -2935,7 +3967,7 @@ export class FinderWindow extends HTMLElement {
           this.renderContent();
           return;
         }
-        await this.vfs.rename(id, name);
+        await this.withOwnVfsMutation(() => this.vfs.rename(id, name));
       }
       await this.reload();
       this.renderContent();
@@ -2955,6 +3987,8 @@ export class FinderWindow extends HTMLElement {
       (e) => {
         const t = e.target as HTMLElement;
         if (t instanceof HTMLInputElement && t.hasAttribute('data-rename')) {
+          // Replacing innerHTML disconnects the input; don't treat that as a commit.
+          if (!t.isConnected) return;
           void this.commitRename(t);
         }
       },
@@ -2965,6 +3999,16 @@ export class FinderWindow extends HTMLElement {
   private escape(s: string): string {
     return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
   }
+}
+
+function decodePreviewText(data: Uint8Array): string {
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(data);
+  } catch {
+    text = decodeMacRoman(data);
+  }
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
 customElements.define('finder-window', FinderWindow);
@@ -2998,18 +4042,23 @@ export async function collectFsZipEntries(
   vfs: Catalog,
   node: VNode,
   prefix = '',
+  onBytes?: (n: number) => void,
+  onAddTotal?: (n: number) => void,
 ): Promise<{ name: string; data: Uint8Array }[]> {
   const out: { name: string; data: Uint8Array }[] = [];
+  const creditRead = vfs.reportsChunkedBytes ? onBytes : undefined;
+  const creditLoaded = !vfs.reportsChunkedBytes ? onBytes : undefined;
   if (node.isDir) {
     const kids = await vfs.children(node.id);
     const dirPrefix = prefix ? `${prefix}${node.name}/` : `${node.name}/`;
     for (const kid of kids) {
-      const full = kid.isDir ? kid : ((await vfs.ensureContent(kid.id)) ?? kid);
-      out.push(...(await collectFsZipEntries(vfs, full, dirPrefix)));
+      if (!kid.isDir) onAddTotal?.(nodeByteSize(kid));
+      out.push(...(await collectFsZipEntries(vfs, kid, dirPrefix, onBytes, onAddTotal)));
     }
     return out;
   }
-  const full = (await vfs.ensureContent(node.id)) ?? node;
+  const full = (await vfs.ensureContent(node.id, creditRead)) ?? node;
+  creditLoaded?.(full.data.length + full.resource.length);
   const base = prefix ? `${prefix}${full.name}` : full.name;
   out.push({ name: base, data: full.data });
   out.push({

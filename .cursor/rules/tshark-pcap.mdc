@@ -1,0 +1,22 @@
+---
+description: Use Wireshark tshark on Windows to analyze LocalTalk pcaps
+alwaysApply: true
+---
+
+# Pcap analysis
+
+On Windows, dissect captures with:
+
+`"c:\Program Files\Wireshark\tshark.exe"`
+
+Do not write one-off Node/Python pcap parsers when tshark can decode the file.
+
+This project writes classic pcap `LINKTYPE_LTALK` (114); frames start with LLAP. tshark protocols: `llap`, `ddp`, `nbp`, `atp`, `asp`, `afp`.
+
+```text
+tshark -r capture.pcap -T fields -e frame.number -e frame.time_relative -e llap.dst -e llap.src -e atp.function -e atp.tid -e asp.function -e afp.command
+tshark -r capture.pcap -Y "atp || asp || afp" -V
+tshark -r capture.pcap -q -z conv,atalk
+```
+
+Quote the tshark path in PowerShell. Prefer `-Y` display filters over dumping every frame.

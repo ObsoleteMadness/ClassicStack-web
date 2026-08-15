@@ -1,50 +1,72 @@
 import { log, meetsLevel, type LogEntry, type LogLevel } from '../util/logger';
+import { positionCallout } from './callout';
 
 const LEVELS: LogLevel[] = ['trace', 'info', 'warn', 'error'];
 
-/** Floating diagnostic log panel with level filter. */
+/** Event log shown as a callout from Advanced. */
 export class LogPanel extends HTMLElement {
   private minLevel: LogLevel = 'info';
   private unsub: (() => void) | null = null;
-  private drag: { ox: number; oy: number; sx: number; sy: number } | null = null;
-  private pos = { x: 24, y: 56 };
+  private anchor: HTMLElement | null = null;
 
   connectedCallback(): void {
-    this.classList.add('log-panel');
+    this.classList.add('log-panel', 'is-callout');
     this.renderShell();
     this.unsub = log.subscribe((e) => this.appendEntry(e));
     this.reload();
     this.addEventListener('click', (e) => this.onClick(e));
     this.addEventListener('change', (e) => this.onChange(e));
-    this.querySelector('.log-panel__chrome')?.addEventListener('pointerdown', (e) =>
-      this.onDragStart(e as PointerEvent),
-    );
-    window.addEventListener('pointermove', this.onDragMove);
-    window.addEventListener('pointerup', this.onDragEnd);
-    this.applyPosition();
+    window.addEventListener('pointerdown', this.onDocPointer, true);
+    window.addEventListener('keydown', this.onKey);
+    window.addEventListener('resize', this.onReposition);
   }
 
   disconnectedCallback(): void {
     this.unsub?.();
     this.unsub = null;
-    window.removeEventListener('pointermove', this.onDragMove);
-    window.removeEventListener('pointerup', this.onDragEnd);
+    window.removeEventListener('pointerdown', this.onDocPointer, true);
+    window.removeEventListener('keydown', this.onKey);
+    window.removeEventListener('resize', this.onReposition);
   }
 
   show(): void {
+    this.showCallout(this.anchor);
+  }
+
+  showCallout(anchor: HTMLElement | null): void {
+    this.anchor = anchor;
     this.hidden = false;
     this.reload();
-    this.scrollToBottom();
+    this.reposition();
   }
 
   hide(): void {
     this.hidden = true;
   }
 
-  toggle(): void {
-    if (this.hidden) this.show();
-    else this.hide();
+  toggleCallout(anchor: HTMLElement | null): void {
+    if (!this.hidden) this.hide();
+    else this.showCallout(anchor);
   }
+
+  private reposition = (): void => {
+    if (this.hidden || !this.anchor) return;
+    positionCallout(this, this.anchor);
+  };
+
+  private onReposition = (): void => this.reposition();
+
+  private onDocPointer = (e: PointerEvent): void => {
+    if (this.hidden) return;
+    const t = e.target as Node;
+    if (this.contains(t)) return;
+    if (this.anchor?.contains(t)) return;
+    this.hide();
+  };
+
+  private onKey = (e: KeyboardEvent): void => {
+    if (e.key === 'Escape' && !this.hidden) this.hide();
+  };
 
   private renderShell(): void {
     this.innerHTML = `
@@ -117,31 +139,6 @@ export class LogPanel extends HTMLElement {
     const body = this.querySelector('.log-panel__body');
     if (body) body.scrollTop = body.scrollHeight;
   }
-
-  private applyPosition(): void {
-    this.style.left = `${this.pos.x}px`;
-    this.style.top = `${this.pos.y}px`;
-  }
-
-  private onDragStart(e: PointerEvent): void {
-    if ((e.target as HTMLElement).closest('select,button,label')) return;
-    this.drag = { ox: this.pos.x, oy: this.pos.y, sx: e.clientX, sy: e.clientY };
-    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-    e.preventDefault();
-  }
-
-  private onDragMove = (e: PointerEvent): void => {
-    if (!this.drag) return;
-    this.pos = {
-      x: Math.max(8, this.drag.ox + (e.clientX - this.drag.sx)),
-      y: Math.max(8, this.drag.oy + (e.clientY - this.drag.sy)),
-    };
-    this.applyPosition();
-  };
-
-  private onDragEnd = (): void => {
-    this.drag = null;
-  };
 }
 
 function escapeHtml(s: string): string {

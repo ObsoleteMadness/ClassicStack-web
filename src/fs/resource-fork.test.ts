@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ResourceFork } from './resource-fork';
+import { ResourceFork, loadResourceForkPartial } from './resource-fork';
 import { decodeIcon, decodeICNHash, type DecodedIcon } from './resource-types/icon-decoder';
 import { IconSet, IconSize } from './resource-types/icon-set';
 
@@ -146,5 +146,25 @@ describe('resource fork + icon decode', () => {
     const picked = set.getIconBySize(IconSize.Large, true, false);
     expect(picked?.typeCode).toBe('icl8');
     expect(set.largeColor?.typeCode).toBe('icl8');
+  });
+
+  it('loads only header, map, and matching icon resources from a fork reader', async () => {
+    const fork = buildForkWithICN();
+    const reads: { offset: number; count: number }[] = [];
+    const rf = await loadResourceForkPartial(
+      async (offset, count) => {
+        reads.push({ offset, count });
+        return fork.subarray(offset, offset + count);
+      },
+      (type, id) => type === 'ICN#' && id === 128,
+    );
+    expect(rf).toBeTruthy();
+    expect(rf!.findById('ICN#', 128)?.length).toBe(256);
+    const set = IconSet.fromResourceFork(128, rf!);
+    expect(set?.getIconBySize(IconSize.Large, false)?.width).toBe(32);
+    const total = reads.reduce((n, r) => n + r.count, 0);
+    expect(reads.some((r) => r.offset === 0 && r.count === fork.length)).toBe(false);
+    expect(reads[0]).toEqual({ offset: 0, count: 16 });
+    expect(total).toBeGreaterThan(16);
   });
 });

@@ -30,6 +30,13 @@ describe('ATP / ASP OpenSess framing', () => {
     expect(atp.responseComplete(8, got, 0)).toBe(true);
   });
 
+  it('infers EOM at the last contiguous slot when the server omits the flag', () => {
+    expect(atp.inferredEomSeq(8, new Set())).toBeNull();
+    expect(atp.inferredEomSeq(8, new Set([0]))).toBe(0);
+    expect(atp.inferredEomSeq(8, new Set([0, 1, 2]))).toBe(2);
+    expect(atp.inferredEomSeq(8, new Set([0, 2]))).toBe(0);
+  });
+
   it('detects STS separately from EOM', () => {
     const h = atp.decodeHeader(atp.encodeHeader({ control: atp.TRESP | atp.STS, bitmap: 1, transId: 1, userData: 0 }));
     expect(atp.hasSTS(h)).toBe(true);

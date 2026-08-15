@@ -18,6 +18,7 @@ import {
   loginCont,
   pickAfpVersion,
   pickCleartextUam,
+  getFileDirParms,
 } from './commands';
 
 describe('AFP client wirePath + Pascal framing', () => {
@@ -188,5 +189,13 @@ describe('AFP login packets', () => {
     expect(b[1]).toBe(0);
     expect(be16(b, 2)).toBe(0x1122);
     expect([...b.subarray(4)]).toEqual([...auth]);
+  });
+
+  it('GetFileDirParms is a named lookup, not an enumerate', () => {
+    const b = getFileDirParms(1, 2, C.FileBitmapRsrcForkLen, 0, 'Icon\r');
+    expect(b[0]).toBe(C.CmdGetFileDirParms);
+    expect(be16(b, 2)).toBe(1);
+    expect(be32(b, 4)).toBe(2);
+    expect(b[12]).toBe(C.PathTypeLongNames);
   });
 });

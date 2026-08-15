@@ -5,10 +5,13 @@ const STORAGE_KEY = 'classicstack.prefs';
 export interface AppPrefs {
   /** When false, Finder hides items with the AppleDouble/Finder kIsInvisible flag (and Icon\\r). */
   showHiddenFiles: boolean;
+  /** When true, dropped .hqx / MacBinary .bin / StuffIt .sit files are decoded. */
+  autoExpandFiles: boolean;
 }
 
 const DEFAULTS: AppPrefs = {
   showHiddenFiles: false,
+  autoExpandFiles: true,
 };
 
 export function loadPrefs(): AppPrefs {
@@ -21,6 +24,10 @@ export function loadPrefs(): AppPrefs {
         typeof parsed.showHiddenFiles === 'boolean'
           ? parsed.showHiddenFiles
           : DEFAULTS.showHiddenFiles,
+      autoExpandFiles:
+        typeof parsed.autoExpandFiles === 'boolean'
+          ? parsed.autoExpandFiles
+          : DEFAULTS.autoExpandFiles,
     };
   } catch {
     return { ...DEFAULTS };

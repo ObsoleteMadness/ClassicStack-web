@@ -4,7 +4,7 @@
 
 import { be16 } from '../../protocol/binary';
 import type { ResourceEntry, ResourceFork } from '../resource-fork';
-import { SUPPORTED_ICON_TYPES } from './icon-decoder';
+import { SUPPORTED_ICON_TYPES, type DecodedIcon } from './icon-decoder';
 import { IconSet } from './icon-set';
 
 function be16s(b: Uint8Array, o: number): number {
@@ -69,16 +69,27 @@ function parseBndlBytes(data: Uint8Array): Bndl | null {
     id,
     sections,
     extractIcons(rf: ResourceFork): Map<number, IconSet> {
-      const result = new Map<number, IconSet>();
+      const bags = new Map<number, DecodedIcon[]>();
       const supported = new Set<string>(SUPPORTED_ICON_TYPES);
       for (const sect of sections) {
         if (!supported.has(sect.code)) continue;
         for (const mapping of sect.mappings) {
-          const icons = IconSet.fromResourceFork(mapping.resourceId, rf);
-          if (icons && !result.has(mapping.localId)) {
-            result.set(mapping.localId, icons);
+          // BNDL usually lists only ICN# / ics#; icl8/icl4/ics8/… share that id.
+          const family = IconSet.fromResourceFork(mapping.resourceId, rf)?.icons ?? [];
+          if (!family.length) continue;
+          const bag = bags.get(mapping.localId) ?? [];
+          const seen = new Set(bag.map((icon) => icon.typeCode));
+          for (const icon of family) {
+            if (seen.has(icon.typeCode)) continue;
+            seen.add(icon.typeCode);
+            bag.push(icon);
           }
+          bags.set(mapping.localId, bag);
         }
+      }
+      const result = new Map<number, IconSet>();
+      for (const [localId, icons] of bags) {
+        result.set(localId, new IconSet(icons));
       }
       return result;
     },

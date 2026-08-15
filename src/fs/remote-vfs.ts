@@ -6,11 +6,15 @@ import { unescapeHostFilename } from '../protocol/host-filename';
 import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appledouble';
 import { be32 } from '../protocol/binary';
 import type { Catalog, VNode, VfsChangeListener } from './virtual-fs';
-import { importDataTransferInto } from './import-transfer';
+import { importDataTransferInto, type ImportProgress } from './import-transfer';
+import { finderInfoFromName } from './extension-map';
+import { loadResourceForkPartial, ResourceFork } from './resource-fork';
+import { SUPPORTED_ICON_TYPES } from './resource-types/icon-decoder';
 
 const EMPTY = new Uint8Array();
 
 export class RemoteVfs implements Catalog {
+  readonly reportsChunkedBytes = true;
   private client: AfpClient;
   private volumeName: string;
   private volId: number;
@@ -54,10 +58,10 @@ export class RemoteVfs implements Catalog {
     return this.nodes.get(id) ?? (id === this.rootId() ? this.ensureRoot() : undefined);
   }
 
-  async ensureContent(id: number): Promise<VNode | undefined> {
+  async ensureContent(id: number, onBytes?: (n: number) => void): Promise<VNode | undefined> {
     const node = await this.get(id);
     if (!node || node.isDir) return node;
-    if (!this.forksLoaded.has(id)) await this.hydrateForks(node);
+    if (!this.forksLoaded.has(id)) await this.hydrateForks(node, onBytes);
     return node;
   }
 
@@ -73,8 +77,35 @@ export class RemoteVfs implements Catalog {
 
   async lookup(parentId: number, name: string): Promise<VNode | undefined> {
     const lower = name.toLowerCase();
-    const kids = await this.children(parentId);
-    return kids.find((n) => n.name.toLowerCase() === lower);
+    for (const n of this.nodes.values()) {
+      if (n.parentId === parentId && n.name.toLowerCase() === lower) return n;
+    }
+    try {
+      const e = await this.client.stat(parentId, name, this.volId);
+      if (!e) return undefined;
+      if (!e.name) e.name = name;
+      return this.adopt(e, parentId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  async loadIconResources(node: VNode): Promise<ResourceFork | null> {
+    if (node.resource.length >= 16) return ResourceFork.fromBytes(node.resource);
+    const rsrcLen = node.resourceBytes ?? 0;
+    if (rsrcLen < 16) return null;
+    const types = new Set<string>([...SUPPORTED_ICON_TYPES, 'BNDL', 'FREF']);
+    try {
+      return await this.client.withForkReader(
+        node.name,
+        node.parentId,
+        true,
+        (read) => loadResourceForkPartial(read, (type) => types.has(type)),
+        this.volId,
+      );
+    } catch {
+      return null;
+    }
   }
 
   async mkdir(parentId: number, name: string): Promise<VNode> {
@@ -98,10 +129,11 @@ export class RemoteVfs implements Catalog {
     name: string,
     data: Uint8Array,
     resource = new Uint8Array(),
-    finderInfo = new Uint8Array(32),
+    finderInfo = finderInfoFromName(name),
+    onBytes?: (n: number) => void,
   ): Promise<VNode> {
-    await this.client.writeFile(name, data, parentId, false, this.volId);
-    if (resource.length) await this.client.writeFile(name, resource, parentId, true, this.volId);
+    await this.client.writeFile(name, data, parentId, false, this.volId, onBytes);
+    if (resource.length) await this.client.writeFile(name, resource, parentId, true, this.volId, onBytes);
     if (finderInfo.some((b) => b !== 0)) {
       await this.client.setFinderInfo(name, finderInfo, parentId, this.volId);
     }
@@ -123,7 +155,10 @@ export class RemoteVfs implements Catalog {
 
   async put(node: VNode): Promise<void> {
     this.nodes.set(node.id, node);
-    await this.client.setFinderInfo(node.name, node.finderInfo, node.parentId, this.volId);
+    await this.client.setFinderInfo(node.name, node.finderInfo, node.parentId, this.volId, {
+      createDate: node.createDate || undefined,
+      modDate: node.modDate || undefined,
+    });
     this.notify(node.parentId);
   }
 
@@ -165,18 +200,11 @@ export class RemoteVfs implements Catalog {
     this.notify(n.parentId);
   }
 
-  async importDataTransfer(
-    parentId: number,
-    dt: DataTransfer,
-    opts?: {
-      onScan?: (total: number) => void;
-      onProgress?: (done: number, total: number) => void;
-    },
-  ): Promise<number> {
-    return importDataTransferInto(this, parentId, dt, (p, file) => this.importBlob(p, file), opts);
+  async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
+    return importDataTransferInto(this, parentId, dt, (p, file, onBytes) => this.importBlob(p, file, onBytes), opts);
   }
 
-  private async importBlob(parentId: number, file: File): Promise<VNode> {
+  private async importBlob(parentId: number, file: File, onBytes?: (n: number) => void): Promise<VNode> {
     const buf = new Uint8Array(await file.arrayBuffer());
     const name = unescapeHostFilename(file.name);
     if (name.startsWith('._') && name.length > 2) {
@@ -188,30 +216,30 @@ export class RemoteVfs implements Catalog {
           const data = this.forksLoaded.has(existing.id)
             ? existing.data
             : await this.client.readFile(existing.name, parentId, false, this.volId);
-          return this.createFile(parentId, target, data, ad.resource, ad.finderInfo);
+          return this.createFile(parentId, target, data, ad.resource, ad.finderInfo, onBytes);
         }
-        return this.createFile(parentId, target, new Uint8Array(), ad.resource, ad.finderInfo);
+        return this.createFile(parentId, target, new Uint8Array(), ad.resource, ad.finderInfo, onBytes);
       }
     }
     if (buf.length >= 4 && be32(buf, 0) === AS_MAGIC) {
       const as = parseAppleSingle(buf);
-      if (as) return this.createFile(parentId, name, as.data, as.resource, as.finderInfo);
+      if (as) return this.createFile(parentId, name, as.data, as.resource, as.finderInfo, onBytes);
     }
     if (buf.length >= 4 && be32(buf, 0) === AD_MAGIC) {
       const ad = parseAppleDouble(buf);
-      if (ad) return this.createFile(parentId, name, new Uint8Array(), ad.resource, ad.finderInfo);
+      if (ad) return this.createFile(parentId, name, new Uint8Array(), ad.resource, ad.finderInfo, onBytes);
     }
-    return this.createFile(parentId, name, buf);
+    return this.createFile(parentId, name, buf, undefined, undefined, onBytes);
   }
 
-  private async hydrateForks(node: VNode): Promise<void> {
+  private async hydrateForks(node: VNode, onBytes?: (n: number) => void): Promise<void> {
     try {
-      node.data = await this.client.readFile(node.name, node.parentId, false, this.volId);
+      node.data = await this.client.readFile(node.name, node.parentId, false, this.volId, onBytes);
     } catch {
       node.data = EMPTY;
     }
     try {
-      node.resource = await this.client.readFile(node.name, node.parentId, true, this.volId);
+      node.resource = await this.client.readFile(node.name, node.parentId, true, this.volId, onBytes);
     } catch {
       node.resource = EMPTY;
     }

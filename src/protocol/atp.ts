@@ -53,6 +53,17 @@ export function responseComplete(
   return true;
 }
 
+/**
+ * Highest contiguous slot from 0. Used when the responder omits EOM on a
+ * short reply (System 7 OpenSess / many AFP Command TResps).
+ */
+export function inferredEomSeq(maxResp: number, got: { has(seq: number): boolean }): number | null {
+  if (!got.has(0)) return null;
+  let last = 0;
+  while (last + 1 < maxResp && got.has(last + 1)) last++;
+  return last;
+}
+
 /** Bitmap of still-missing response slots (OmniTalk missingMask). */
 export function missingBitmap(
   maxResp: number,

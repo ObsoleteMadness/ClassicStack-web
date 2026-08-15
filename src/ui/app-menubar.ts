@@ -4,6 +4,8 @@ import type { LogPanel } from './log-panel';
 import type { ActivityWindow } from './activity-window';
 import type { NetbootDialog } from './netboot-dialog';
 import type { AfpSessionsDialog } from './afp-sessions-dialog';
+import type { ExtensionEditorDialog } from './extension-editor-dialog';
+import type { ResourceForkExplorer } from './resource-fork-explorer';
 import type { FinderWindow } from './finder-window';
 import { iconCache } from '../fs/icon-cache';
 
@@ -13,6 +15,8 @@ export interface AdvancedMenuHost {
   activityWindow: ActivityWindow;
   netboot: NetbootDialog;
   afpSessions: AfpSessionsDialog;
+  extensionEditor: ExtensionEditorDialog;
+  resourceExplorer: ResourceForkExplorer;
   finder?: FinderWindow;
   onCaptureChanged?(capturing: boolean): void;
 }
@@ -66,6 +70,7 @@ export class AppMenuBar extends HTMLElement {
     const capturing = this.host?.pcap.capturing ?? false;
     const count = this.host?.pcap.packetCount ?? 0;
     const showHidden = this.host?.finder?.getShowHiddenFiles?.() ?? false;
+    const autoExpand = this.host?.finder?.getAutoExpandFiles?.() ?? false;
     this.innerHTML = `
       <div class="app-menubar__inner">
         <span class="app-menubar__brand">ClassicStack</span>
@@ -104,6 +109,18 @@ export class AppMenuBar extends HTMLElement {
               <button type="button" role="menuitemcheckbox" aria-checked="${showHidden}" data-act="toggle-show-hidden" class="app-menu__item">
                 <span class="app-menu__check">${showHidden ? '✓' : ''}</span>
                 Show hidden files
+              </button>
+              <button type="button" role="menuitemcheckbox" aria-checked="${autoExpand}" data-act="toggle-auto-expand" class="app-menu__item">
+                <span class="app-menu__check">${autoExpand ? '✓' : ''}</span>
+                Auto-expand files
+              </button>
+              <button type="button" role="menuitem" data-act="extension-editor" class="app-menu__item">
+                <span class="app-menu__check"></span>
+                Extension editor…
+              </button>
+              <button type="button" role="menuitem" data-act="resource-fork" class="app-menu__item">
+                <span class="app-menu__check"></span>
+                Resource Fork…
               </button>
               <button type="button" role="menuitem" data-act="clear-icon-cache" class="app-menu__item">
                 <span class="app-menu__check"></span>
@@ -186,14 +203,16 @@ export class AppMenuBar extends HTMLElement {
     if (act === 'show-log') {
       this.menuOpen = false;
       this.render();
-      this.host.logPanel.show();
+      this.host.activityWindow.hide();
+      this.host.logPanel.toggleCallout(this.querySelector('.app-menu__trigger') as HTMLElement | null);
       return;
     }
 
     if (act === 'show-activity') {
       this.menuOpen = false;
       this.render();
-      this.host.activityWindow.show();
+      this.host.logPanel.hide();
+      this.host.activityWindow.toggleCallout(this.querySelector('.app-menu__trigger') as HTMLElement | null);
       return;
     }
 
@@ -202,6 +221,28 @@ export class AppMenuBar extends HTMLElement {
       this.host.finder?.setShowHiddenFiles?.(next);
       this.menuOpen = false;
       this.render();
+      return;
+    }
+
+    if (act === 'toggle-auto-expand') {
+      const next = !(this.host.finder?.getAutoExpandFiles?.() ?? false);
+      this.host.finder?.setAutoExpandFiles?.(next);
+      this.menuOpen = false;
+      this.render();
+      return;
+    }
+
+    if (act === 'extension-editor') {
+      this.menuOpen = false;
+      this.render();
+      this.host.extensionEditor.open();
+      return;
+    }
+
+    if (act === 'resource-fork') {
+      this.menuOpen = false;
+      this.render();
+      this.host.finder?.openResourceExplorer();
       return;
     }
 
