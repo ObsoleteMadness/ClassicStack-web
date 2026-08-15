@@ -54,13 +54,11 @@ export class AboutDialog extends HTMLElement {
           <p class="about-dialog__name">ClassicStack</p>
           <p class="about-dialog__ver">Version ${APP_VERSION}</p>
           <p>A browser AppleTalk / AFP stack over Web Serial → TashTalk → LocalTalk.</p>
-
+          <p><a href="https://github.com/obsoletemadness/classicstack-web">GitHub</a></p>
           <h3>License</h3>
           <p>
             ClassicStack is free software under the
             ${extLink(GPL, 'GNU General Public License v3.0')}.
-            An MIT license would be preferred if the projects this work is based on
-            can be relicensed.
           </p>
 
           <h3>Credits</h3>
