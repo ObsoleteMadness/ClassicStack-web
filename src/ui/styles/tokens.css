@@ -1301,6 +1301,11 @@ finder-window {
   letter-spacing: -0.02em;
 }
 
+.app-menu__trigger.app-menubar__brand {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
 .app-menubar__menus {
   display: flex;
   align-items: stretch;
@@ -2180,12 +2185,14 @@ netboot-dialog[hidden],
   padding: 12px 16px 14px;
 }
 
-/* —— Alert / AFP sessions dialogs —— */
+/* —— Alert / AFP sessions / About dialogs —— */
 
 alert-dialog,
 .alert-dialog,
 afp-sessions-dialog,
-.afp-sessions-dialog {
+.afp-sessions-dialog,
+about-dialog,
+.about-dialog {
   position: fixed;
   inset: 0;
   z-index: 80;
@@ -2196,7 +2203,9 @@ afp-sessions-dialog,
 alert-dialog[hidden],
 .alert-dialog[hidden],
 afp-sessions-dialog[hidden],
-.afp-sessions-dialog[hidden] {
+.afp-sessions-dialog[hidden],
+about-dialog[hidden],
+.about-dialog[hidden] {
   display: none !important;
 }
 
@@ -2206,6 +2215,56 @@ afp-sessions-dialog[hidden],
   font-size: 13px;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.about-dialog__card {
+  width: min(520px, calc(100vw - 32px));
+  max-height: min(640px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+}
+
+.about-dialog__body {
+  padding: 12px 16px 8px;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.about-dialog__name {
+  margin: 0 0 2px;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.about-dialog__ver {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.about-dialog__body h3 {
+  margin: 16px 0 6px;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.about-dialog__body p {
+  margin: 0 0 8px;
+}
+
+.about-dialog__body ul {
+  margin: 0 0 8px;
+  padding-left: 1.2em;
+}
+
+.about-dialog__body li {
+  margin: 0 0 8px;
+}
+
+.about-dialog__body a {
+  color: var(--accent);
 }
 
 .afp-sessions-dialog__card {
@@ -2865,7 +2924,8 @@ html.compact-ui .rsrc-explorer {
 }
 
 html.compact-ui .netboot-dialog__card,
-html.compact-ui .login-dialog__card {
+html.compact-ui .login-dialog__card,
+html.compact-ui .about-dialog__card {
   max-width: calc(100vw - 24px);
 }
 

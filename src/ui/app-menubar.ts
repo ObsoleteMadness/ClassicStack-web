@@ -8,7 +8,10 @@ import type { AfpSessionsDialog } from './afp-sessions-dialog';
 import type { ExtensionEditorDialog } from './extension-editor-dialog';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
 import type { FinderWindow } from './finder-window';
+import type { AboutDialog } from './about-dialog';
 import { iconCache } from '../fs/icon-cache';
+
+type OpenMenu = 'app' | 'advanced' | null;
 
 export interface AdvancedMenuHost {
   pcap: PcapCapture;
@@ -18,14 +21,15 @@ export interface AdvancedMenuHost {
   afpSessions: AfpSessionsDialog;
   extensionEditor: ExtensionEditorDialog;
   resourceExplorer: ResourceForkExplorer;
+  about: AboutDialog;
   finder?: FinderWindow;
   onCaptureChanged?(capturing: boolean): void;
 }
 
-/** Screen-top menu bar with Advanced diagnostics / Netboot actions. */
+/** Screen-top menu bar with ClassicStack / Advanced menus. */
 export class AppMenuBar extends HTMLElement {
   private host: AdvancedMenuHost | null = null;
-  private menuOpen = false;
+  private openMenu: OpenMenu = null;
 
   connectedCallback(): void {
     this.classList.add('app-menubar');
@@ -73,15 +77,26 @@ export class AppMenuBar extends HTMLElement {
     const showHidden = this.host?.finder?.getShowHiddenFiles?.() ?? false;
     const autoExpand = this.host?.finder?.getAutoExpandFiles?.() ?? false;
     const zipStyle = loadPrefs().zipExportStyle;
+    const appOpen = this.openMenu === 'app';
+    const advancedOpen = this.openMenu === 'advanced';
     this.innerHTML = `
       <div class="app-menubar__inner">
-        <span class="app-menubar__brand">ClassicStack</span>
         <div class="app-menubar__menus">
-          <div class="app-menu${this.menuOpen ? ' open' : ''}">
-            <button type="button" class="app-menu__trigger" data-act="toggle-advanced" aria-haspopup="true" aria-expanded="${this.menuOpen}">
+          <div class="app-menu${appOpen ? ' open' : ''}">
+            <button type="button" class="app-menu__trigger app-menubar__brand" data-act="toggle-app" aria-haspopup="true" aria-expanded="${appOpen}">
+              ClassicStack
+            </button>
+            <div class="app-menu__dropdown" role="menu" ${appOpen ? '' : 'hidden'}>
+              <button type="button" role="menuitem" data-act="about" class="app-menu__item">
+                About ClassicStack…
+              </button>
+            </div>
+          </div>
+          <div class="app-menu${advancedOpen ? ' open' : ''}">
+            <button type="button" class="app-menu__trigger" data-act="toggle-advanced" aria-haspopup="true" aria-expanded="${advancedOpen}">
               Advanced
             </button>
-            <div class="app-menu__dropdown" role="menu" ${this.menuOpen ? '' : 'hidden'}>
+            <div class="app-menu__dropdown" role="menu" ${advancedOpen ? '' : 'hidden'}>
               <button type="button" role="menuitemcheckbox" aria-checked="${capturing}" data-act="capture-pcap" class="app-menu__item">
                 <span class="app-menu__check">${capturing ? '✓' : ''}</span>
                 Capture pcap
@@ -149,18 +164,27 @@ export class AppMenuBar extends HTMLElement {
   }
 
   private onWindowClick = (e: MouseEvent): void => {
-    if (!this.menuOpen) return;
+    if (!this.openMenu) return;
     if (this.contains(e.target as Node)) return;
-    this.menuOpen = false;
+    this.openMenu = null;
     this.render();
   };
 
   private onKey = (e: KeyboardEvent): void => {
-    if (e.key === 'Escape' && this.menuOpen) {
-      this.menuOpen = false;
+    if (e.key === 'Escape' && this.openMenu) {
+      this.openMenu = null;
       this.render();
     }
   };
+
+  private closeMenus(): void {
+    this.openMenu = null;
+    this.render();
+  }
+
+  private advancedTrigger(): HTMLElement | null {
+    return this.querySelector('[data-act="toggle-advanced"]');
+  }
 
   private onClick(e: MouseEvent): void {
     const t = (e.target as HTMLElement).closest('[data-act]') as HTMLElement | null;
@@ -168,9 +192,21 @@ export class AppMenuBar extends HTMLElement {
     e.stopPropagation();
     const act = t.dataset.act;
 
-    if (act === 'toggle-advanced') {
-      this.menuOpen = !this.menuOpen;
+    if (act === 'toggle-app') {
+      this.openMenu = this.openMenu === 'app' ? null : 'app';
       this.render();
+      return;
+    }
+
+    if (act === 'toggle-advanced') {
+      this.openMenu = this.openMenu === 'advanced' ? null : 'advanced';
+      this.render();
+      return;
+    }
+
+    if (act === 'about') {
+      this.closeMenus();
+      this.host.about.open();
       return;
     }
 
@@ -183,8 +219,7 @@ export class AppMenuBar extends HTMLElement {
         log.info('Started pcap capture', 'pcap');
       }
       this.host.onCaptureChanged?.(this.host.pcap.capturing);
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       return;
     }
 
@@ -193,54 +228,47 @@ export class AppMenuBar extends HTMLElement {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       downloadBytes(data, `localtalk-${stamp}.pcap`, 'application/vnd.tcpdump.pcap');
       log.info(`Downloaded pcap (${this.host.pcap.packetCount} frames, ${data.length} bytes)`, 'pcap');
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       return;
     }
 
     if (act === 'mac-clients') {
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       this.host.afpSessions.open();
       return;
     }
 
     if (act === 'netboot') {
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       this.host.netboot.open();
       return;
     }
 
     if (act === 'show-log') {
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       this.host.activityWindow.hide();
-      this.host.logPanel.toggleCallout(this.querySelector('.app-menu__trigger') as HTMLElement | null);
+      this.host.logPanel.toggleCallout(this.advancedTrigger());
       return;
     }
 
     if (act === 'show-activity') {
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       this.host.logPanel.hide();
-      this.host.activityWindow.toggleCallout(this.querySelector('.app-menu__trigger') as HTMLElement | null);
+      this.host.activityWindow.toggleCallout(this.advancedTrigger());
       return;
     }
 
     if (act === 'toggle-show-hidden') {
       const next = !(this.host.finder?.getShowHiddenFiles?.() ?? false);
       this.host.finder?.setShowHiddenFiles?.(next);
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       return;
     }
 
     if (act === 'toggle-auto-expand') {
       const next = !(this.host.finder?.getAutoExpandFiles?.() ?? false);
       this.host.finder?.setAutoExpandFiles?.(next);
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       return;
     }
 
@@ -251,22 +279,19 @@ export class AppMenuBar extends HTMLElement {
     }
 
     if (act === 'extension-editor') {
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       this.host.extensionEditor.open();
       return;
     }
 
     if (act === 'resource-fork') {
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       this.host.finder?.openResourceExplorer();
       return;
     }
 
     if (act === 'clear-icon-cache') {
-      this.menuOpen = false;
-      this.render();
+      this.closeMenus();
       void (async () => {
         await iconCache.clear();
         this.host?.finder?.invalidateIcons?.();

@@ -14,6 +14,7 @@ import { LogPanel } from './ui/log-panel';
 import { ActivityWindow } from './ui/activity-window';
 import { FileActivityWindow } from './ui/file-activity-window';
 import { AlertDialog } from './ui/alert-dialog';
+import { AboutDialog } from './ui/about-dialog';
 import { AfpSessionsDialog } from './ui/afp-sessions-dialog';
 import { LoginDialog } from './ui/login-dialog';
 import { NameConflictDialog } from './ui/name-conflict-dialog';
@@ -64,6 +65,7 @@ async function main(): Promise<void> {
   const fileActivityWindow = new FileActivityWindow();
   fileActivityWindow.hidden = true;
   const netboot = new NetbootDialog();
+  const about = new AboutDialog();
   const alertDialog = new AlertDialog();
   const afpSessions = new AfpSessionsDialog();
   const loginDialog = new LoginDialog();
@@ -73,7 +75,7 @@ async function main(): Promise<void> {
   resourceExplorer.hidden = true;
 
   stage.appendChild(finder);
-  app.append(menubar, stage, logPanel, activityWindow, fileActivityWindow, netboot, alertDialog, afpSessions, loginDialog, nameConflictDialog, extensionEditor, resourceExplorer);
+  app.append(menubar, stage, logPanel, activityWindow, fileActivityWindow, netboot, about, alertDialog, afpSessions, loginDialog, nameConflictDialog, extensionEditor, resourceExplorer);
 
   const serial = new WebSerialPort();
   const pcap = new PcapCapture();
@@ -98,6 +100,7 @@ async function main(): Promise<void> {
     afpSessions,
     extensionEditor,
     resourceExplorer,
+    about,
     finder,
     onCaptureChanged() {
       menubar.refreshCaptureStatus();
