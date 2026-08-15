@@ -1097,8 +1097,9 @@ export class FinderWindow extends HTMLElement {
           .map((it) => this.colItemHtml(it, 0, this.selectedId))
           .join('')}</div></div>`;
       }
+    }
 
-      if (this.folderOpening && this.view !== 'column') {
+    if (this.folderOpening && this.view !== 'column') {
       content.insertAdjacentHTML(
         'beforeend',
         `<div class="content-loading">${this.spinnerHtml()}<span>Loading</span></div>`,
