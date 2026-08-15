@@ -5,8 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { crc16Ibm } from '../protocol/crc16';
 import { writeBe16 } from '../protocol/binary';
 import { BitReader, decompressSit13, SitError } from './stuffit-codec';
-import { buildClassicStore, isStuffItArchive, parseStuffIt } from './stuffit';
-import { expandIncoming } from './expand-incoming';
+import { buildClassicStore, isStuffItArchive, parseStuffIt, sitUnsupportedTypeCode } from './stuffit';
+import { expandArchiveFile, expandIncoming, isExpandableArchive } from './expand-incoming';
 import { buildBinHex } from './binhex';
 import { makeFinderInfo } from './mac-file';
 import { buildMacBinary } from './macbinary';
@@ -93,6 +93,18 @@ describe('classic StuffIt store', () => {
     expect(entries?.[0]?.name).toBe('Notes');
   });
 
+  it('parses installer archives whose header magic is ST42', () => {
+    const packed = buildClassicStore([{ name: 'Notes', data: ascii('hi') }]);
+    packed[0] = 0x53;
+    packed[1] = 0x54;
+    packed[2] = 0x34;
+    packed[3] = 0x32; // ST42
+    expect(isStuffItArchive(packed)).toBe(true);
+    const entries = parseStuffIt(packed);
+    expect(entries?.[0]?.name).toBe('Notes');
+    expect([...entries![0]!.data]).toEqual([...ascii('hi')]);
+  });
+
   it('unwraps BinHex around a real StuffIt archive', () => {
     const packed = buildClassicStore([{ name: 'Inside', data: ascii('payload') }]);
     const hqx = buildBinHex({
@@ -163,6 +175,69 @@ const testdata = (name: string): Uint8Array =>
 const REAL_NAMES = ['Test Image', 'Test Text', 'testfile.PICT', 'testfile.jpg', 'testfile.png', 'testfile.txt'];
 
 describe('real StuffIt archives', () => {
+  it('expands StuffIt Expander 4.0.2.sit from the welcome pack', () => {
+    const packed = new Uint8Array(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../public/welcome/Utilities/StuffIt Expander 4.0.2.sit')),
+    );
+    const entries = parseStuffIt(packed);
+    expect(entries?.some((e) => e.isFolder && e.name === 'StuffIt Expander™ 4.0.2')).toBe(true);
+    const app = entries?.find((e) => e.name.endsWith('StuffIt Expander™') && !e.isFolder);
+    expect(app && !app.isFolder).toBe(true);
+    if (app && !app.isFolder) {
+      expect(app.fileType).toBe('APPL');
+      expect(app.creator).toBe('SITx');
+      expect(app.resource.length).toBe(212771);
+      expect(crc16Ibm(app.resource)).toBe(0xd806);
+    }
+    const readme = entries?.find((e) => e.name.includes('Read Me') && !e.isFolder);
+    if (readme && !readme.isFolder) {
+      expect(crc16Ibm(readme.data)).toBe(0x605d);
+      expect(String.fromCharCode(...readme.data.subarray(0, 7))).toBe('StuffIt');
+      expect(isStuffItArchive(readme.data)).toBe(false);
+      expect(sitUnsupportedTypeCode(readme.data)).toBeNull();
+      expect(isExpandableArchive(readme.name, makeFinderInfo(readme.fileType, readme.creator), readme.data)).toBe(
+        false,
+      );
+    }
+    const regForm = entries?.find((e) => e.name.includes('Expander Reg. Form') && !e.isFolder);
+    if (regForm && !regForm.isFolder) {
+      expect(String.fromCharCode(...regForm.data.subarray(0, 7))).toBe('StuffIt');
+      expect(regForm.data[82]).toBe(42);
+      expect(isStuffItArchive(regForm.data)).toBe(false);
+      expect(sitUnsupportedTypeCode(regForm.data)).toBeNull();
+    }
+    const expanded = expandArchiveFile('StuffIt Expander 4.0.2.sit', packed);
+    expect(expanded.some((n) => n.kind === 'dir' && n.name.includes('StuffIt Expander'))).toBe(true);
+  });
+
+  it('expands a QuickTime installer archive (ST46, method 14)', () => {
+    const packed = new Uint8Array(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../public/welcome/Utilities/QuickTime 3.0.sit')),
+    );
+    const entries = parseStuffIt(packed);
+    const names = entries?.map((e) => e.name) ?? [];
+    expect(names.some((n) => n.includes('Installer'))).toBe(true);
+    const readme = entries?.find((e) => e.name.includes('READ ME') && !e.isFolder);
+    expect(readme && !readme.isFolder).toBe(true);
+    if (readme && !readme.isFolder) {
+      expect(readme.data.length).toBe(4294);
+      expect(readme.resource.length).toBe(4755);
+      expect(readme.fileType).toBe('ttro');
+    }
+  });
+
+  it('expands ResEdit.sit using classic method 2 (compress LZW)', () => {
+    const packed = new Uint8Array(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../public/welcome/Utilities/ResEdit.sit')),
+    );
+    const entries = parseStuffIt(packed);
+    expect(entries).toHaveLength(1);
+    const app = entries![0]!;
+    expect(app.name).toBe('ResEdit');
+    expect(app.fileType).toBe('APPL');
+    expect(app.resource.length).toBe(657523);
+  });
+
   it('expands a StuffIt Deluxe 4.5 classic archive', () => {
     const entries = parseStuffIt(testdata('stuffit45.sit'));
     expect(entries?.map((e) => e.name).sort()).toEqual(REAL_NAMES);

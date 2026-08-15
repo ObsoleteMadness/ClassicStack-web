@@ -86,4 +86,4 @@ Protocol codecs mirror [ClassicStack / OmniTalk](https://github.com/ObsoleteMadn
 - Desktop DB Add/GetIcon is implemented on the server
 - AFP Write uses a simplified path; full WriteContinue parity may need tuning against specific Mac OS versions
 - Netboot ChainBoot keeps the selected HFS image in browser memory for the session (writes are not persisted back to the file)
-- Default Browser Share files live in `public/welcome/` (see that folder’s README); new pack files are imported on next load, existing names are never overwritten
+- Default Browser Share files live in `public/welcome/` (see that folder’s README); new pack files are imported on next load, archives are expanded (wrappers are not kept), existing names are never overwritten

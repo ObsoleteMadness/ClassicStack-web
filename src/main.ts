@@ -124,7 +124,6 @@ async function main(): Promise<void> {
   });
 
   await vfs.init();
-  await seedWelcomePackIfNeeded(vfs);
 
   function attachRemoteNotices(client: AfpClient): void {
     client.onNotice = (n: AfpServerNotice) => {
@@ -356,8 +355,12 @@ async function main(): Promise<void> {
       return vfs;
     },
 
-    installWelcomePack() {
-      return addWelcomePack(vfs);
+    installWelcomePack(opts) {
+      return addWelcomePack(vfs, opts);
+    },
+
+    seedWelcomePack(opts) {
+      return seedWelcomePackIfNeeded(vfs, opts);
     },
 
     promptCredentials(opts) {

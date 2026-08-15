@@ -23,6 +23,15 @@ function ascii(s: string): Uint8Array {
   return b;
 }
 
+/** Minimal StuffIt 5 header: Unarchiver banner + version byte at offset 82. */
+function sit5Stub(version: number): Uint8Array {
+  const banner = 'StuffIt (c)1997-2001 Aladdin Systems, Inc., http://www.aladdinsys.com/StuffIt/\r\n';
+  const data = new Uint8Array(100);
+  data.set(ascii(banner), 0);
+  data[82] = version;
+  return data;
+}
+
 const sample = {
   name: 'Read Me',
   data: ascii('Hello, Macintosh!\r'),
@@ -194,6 +203,19 @@ describe('expandIncoming', () => {
   it('returns null for ordinary files', () => {
     expect(expandIncoming('notes.txt', ascii('hello'))).toBeNull();
   });
+
+  it('keeps a nested unsupported archive packed instead of aborting the parent', () => {
+    const inner = ascii('StuffIt!');
+    const packed = buildClassicStore([
+      { name: 'Notes', data: ascii('hi') },
+      { name: 'Bad.sit', data: inner },
+    ]);
+    const out = expandIncoming('Pack.sit', packed);
+    expect(out?.map((n) => n.name).sort()).toEqual(['Bad.sit', 'Notes']);
+    const bad = out?.find((n) => n.name === 'Bad.sit');
+    expect(bad?.kind).toBe('file');
+    if (bad?.kind === 'file') expect([...bad.data]).toEqual([...inner]);
+  });
 });
 
 describe('isExpandableArchive', () => {
@@ -205,6 +227,16 @@ describe('isExpandableArchive', () => {
     expect(isExpandableArchive('Read Me', makeFinderInfo('SIT!', 'SITx'))).toBe(true);
     expect(isExpandableArchive('Archive', makeFinderInfo('ZIP ', 'SITx'))).toBe(true);
     expect(isExpandableArchive('Archive', makeFinderInfo('TEXT', 'SITx'))).toBe(true);
+    const hqx = buildBinHex({
+      name: 'Read Me',
+      data: ascii('hello'),
+      resource: new Uint8Array(),
+      finderInfo: makeFinderInfo('TEXT', 'SITx'),
+    });
+    expect(isExpandableArchive('Archive', makeFinderInfo('TEXT', 'SITx'), hqx)).toBe(true);
+    expect(isExpandableArchive('Read Me', makeFinderInfo('TEXT', 'SITx'), ascii('StuffIt Expander notes'))).toBe(
+      false,
+    );
     expect(isExpandableArchive('Read Me', makeFinderInfo('TEXT', 'ttxt'))).toBe(false);
     expect(isExpandableArchive('notes.txt')).toBe(false);
   });
@@ -306,10 +338,15 @@ describe('expandArchiveFile', () => {
   });
 
   it('reports an unsupported StuffIt 5 version from the archive header', () => {
-    const sit5 = new Uint8Array(83);
-    sit5.set(ascii('StuffIt (c)1997-'), 0);
-    sit5[82] = 6;
-    expect(() => expandArchiveFile('Archive.sit', sit5)).toThrowError(/Unsupported type 6/);
+    expect(() => expandArchiveFile('Archive.sit', sit5Stub(6))).toThrowError(/Unsupported type 6/);
+  });
+
+  it('does not treat a StuffIt Expander Read Me as StuffIt 5', () => {
+    const text = new Uint8Array(120);
+    text.set(ascii('StuffIt Expander™ Read Me — not an archive ****************'), 0);
+    text[82] = 42;
+    expect(isStuffItArchive(text)).toBe(false);
+    expect(() => expandArchiveFile('StuffIt Expander™ Read Me', text)).not.toThrowError(/Unsupported type 42/);
   });
 
   it('throws Unsupported type {method} for an unknown classic method', () => {

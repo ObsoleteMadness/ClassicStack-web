@@ -28,13 +28,19 @@ export { isStuffItArchive, isZipArchive };
 const SIT_TYPES = new Set(['SIT!', 'SIT5', 'SITD']);
 const EXPANDABLE_EXTS = new Set(['sit', 'hqx', 'bin', 'zip']);
 
-/** True when the Finder should offer Expand (`.sit` / `.hqx` / `.bin` / `.zip`, StuffIt type, ZIP, or BinHex TEXT/SITx). */
-export function isExpandableArchive(name: string, finderInfo?: Uint8Array): boolean {
+/**
+ * True when the Finder should offer Expand (`.sit` / `.hqx` / `.bin` / `.zip`, StuffIt type, ZIP,
+ * or BinHex stored as TEXT/SITx). Pass `data` when loaded: Expander Read Me files are also
+ * TEXT/SITx but are not archives.
+ */
+export function isExpandableArchive(name: string, finderInfo?: Uint8Array, data?: Uint8Array): boolean {
   if (EXPANDABLE_EXTS.has(filenameExtension(name))) return true;
   if (!finderInfo || finderInfo.length < 8) return false;
   const type = ostypeFromBytes(finderInfo, 0);
   const creator = ostypeFromBytes(finderInfo, 4);
-  return SIT_TYPES.has(type) || type === 'ZIP ' || (type === 'TEXT' && creator === 'SITx');
+  if (SIT_TYPES.has(type) || type === 'ZIP ') return true;
+  if (type === 'TEXT' && creator === 'SITx') return !data?.length || parseBinHex(data) != null;
+  return false;
 }
 
 /** Modal body when Expand cannot unpack a file. Never uses Finder type/creator. */
@@ -134,9 +140,23 @@ function finishMacFile(file: MacFile, depth: number): ExpandedNode[] {
       };
     }
   }
-  const nested = expandBytes(current.name, current.data, current.resource, depth);
+  const nested = tryExpandBytes(current.name, current.data, current.resource, depth);
   if (nested) return nested;
   return [{ kind: 'file', ...current }];
+}
+
+/** Nested members that cannot be unpacked stay packed instead of aborting the parent archive. */
+function tryExpandBytes(
+  name: string,
+  data: Uint8Array,
+  resource: Uint8Array,
+  depth: number,
+): ExpandedNode[] | null {
+  try {
+    return expandBytes(name, data, resource, depth);
+  } catch {
+    return null;
+  }
 }
 
 /** Keep unwrapping members that are themselves BinHex / MacBinary / StuffIt / ZIP. */
@@ -147,7 +167,7 @@ function expandNodes(nodes: ExpandedNode[], depth: number): ExpandedNode[] {
       out.push({ ...node, children: expandNodes(node.children, depth) });
       continue;
     }
-    const nested = expandBytes(node.name, node.data, node.resource, depth);
+    const nested = tryExpandBytes(node.name, node.data, node.resource, depth);
     if (nested) out.push(...nested);
     else out.push(node);
   }

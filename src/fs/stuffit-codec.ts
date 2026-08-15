@@ -73,6 +73,12 @@ export class BitReader {
     return true;
   }
 
+  /** Discard leftover bits in the current byte (xadIOByteBoundary). */
+  byteAlign(): void {
+    const extra = this.bitsInBuf % 8;
+    if (extra) this.skipBitsLe(extra);
+  }
+
   readBitLe(): boolean {
     return this.readBitsLe(1) !== 0;
   }
@@ -597,6 +603,216 @@ function decompressArsenic(data: Uint8Array, uncompLen: number): Uint8Array {
   return Uint8Array.from(output);
 }
 
+/**
+ * Classic method 14 ("Installer") from Unarchiver XADStuffItOldHandles SIT_14.
+ * Used by STxx installer archives (ST42, ST46, …).
+ */
+function decompressSit14(data: Uint8Array, uncompLen: number): Uint8Array {
+  const reader = new BitReader(data);
+  const bits = (n: number): number => reader.readBitsLe(n) >>> 0;
+  const code = new Uint8Array(308);
+  const codecopy = new Uint8Array(308);
+  const freq = new Uint16Array(308);
+  const buff = new Uint32Array(308);
+  const var1 = new Uint8Array(52);
+  const var2 = new Uint16Array(52);
+  const var3 = new Uint16Array(75 * 2);
+  const var4 = new Uint8Array(76);
+  const var5 = new Uint32Array(75);
+  const var7 = new Uint16Array(308 * 2);
+  const window = new Uint8Array(0x40000);
+
+  const update = (first0: number, last0: number): void => {
+    let first = first0;
+    let last = last0;
+    while (last - first > 1) {
+      let i = first;
+      let j = last;
+      do {
+        while (++i < last && codecopy[first]! > codecopy[i]!) {}
+        while (--j > first && codecopy[first]! < codecopy[j]!) {}
+        if (j > i) {
+          const tc = codecopy[i]!;
+          codecopy[i] = codecopy[j]!;
+          codecopy[j] = tc;
+          const tf = freq[i]!;
+          freq[i] = freq[j]!;
+          freq[j] = tf;
+        }
+      } while (j > i);
+      if (first !== j) {
+        const tc = codecopy[first]!;
+        codecopy[first] = codecopy[j]!;
+        codecopy[j] = tc;
+        const tf = freq[first]!;
+        freq[first] = freq[j]!;
+        freq[j] = tf;
+        i = j + 1;
+        if (last - i <= j - first) {
+          update(i, last);
+          last = j;
+        } else {
+          update(first, j);
+          first = i;
+        }
+      } else {
+        ++first;
+      }
+    }
+  };
+
+  const readTree = (codesize: number, result: Uint16Array): void => {
+    let k = bits(1);
+    const jBits = bits(2) + 2;
+    const o = bits(3) + 1;
+    const size = 1 << jBits;
+    const m = size - 1;
+    k = k ? m - 1 : 0xffffffff;
+    if (bits(2) & 1) {
+      readTree(size, freq);
+      for (let i = 0; i < codesize; ) {
+        let l = 0;
+        let n: number;
+        do {
+          l = freq[l + bits(1)]!;
+          n = size << 1;
+        } while (n > l);
+        l -= n;
+        if (k !== l) {
+          if (l === m) {
+            l = 0;
+            do {
+              l = freq[l + bits(1)]!;
+              n = size << 1;
+            } while (n > l);
+            l += 3 - n;
+            while (l--) {
+              if (i === 0 || i >= codesize) break;
+              code[i] = code[i - 1]!;
+              ++i;
+            }
+          } else {
+            code[i++] = (l + o) & 0xff;
+          }
+        } else {
+          code[i++] = 0;
+        }
+      }
+    } else {
+      for (let i = 0; i < codesize; ) {
+        let l = bits(jBits);
+        if (k !== l) {
+          if (l === m) {
+            l = bits(jBits) + 3;
+            while (l--) {
+              if (i === 0 || i >= codesize) break;
+              code[i] = code[i - 1]!;
+              ++i;
+            }
+          } else {
+            code[i++] = (l + o) & 0xff;
+          }
+        } else {
+          code[i++] = 0;
+        }
+      }
+    }
+
+    for (let i = 0; i < codesize; i++) {
+      codecopy[i] = code[i]!;
+      freq[i] = i;
+    }
+    update(0, codesize);
+
+    let i = 0;
+    while (i < codesize && !codecopy[i]) i++;
+    for (let j = 0; i < codesize; i++, j++) {
+      if (i) j <<= codecopy[i]! - codecopy[i - 1]!;
+      let kk = codecopy[i]!;
+      let mm = 0;
+      for (let l = j; kk--; l >>= 1) mm = (mm << 1) | (l & 1);
+      buff[freq[i]!] = mm >>> 0;
+    }
+
+    result.fill(0, 0, codesize * 2);
+    let node = 2;
+    for (let si = 0; si < codesize; si++) {
+      let l = 0;
+      let mm = buff[si]!;
+      for (let kk = 0; kk < code[si]!; kk++) {
+        l += mm & 1;
+        if (code[si]! - 1 <= kk) result[l] = codesize * 2 + si;
+        else {
+          if (!result[l]) {
+            result[l] = node;
+            node += 2;
+          }
+          l = result[l]!;
+        }
+        mm >>= 1;
+      }
+    }
+    reader.byteAlign();
+  };
+
+  let acc = 0;
+  for (let i = 0; i < 52; i++) {
+    var2[i] = acc;
+    var1[i] = i >= 4 ? (i - 4) >> 2 : 0;
+    acc += 1 << var1[i]!;
+  }
+  acc = 1;
+  for (let i = 0; i < 75; i++) {
+    var5[i] = acc;
+    var4[i] = i >= 3 ? (i - 3) >> 2 : 0;
+    acc += 1 << var4[i]!;
+  }
+
+  const output: number[] = [];
+  let blocks = bits(16);
+  let wp = 0;
+  while (blocks-- && output.length < uncompLen) {
+    bits(16);
+    bits(16);
+    let remain = bits(16) | (bits(16) << 16);
+    readTree(308, var7);
+    readTree(75, var3);
+    while (remain && output.length < uncompLen) {
+      let i = 0;
+      while (i < 616) i = var7[i + bits(1)]!;
+      i -= 616;
+      if (i < 0x100) {
+        window[wp++] = i;
+        wp &= 0x3ffff;
+        output.push(i);
+        remain--;
+      } else {
+        i -= 0x100;
+        let matchLen = var2[i]! + 4;
+        const extra = var1[i]!;
+        if (extra) matchLen += bits(extra);
+        i = 0;
+        while (i < 150) i = var3[i + bits(1)]!;
+        i -= 150;
+        let dist = var5[i]!;
+        const dExtra = var4[i]!;
+        if (dExtra) dist += bits(dExtra);
+        remain -= matchLen;
+        dist = wp + 0x40000 - dist;
+        while (matchLen-- && output.length < uncompLen) {
+          dist &= 0x3ffff;
+          const b = window[dist++]!;
+          window[wp++] = b;
+          wp &= 0x3ffff;
+          output.push(b);
+        }
+      }
+    }
+    reader.byteAlign();
+  }
+  return Uint8Array.from(output.length > uncompLen ? output.slice(0, uncompLen) : output);
+}
+
 function decompressDeflate(data: Uint8Array, uncompLen: number): Uint8Array {
   try {
     const out = inflateSync(data, { out: new Uint8Array(Math.max(uncompLen, 1)) });
@@ -635,6 +851,8 @@ export function decompressClassic(data: Uint8Array, method: number, uncompLen: n
       return decompressHuffman(data, uncompLen);
     case 13:
       return decompressSit13(data, uncompLen);
+    case 14:
+      return decompressSit14(data, uncompLen);
     default:
       throw new SitError(`Unsupported type ${method & 0x0f}`, 'unsupported');
   }

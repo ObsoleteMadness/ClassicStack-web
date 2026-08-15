@@ -1,9 +1,0 @@
-Network Notes
-
-Mount this volume from a Macintosh:
-
-1. Connect the Mac to the same LocalTalk network as the TashTalk adaptor.
-2. Open the Chooser, select AppleShare, then the “ClassicStack” server.
-3. Open the “Browser Share” volume. Guest login is enabled.
-
-Copy archive expanders, disk tools, and other helpers into this Utilities folder so every Macintosh that mounts the share can use them. Files you put here stay in the browser until Browser Share is erased.

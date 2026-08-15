@@ -23,15 +23,23 @@ export type SitEntry = {
 const SIT_ENTRY = 112;
 const START_FOLDER = 0x20;
 const END_FOLDER = 0x21;
-/** Classic archive magics (4-byte header) that share the SIT! / rLau layout. */
-const CLASSIC_MAGICS = new Set(['SIT!', 'ST46', 'ST50', 'ST60', 'ST65', 'STin', 'STi2', 'STi3', 'STi4']);
-
 function headerMagic(data: Uint8Array): string {
   return ostypeFromBytes(data, 0);
 }
 
 function hasRLau(data: Uint8Array): boolean {
   return data.length >= 14 && ostypeFromBytes(data, 10) === 'rLau';
+}
+
+/** Unarchiver XADStuffItParser: SIT! or installer STdd / STin / STi0–9 with rLau. */
+function isClassicMagic(data: Uint8Array): boolean {
+  if (data.length < 4) return false;
+  if (headerMagic(data) === 'SIT!') return true;
+  if (data[0] !== 0x53 || data[1] !== 0x54) return false;
+  const c2 = data[2]!;
+  const c3 = data[3]!;
+  if (c2 === 0x69) return c3 === 0x6e || (c3 >= 0x30 && c3 <= 0x39);
+  return c2 >= 0x30 && c2 <= 0x39 && c3 >= 0x30 && c3 <= 0x39;
 }
 
 function sitxSignature(data: Uint8Array): string | null {
@@ -46,20 +54,28 @@ function readName(bytes: Uint8Array): string {
 }
 
 function isClassic(data: Uint8Array): boolean {
-  return hasRLau(data) && CLASSIC_MAGICS.has(headerMagic(data));
+  return hasRLau(data) && isClassicMagic(data);
 }
 
+/**
+ * Unarchiver XADStuffIt5Parser: 100-byte header whose first 80 bytes match
+ * `StuffIt (c)1997-XXXX Aladdin Systems, Inc., http://www.aladdinsys.com/StuffIt/\r\n`
+ * (year digits are wildcards). A leading `StuffIt` is not enough — Expander
+ * documents such as “Expander Reg. Form” start that way and are not archives.
+ */
+const SIT5_BANNER_PREFIX = 'StuffIt (c)1997-';
+const SIT5_BANNER_SUFFIX = ' Aladdin Systems, Inc., http://www.aladdinsys.com/StuffIt/\r\n';
+
 function isSit5(data: Uint8Array): boolean {
-  return (
-    data.length >= 7 &&
-    data[0] === 0x53 &&
-    data[1] === 0x74 &&
-    data[2] === 0x75 &&
-    data[3] === 0x66 &&
-    data[4] === 0x66 &&
-    data[5] === 0x49 &&
-    data[6] === 0x74
-  );
+  if (data.length < 100) return false;
+  for (let i = 0; i < SIT5_BANNER_PREFIX.length; i++) {
+    if (data[i] !== SIT5_BANNER_PREFIX.charCodeAt(i)) return false;
+  }
+  const suffixAt = SIT5_BANNER_PREFIX.length + 4;
+  for (let i = 0; i < SIT5_BANNER_SUFFIX.length; i++) {
+    if (data[suffixAt + i] !== SIT5_BANNER_SUFFIX.charCodeAt(i)) return false;
+  }
+  return true;
 }
 
 export function isStuffItArchive(data: Uint8Array): boolean {
@@ -123,8 +139,8 @@ function parseClassic(data: Uint8Array): SitEntry[] {
         name: full,
         data: new Uint8Array(),
         resource: new Uint8Array(),
-        fileType: ostypeFromBytes(header, 66),
-        creator: ostypeFromBytes(header, 70),
+        fileType: '    ',
+        creator: '    ',
         isFolder: true,
         finderFlags: be16(header, 74),
         createDate: be32(header, 76),
@@ -310,7 +326,7 @@ export function parseStuffIt(data: Uint8Array): SitEntry[] | null {
     if (unsupported) throw new SitError(`Unsupported type ${unsupported}`, 'unsupported');
     if (data.length < 22) return null;
     if (isClassic(data)) return parseClassic(data);
-    if (data.length >= 80 && isSit5(data)) return parseSit5(data);
+    if (isSit5(data)) return parseSit5(data);
     return null;
   } catch (err) {
     if (err instanceof SitError && (err.code === 'unsupported' || err.code === 'corrupt')) throw err;
@@ -331,7 +347,7 @@ export function sitUnsupportedTypeCode(data: Uint8Array): string | null {
     if (data.length > 82 && data[82] !== 5) return String(data[82]!);
     return null;
   }
-  if (hasRLau(data) && !CLASSIC_MAGICS.has(magic)) return magic;
+  if (hasRLau(data) && !isClassicMagic(data)) return magic;
   if (magic === 'SITD') return magic;
   return null;
 }

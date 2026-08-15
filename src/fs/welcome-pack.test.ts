@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseAppleSingle } from './appledouble';
 import { decodeMacRoman } from '../protocol/macroman';
+import { expandIncoming } from './expand-incoming';
+import { buildClassicStore } from './stuffit';
+import type { VNode } from './virtual-fs';
 import {
   addWelcomePack,
   importWelcomePack,
@@ -18,18 +24,37 @@ function textFile(path: string, body: string) {
   return { path, data: new TextEncoder().encode(body) };
 }
 
+function ascii(s: string): Uint8Array {
+  const b = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+  return b;
+}
+
 function mockStore(): WelcomePackStore & {
-  files: Map<string, { id: number; isDir: boolean }>;
+  files: Map<string, { id: number; isDir: boolean; name: string }>;
   blobs: { parentId: number; name: string }[];
+  created: VNode[];
   meta: Map<string, unknown>;
+  names(): string[];
 } {
-  const files = new Map<string, { id: number; isDir: boolean }>();
+  const files = new Map<string, { id: number; isDir: boolean; name: string }>();
+  const byId = new Map<number, { parentId: number; name: string }>();
   let nextId = 10;
   const key = (parentId: number, name: string) => `${parentId}\0${name.toLowerCase()}`;
-  return {
+  const store: WelcomePackStore & {
+    files: Map<string, { id: number; isDir: boolean; name: string }>;
+    blobs: { parentId: number; name: string }[];
+    created: VNode[];
+    meta: Map<string, unknown>;
+    names(): string[];
+  } = {
     files,
     blobs: [],
+    created: [],
     meta: new Map(),
+    names() {
+      return [...files.values()].filter((n) => !n.isDir).map((n) => n.name);
+    },
     rootId: () => 2,
     beginBatch() {},
     endBatch() {},
@@ -40,13 +65,43 @@ function mockStore(): WelcomePackStore & {
       const k = key(parentId, name);
       const existing = files.get(k);
       if (existing?.isDir) return existing;
-      const node = { id: nextId++, isDir: true };
+      const node = { id: nextId++, isDir: true, name };
       files.set(k, node);
+      byId.set(node.id, { parentId, name });
       return node;
     },
     async importBlob(parentId, file) {
-      files.set(key(parentId, file.name), { id: nextId++, isDir: false });
+      const node = { id: nextId++, isDir: false as const, name: file.name };
+      files.set(key(parentId, file.name), node);
+      byId.set(node.id, { parentId, name: file.name });
       this.blobs.push({ parentId, name: file.name });
+    },
+    async createFile(parentId, name, data, resource = new Uint8Array(), finderInfo = new Uint8Array(32)) {
+      const node: VNode = {
+        id: nextId++,
+        parentId,
+        name,
+        isDir: false,
+        data,
+        resource,
+        finderInfo,
+        createDate: 1,
+        modDate: 1,
+      };
+      files.set(key(parentId, name), { id: node.id, isDir: false, name });
+      byId.set(node.id, { parentId, name });
+      this.created.push(node);
+      return node;
+    },
+    async put(node) {
+      files.set(key(node.parentId, node.name), { id: node.id, isDir: node.isDir, name: node.name });
+      byId.set(node.id, { parentId: node.parentId, name: node.name });
+    },
+    async remove(id) {
+      const loc = byId.get(id);
+      if (!loc) return;
+      files.delete(key(loc.parentId, loc.name));
+      byId.delete(id);
     },
     async getMeta(k) {
       return this.meta.get(k);
@@ -55,6 +110,7 @@ function mockStore(): WelcomePackStore & {
       this.meta.set(k, value);
     },
   };
+  return store;
 }
 
 describe('welcome pack source filter', () => {
@@ -134,6 +190,33 @@ describe('importWelcomePack', () => {
     expect(fs.blobs.map((b) => b.name)).toEqual(['Network Notes', 'Read Me', 'Disk Copy.sit']);
   });
 
+  it('imports each item in its own batch so the Finder can paint between them', async () => {
+    const fs = mockStore();
+    let depth = 0;
+    let maxDepth = 0;
+    let batches = 0;
+    fs.beginBatch = () => {
+      depth++;
+      batches++;
+      maxDepth = Math.max(maxDepth, depth);
+    };
+    fs.endBatch = () => {
+      depth--;
+    };
+    const names: string[] = [];
+    await importWelcomePack(
+      fs,
+      [textFile('Read Me.txt', 'a'), textFile('Utilities/Notes.txt', 'b')],
+      { onItem: (item) => {
+        names.push(item.name);
+        return undefined;
+      } },
+    );
+    expect(batches).toBe(2);
+    expect(maxDepth).toBe(1);
+    expect(names).toEqual(['Read Me', 'Notes']);
+  });
+
   it('skips an AppleDouble sidecar when the logical file already exists', async () => {
     const fs = mockStore();
     await fs.importBlob(2, new File([new Uint8Array([1])], 'Disk Copy'));
@@ -142,6 +225,87 @@ describe('importWelcomePack', () => {
     ]);
     expect(result).toEqual({ imported: 0, skipped: 1 });
   });
+
+  it('expands archives into inner items and does not keep the wrapper', async () => {
+    const fs = mockStore();
+    const packed = buildClassicStore([
+      { name: 'Notes', data: ascii('hi') },
+      { name: 'App', data: Uint8Array.of(1, 2, 3), type: 'APPL', creator: 'CARO' },
+    ]);
+    const result = await importWelcomePack(fs, [{ path: 'Utilities/Disk Copy.sit', data: packed }]);
+    expect(result).toEqual({ imported: 2, skipped: 0 });
+    expect(fs.names()).toEqual(['Notes', 'App']);
+    expect(fs.blobs).toEqual([]);
+  });
+
+  it('removes a previously imported archive after expanding', async () => {
+    const fs = mockStore();
+    const utilities = await fs.ensureDir(2, 'Utilities');
+    await fs.importBlob(utilities.id, new File([new Uint8Array([9])], 'Disk Copy.sit'));
+    const packed = buildClassicStore([{ name: 'Disk Copy', data: ascii('app') }]);
+    const result = await importWelcomePack(fs, [{ path: 'Utilities/Disk Copy.sit', data: packed }]);
+    expect(result).toEqual({ imported: 1, skipped: 0 });
+    expect(fs.names()).toEqual(['Disk Copy']);
+  });
+
+  it('skips inner names that already exist and still drops the wrapper', async () => {
+    const fs = mockStore();
+    const utilities = await fs.ensureDir(2, 'Utilities');
+    await fs.importBlob(utilities.id, new File([new Uint8Array([9])], 'Notes'));
+    await fs.importBlob(utilities.id, new File([new Uint8Array([8])], 'Stuff.sit'));
+    const packed = buildClassicStore([
+      { name: 'Notes', data: ascii('new') },
+      { name: 'App', data: Uint8Array.of(1) },
+    ]);
+    const result = await importWelcomePack(fs, [{ path: 'Utilities/Stuff.sit', data: packed }]);
+    expect(result).toEqual({ imported: 1, skipped: 1 });
+    expect(fs.names().sort()).toEqual(['App', 'Notes']);
+  });
+
+  it('keeps a wrapper that cannot be expanded', async () => {
+    const fs = mockStore();
+    const sit = new Uint8Array(64);
+    sit.set(ascii('SIT!'), 0);
+    const result = await importWelcomePack(fs, [{ path: 'Utilities/Broken.sit', data: sit }]);
+    expect(result).toEqual({ imported: 1, skipped: 0 });
+    expect(fs.names()).toEqual(['Broken.sit']);
+  });
+
+  it('expands StuffIt Expander from the welcome pack without leaving the .sit', async () => {
+    const packed = new Uint8Array(
+      readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), '../../public/welcome/Utilities/StuffIt Expander 4.0.2.sit'),
+      ),
+    );
+    const fs = mockStore();
+    const result = await importWelcomePack(fs, [
+      { path: 'Utilities/StuffIt Expander 4.0.2.sit', data: packed },
+    ]);
+    expect(result.imported).toBeGreaterThan(0);
+    expect(fs.names()).not.toContain('StuffIt Expander 4.0.2.sit');
+    expect([...fs.files.values()].some((n) => n.isDir && n.name === 'StuffIt Expander™ 4.0.2')).toBe(true);
+  });
+
+  it('does not keep wrappers for bundled welcome archives that expand', async () => {
+    const dir = join(dirname(fileURLToPath(import.meta.url)), '../../public/welcome/Utilities');
+    const archives = readdirSync(dir).filter((n) => /\.(sit|hqx|bin|zip)$/i.test(n));
+    expect(archives.length).toBeGreaterThan(0);
+    const leftover: string[] = [];
+    for (const name of archives) {
+      const data = new Uint8Array(readFileSync(join(dir, name)));
+      const fs = mockStore();
+      await importWelcomePack(fs, [{ path: `Utilities/${name}`, data }]);
+      if (fs.names().includes(name)) leftover.push(name);
+    }
+    const unexpected = leftover.filter((name) => {
+      try {
+        return Boolean(expandIncoming(name, new Uint8Array(readFileSync(join(dir, name))))?.length);
+      } catch {
+        return false;
+      }
+    });
+    expect(unexpected).toEqual([]);
+  }, 60_000);
 });
 
 describe('seedWelcomePackIfNeeded', () => {

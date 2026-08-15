@@ -14,6 +14,7 @@ import {
   type IconUrls,
 } from '../fs/icon-cache';
 import { expandArchiveFile, expandFailureMessage, isExpandableArchive, type ExpandedNode } from '../fs/expand-incoming';
+import type { WelcomePackProgress } from '../fs/welcome-pack';
 import { importExpandedTree } from '../fs/import-transfer';
 import { filenameExtension } from '../fs/extension-map';
 import { loadPrefs, savePrefs } from '../util/prefs';
@@ -77,7 +78,9 @@ export interface FinderHost {
     suggestedName: string;
   }): Promise<NameConflictChoice>;
   /** Copy bundled public/welcome files into Browser Share (skips existing names). */
-  installWelcomePack(): Promise<{ imported: number; skipped: number }>;
+  installWelcomePack(opts?: WelcomePackProgress): Promise<{ imported: number; skipped: number }>;
+  /** Import new bundled files once per pack list; returns null when already up to date. */
+  seedWelcomePack(opts?: WelcomePackProgress): Promise<{ imported: number; skipped: number } | null>;
 }
 
 interface ListItem {
@@ -125,6 +128,7 @@ export class FinderWindow extends HTMLElement {
   private source: 'local' | 'remote' = 'local';
   private status = 'Connect a TashTalk adaptor to begin.';
   private statusBusy = false;
+  private welcomePackBusy = false;
   private showProps = false;
   private remoteOpen = false;
   /** True after AFP login; volumes listed under the server until eject. */
@@ -260,7 +264,10 @@ export class FinderWindow extends HTMLElement {
     this.attachCatalog(vfs);
     this.host = host;
     this.ensureShellEvents();
-    void this.bootstrapFromLocation().then(() => this.applyCompactView());
+    void this.bootstrapFromLocation().then(() => {
+      this.applyCompactView();
+      void this.runWelcomePack({ seed: true });
+    });
   }
 
   private attachCatalog(next: Catalog): void {
@@ -3026,7 +3033,7 @@ export class FinderWindow extends HTMLElement {
 
   private isExpandableArchive(node: VNode | null | undefined): node is VNode {
     if (!node || node.isDir) return false;
-    return isExpandableArchive(node.name, node.finderInfo);
+    return isExpandableArchive(node.name, node.finderInfo, node.data);
   }
 
   private async expandArchive(id: number | null = this.selectedId): Promise<void> {
@@ -3627,27 +3634,43 @@ export class FinderWindow extends HTMLElement {
         await this.eraseLocalShare();
         break;
       case 'welcome-pack':
-        await this.addWelcomePack();
+        void this.runWelcomePack({ seed: false });
         break;
     }
   }
 
-  private async addWelcomePack(): Promise<void> {
-    this.setStatus('Adding Welcome Pack Items…', { busy: true });
+  private async runWelcomePack(opts: { seed: boolean }): Promise<void> {
+    if (this.welcomePackBusy) {
+      if (!opts.seed) this.setStatus('Welcome pack is already adding items');
+      return;
+    }
+    this.welcomePackBusy = true;
+    const progress: WelcomePackProgress = {
+      onBegin: (fileCount) => {
+        if (fileCount <= 0) return;
+        this.setStatus('Adding Welcome Pack Items…', { busy: true });
+      },
+      onItem: (item) => this.trackImportItem(item),
+    };
     try {
-      const { imported, skipped } = await this.host.installWelcomePack();
-      if (imported === 0 && skipped === 0) {
+      const result = opts.seed
+        ? await this.host.seedWelcomePack(progress)
+        : await this.host.installWelcomePack(progress);
+      if (!result) return;
+      if (result.imported === 0 && result.skipped === 0) {
         this.setStatus('Welcome pack is empty');
         return;
       }
-      if (imported === 0) {
+      if (result.imported === 0) {
         this.setStatus('Welcome pack items already present');
         return;
       }
-      const extra = skipped > 0 ? ` (${skipped} already present)` : '';
-      this.setStatus(`Added ${imported} welcome pack item${imported === 1 ? '' : 's'}${extra}`);
+      const extra = result.skipped > 0 ? ` (${result.skipped} already present)` : '';
+      this.setStatus(`Added ${result.imported} welcome pack item${result.imported === 1 ? '' : 's'}${extra}`);
     } catch (err) {
       this.setStatus(`Welcome pack failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.welcomePackBusy = false;
     }
   }
 
