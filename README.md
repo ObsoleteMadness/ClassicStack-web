@@ -13,7 +13,7 @@ Browser AppleTalk / AFP stack over **WebSerial → TashTalk → LocalTalk**.
 - AppleSingle / AppleDouble import; remote downloads as AppleDouble pairs in a zip
 - Finder-style UI: icon / list / column views, properties (type/creator)
 - Advanced → **Extension editor…** maps filename suffixes to Macintosh creator/type plus a comment (saved in localStorage; used on import when there is no AppleDouble metadata)
-- Dropped BinHex (`.hqx`), MacBinary (`.bin`), and StuffIt (`.sit`) are decoded into the inner Macintosh files (name, forks, type/creator); toggle via Advanced → **Auto-expand files**
+- Dropped BinHex (`.hqx`), MacBinary (`.bin`), StuffIt (`.sit`), and ZIP (`.zip`) are decoded into the inner Macintosh files (name, forks, type/creator); ZIP merges `._` and `__MACOSX` AppleDouble. Toggle via Advanced → **Auto-expand files**
 - Resource-fork icons (BNDL / ICN# / icl8) with `./icons` system fallbacks and a clearable local type-icon cache
 - Advanced → **Resource Fork…** (or Get Info / context menu **Resources…**) lists every resource type, id, and BNDL mapping in the selected file
 

@@ -4,8 +4,7 @@ import { hfsTimeToAfp } from '../protocol/afp/constants';
 import { unescapeHostFilename } from '../protocol/host-filename';
 import { loadPrefs } from '../util/prefs';
 import { log } from '../util/logger';
-import { expandIncoming, type ExpandedDir, type ExpandedFile, type ExpandedNode } from './expand-incoming';
-import { filenameExtension } from './extension-map';
+import { expandIncoming, isExpandableArchive, type ExpandedDir, type ExpandedFile, type ExpandedNode } from './expand-incoming';
 import type { Catalog, VNode } from './virtual-fs';
 import {
   planItemPlacement,
@@ -38,7 +37,13 @@ export type ImportProgress = {
   }) => Promise<NameConflictChoice>;
 };
 
-type ImportBlob = (parentId: number, file: File, onBytes?: (n: number) => void) => Promise<unknown>;
+type ImportBlob = (
+  parentId: number,
+  file: File,
+  onBytes?: (n: number) => void,
+  /** Host resource fork from `..namedfork/rsrc` (Chrome on macOS). */
+  resource?: Uint8Array,
+) => Promise<unknown>;
 type ImportFs = Pick<
   Catalog,
   'beginBatch' | 'endBatch' | 'ensureDir' | 'lookup' | 'remove' | 'createFile' | 'put'
@@ -179,20 +184,25 @@ async function importFsEntry(
   onItem?: () => void,
   track?: ImportItemTrack,
   destName?: string,
+  parentDir?: FileSystemDirectoryEntry,
 ): Promise<void> {
+  if (isNamedForkDirName(entry.name)) return;
   const name = destName ?? unescapeHostFilename(entry.name);
   if (entry.isDirectory) {
     const dir = await fs.ensureDir(parentId, name);
     onItem?.();
-    const kids = (await readDirectoryEntries(entry as FileSystemDirectoryEntry)).sort(compareImportEntries);
+    const folder = entry as FileSystemDirectoryEntry;
+    const kids = (await readDirectoryEntries(folder)).sort(compareImportEntries);
     for (const kid of kids) {
-      await importFsEntry(fs, dir.id, kid, importBlob, onItem, track);
+      await importFsEntry(fs, dir.id, kid, importBlob, onItem, track, undefined, folder);
     }
     return;
   }
   if (entry.isFile) {
-    const file = await readFileEntry(entry as FileSystemFileEntry);
-    await importOneFile(fs, parentId, fileWithName(file, name), importBlob, track);
+    const fileEntry = entry as FileSystemFileEntry;
+    const file = await readFileEntry(fileEntry);
+    const resource = await readNamedResourceForkForEntry(fileEntry, parentDir);
+    await importOneFile(fs, parentId, fileWithName(file, name), importBlob, track, resource);
     onItem?.();
   }
 }
@@ -228,11 +238,16 @@ async function importOneFile(
   file: File,
   importBlob: ImportBlob,
   track?: ImportItemTrack,
+  resource?: Uint8Array | null,
 ): Promise<void> {
   const name = unescapeHostFilename(file.name);
   const onBytes = track?.onBytes;
+  const hostResource = resource?.length ? resource : undefined;
+  if (hostResource) {
+    log.info(`Imported resource fork for “${name}” (${hostResource.length} bytes)`, 'import');
+  }
   if (!loadPrefs().autoExpandFiles || !shouldTryExpand(name)) {
-    await importBlob(parentId, file, onBytes);
+    await importBlob(parentId, file, onBytes, hostResource);
     return;
   }
   const buf = await readBlobProgress(file, onBytes);
@@ -243,7 +258,12 @@ async function importOneFile(
     log.warn(`Couldn’t auto-expand “${name}”: ${err instanceof Error ? err.message : err}`, 'expand');
   }
   if (!expanded) {
-    await importBlob(parentId, new File([buf], name, { type: file.type, lastModified: file.lastModified }));
+    await importBlob(
+      parentId,
+      new File([buf], name, { type: file.type, lastModified: file.lastModified }),
+      undefined,
+      hostResource,
+    );
     return;
   }
   const first = expanded[0];
@@ -257,8 +277,7 @@ async function importOneFile(
 }
 
 function shouldTryExpand(name: string): boolean {
-  const ext = filenameExtension(name);
-  return ext === 'hqx' || ext === 'bin' || ext === 'sit';
+  return isExpandableArchive(name);
 }
 
 /** Write expanded Mac files/folders through Catalog.createFile / put (forks, Finder info, dates). */
@@ -348,6 +367,7 @@ function collectDataTransferEntries(dt: DataTransfer): FileSystemEntry[] {
 async function countFsEntries(entries: FileSystemEntry[]): Promise<number> {
   let total = 0;
   const walk = async (entry: FileSystemEntry): Promise<void> => {
+    if (isNamedForkDirName(entry.name)) return;
     total++;
     if (!entry.isDirectory) return;
     const kids = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
@@ -364,6 +384,7 @@ async function measureGroupBytes(entries: FileSystemEntry[]): Promise<number> {
 }
 
 async function measureEntryBytes(entry: FileSystemEntry): Promise<number> {
+  if (isNamedForkDirName(entry.name)) return 0;
   if (entry.isFile) {
     const file = await readFileEntry(entry as FileSystemFileEntry);
     return file.size;
@@ -432,6 +453,106 @@ function groupFilesByTopLevel(files: File[]): { name: string; isDir: boolean; fi
 
 function isAppleDoubleSidecarName(name: string): boolean {
   return name.startsWith('._') && name.length > 2;
+}
+
+/** Chrome on macOS can expose a file's resource fork as this parallel path. */
+export const NAMED_RESOURCE_FORK_SUFFIX = '..namedfork/rsrc';
+
+export function namedResourceForkPath(fileName: string): string {
+  return `${fileName}/${NAMED_RESOURCE_FORK_SUFFIX}`;
+}
+
+function isNamedForkDirName(name: string): boolean {
+  return name === '..namedfork';
+}
+
+/** AppleDouble sidecars already carry the resource fork; don't probe them. */
+export function shouldProbeNamedResourceFork(name: string): boolean {
+  if (!name || name === '.' || name === '..' || isNamedForkDirName(name)) return false;
+  return !isAppleDoubleSidecarName(name);
+}
+
+/**
+ * Read `file/..namedfork/rsrc` via the drag-and-drop File System API.
+ * Works in Chrome on macOS; Safari often returns a File that fails to read,
+ * Firefox typically errors. Empty forks and failures are ignored.
+ */
+export async function readNamedResourceFork(
+  dir: FileSystemDirectoryEntry,
+  fileName: string,
+): Promise<Uint8Array | null> {
+  if (!shouldProbeNamedResourceFork(fileName)) return null;
+  const file = await getFileFromDirectory(dir, namedResourceForkPath(fileName));
+  return readResourceForkFile(file);
+}
+
+async function readNamedResourceForkForEntry(
+  fileEntry: FileSystemFileEntry,
+  parentDir?: FileSystemDirectoryEntry | null,
+): Promise<Uint8Array | null> {
+  if (!shouldProbeNamedResourceFork(fileEntry.name)) return null;
+  const dir = parentDir ?? (await getParentDirectory(fileEntry));
+  if (dir) {
+    const fromParent = await readNamedResourceFork(dir, fileEntry.name);
+    if (fromParent) return fromParent;
+  }
+  const root = fileEntry.filesystem?.root;
+  const fullPath = fileEntry.fullPath?.replace(/^\//, '');
+  if (!root || !fullPath) return null;
+  const file = await getFileFromDirectory(root, namedResourceForkPath(fullPath));
+  return readResourceForkFile(file);
+}
+
+async function readResourceForkFile(file: File | null): Promise<Uint8Array | null> {
+  if (!file?.size) return null;
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    return buf.length ? buf : null;
+  } catch {
+    // Safari: getFile succeeds but reading the named fork throws.
+    return null;
+  }
+}
+
+function getFileFromDirectory(dir: FileSystemDirectoryEntry, relativePath: string): Promise<File | null> {
+  return new Promise((resolve) => {
+    if (typeof dir.getFile !== 'function') {
+      resolve(null);
+      return;
+    }
+    try {
+      dir.getFile(
+        relativePath,
+        { create: false },
+        (entry) => {
+          (entry as FileSystemFileEntry).file(
+            (file) => resolve(file),
+            () => resolve(null),
+          );
+        },
+        () => resolve(null),
+      );
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function getParentDirectory(entry: FileSystemEntry): Promise<FileSystemDirectoryEntry | null> {
+  return new Promise((resolve) => {
+    if (typeof entry.getParent !== 'function') {
+      resolve(null);
+      return;
+    }
+    try {
+      entry.getParent(
+        (parent) => resolve(parent as FileSystemDirectoryEntry),
+        () => resolve(null),
+      );
+    } catch {
+      resolve(null);
+    }
+  });
 }
 
 function compareImportEntries(a: FileSystemEntry, b: FileSystemEntry): number {

@@ -13,6 +13,6 @@ Drop Mac files here (folders are preserved):
 | `Name.txt` | Imported as TeachText/SimpleText `Name` (AppleSingle, `TEXT`/`ttxt`) |
 | AppleSingle | Detected by magic; keep the Mac filename |
 | Data fork + `._Name` | AppleDouble sidecar merged on import |
-| `.sit` / `.hqx` / `.bin` | Welcome-pack copies stay as-is. Drops decode `.hqx` / MacBinary `.bin` / StuffIt `.sit` by default (Advanced → **Auto-expand files**) |
+| `.sit` / `.hqx` / `.bin` / `.zip` | Welcome-pack copies stay as-is. Drops decode `.hqx` / MacBinary `.bin` / StuffIt `.sit` / ZIP (including `._` and `__MACOSX` AppleDouble) by default (Advanced → **Auto-expand files**) |
 
 Served at `/welcome/*` via Vite `public/`. The file list is generated as `/welcome/manifest.json`.

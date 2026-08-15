@@ -197,11 +197,13 @@ describe('expandIncoming', () => {
 });
 
 describe('isExpandableArchive', () => {
-  it('matches .sit / .hqx / .bin names, StuffIt types, and BinHex TEXT/SITx', () => {
+  it('matches .sit / .hqx / .bin / .zip names, StuffIt types, ZIP, and BinHex TEXT/SITx', () => {
     expect(isExpandableArchive('Disk Copy.sit')).toBe(true);
     expect(isExpandableArchive('Read Me.bin.hqx')).toBe(true);
     expect(isExpandableArchive('Read Me.bin')).toBe(true);
+    expect(isExpandableArchive('Archive.zip')).toBe(true);
     expect(isExpandableArchive('Read Me', makeFinderInfo('SIT!', 'SITx'))).toBe(true);
+    expect(isExpandableArchive('Archive', makeFinderInfo('ZIP ', 'SITx'))).toBe(true);
     expect(isExpandableArchive('Archive', makeFinderInfo('TEXT', 'SITx'))).toBe(true);
     expect(isExpandableArchive('Read Me', makeFinderInfo('TEXT', 'ttxt'))).toBe(false);
     expect(isExpandableArchive('notes.txt')).toBe(false);
