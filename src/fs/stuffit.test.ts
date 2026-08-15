@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { crc16Ibm } from '../protocol/crc16';
@@ -210,10 +210,9 @@ describe('real StuffIt archives', () => {
     expect(expanded.some((n) => n.kind === 'dir' && n.name.includes('StuffIt Expander'))).toBe(true);
   });
 
-  it('expands a QuickTime installer archive (ST46, method 14)', () => {
-    const packed = new Uint8Array(
-      readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../public/welcome/Utilities/QuickTime 3.0.sit')),
-    );
+  const quickTimeSit = join(dirname(fileURLToPath(import.meta.url)), '../../public/welcome/Utilities/QuickTime 3.0.sit');
+  it.skipIf(!existsSync(quickTimeSit))('expands a QuickTime installer archive (ST46, method 14)', () => {
+    const packed = new Uint8Array(readFileSync(quickTimeSit));
     const entries = parseStuffIt(packed);
     const names = entries?.map((e) => e.name) ?? [];
     expect(names.some((n) => n.includes('Installer'))).toBe(true);
