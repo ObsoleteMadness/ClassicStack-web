@@ -1130,8 +1130,16 @@ finder-window {
   z-index: -1;
 }
 
+.ctx-root {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+}
+
 .ctx-menu {
   position: fixed;
+  z-index: 20;
   pointer-events: auto;
   min-width: 168px;
   padding: 4px;
