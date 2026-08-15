@@ -30,6 +30,20 @@ function ascii(s: string): Uint8Array {
   return b;
 }
 
+function dirNode(id: number, parentId: number, name: string): VNode {
+  return {
+    id,
+    parentId,
+    name,
+    isDir: true,
+    data: new Uint8Array(),
+    resource: new Uint8Array(),
+    finderInfo: new Uint8Array(32),
+    createDate: 1,
+    modDate: 1,
+  };
+}
+
 function mockStore(): WelcomePackStore & {
   files: Map<string, { id: number; isDir: boolean; name: string }>;
   blobs: { parentId: number; name: string }[];
@@ -64,9 +78,9 @@ function mockStore(): WelcomePackStore & {
     async ensureDir(parentId, name) {
       const k = key(parentId, name);
       const existing = files.get(k);
-      if (existing?.isDir) return existing;
-      const node = { id: nextId++, isDir: true, name };
-      files.set(k, node);
+      if (existing?.isDir) return dirNode(existing.id, parentId, name);
+      const node = dirNode(nextId++, parentId, name);
+      files.set(k, { id: node.id, isDir: true, name });
       byId.set(node.id, { parentId, name });
       return node;
     },

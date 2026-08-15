@@ -6,7 +6,7 @@ import { be32 } from '../protocol/binary';
 import { AS_MAGIC, AD_MAGIC, buildAppleSingle } from './appledouble';
 import { expandIncoming, isExpandableArchive, type ExpandedNode } from './expand-incoming';
 import { importExpandedTree, type ImportItemTrack } from './import-transfer';
-import type { VNode } from './virtual-fs';
+import type { Catalog } from './virtual-fs';
 import { log } from '../util/logger';
 
 export const WELCOME_PACK_BASE = '/welcome';
@@ -36,23 +36,12 @@ export type WelcomePackProgress = {
   }) => ImportItemTrack | undefined;
 };
 
-export type WelcomePackFs = {
-  rootId(): number;
+export type WelcomePackFs = Pick<
+  Catalog,
+  'rootId' | 'ensureDir' | 'beginBatch' | 'endBatch' | 'createFile' | 'put' | 'remove'
+> & {
   lookup(parentId: number, name: string): Promise<{ id: number; isDir: boolean } | undefined>;
-  ensureDir(parentId: number, name: string): Promise<{ id: number }>;
-  beginBatch(): void;
-  endBatch(): void;
   importBlob(parentId: number, file: File): Promise<unknown>;
-  createFile(
-    parentId: number,
-    name: string,
-    data: Uint8Array,
-    resource?: Uint8Array,
-    finderInfo?: Uint8Array,
-    onBytes?: (n: number) => void,
-  ): Promise<VNode>;
-  put(node: VNode): Promise<void>;
-  remove(id: number): Promise<void>;
 };
 
 export type WelcomePackStore = WelcomePackFs & {
