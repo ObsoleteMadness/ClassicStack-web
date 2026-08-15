@@ -383,16 +383,19 @@ async function measureGroupBytes(entries: FileSystemEntry[]): Promise<number> {
   return n;
 }
 
-async function measureEntryBytes(entry: FileSystemEntry): Promise<number> {
+async function measureEntryBytes(entry: FileSystemEntry, parentDir?: FileSystemDirectoryEntry): Promise<number> {
   if (isNamedForkDirName(entry.name)) return 0;
   if (entry.isFile) {
-    const file = await readFileEntry(entry as FileSystemFileEntry);
-    return file.size;
+    const fileEntry = entry as FileSystemFileEntry;
+    const file = await readFileEntry(fileEntry);
+    const resource = await readNamedResourceForkForEntry(fileEntry, parentDir);
+    return file.size + (resource?.length ?? 0);
   }
   if (!entry.isDirectory) return 0;
   let n = 0;
-  const kids = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
-  for (const kid of kids) n += await measureEntryBytes(kid);
+  const folder = entry as FileSystemDirectoryEntry;
+  const kids = await readDirectoryEntries(folder);
+  for (const kid of kids) n += await measureEntryBytes(kid, folder);
   return n;
 }
 
