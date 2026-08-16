@@ -1487,7 +1487,8 @@ log-panel[hidden],
 }
 
 .log-panel.is-dragging .log-panel__chrome,
-.activity-window.is-dragging .activity-window__chrome {
+.activity-window.is-dragging .activity-window__chrome,
+.rsrc-explorer.is-dragging .rsrc-explorer__chrome {
   cursor: grabbing;
 }
 
@@ -1788,6 +1789,9 @@ resource-fork-explorer[hidden],
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #2c333b, #262c33);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
 }
 
 .rsrc-explorer__title {

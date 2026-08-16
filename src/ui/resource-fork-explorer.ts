@@ -21,7 +21,7 @@ import {
 import { decodeIcon, SUPPORTED_ICON_TYPES, decodedIconToDataUrl } from '../fs/resource-types/icon-decoder';
 import { readTypeCreator } from '../fs/icon-cache';
 import { formatBytes } from './format-bytes';
-import { enableWindowResize } from './window-resize';
+import { enableWindowMove, enableWindowResize } from './window-resize';
 
 const ICON_TYPE_SET = new Set<string>(SUPPORTED_ICON_TYPES);
 
@@ -51,6 +51,7 @@ export class ResourceForkExplorer extends HTMLElement {
     this.hidden = true;
     this.renderShell();
     enableWindowResize(this, { minWidth: 420, minHeight: 280 });
+    enableWindowMove(this, '.rsrc-explorer__chrome');
     this.addEventListener('click', (e) => this.onClick(e));
     window.addEventListener('keydown', this.onKey);
   }
