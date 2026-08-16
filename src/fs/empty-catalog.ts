@@ -1,7 +1,7 @@
 /** No-op Catalog used when the Finder has no local share (ClassicStack Go SPA). */
 
 import type { ByteRangeReader } from './byte-range';
-import type { ResourceFork, ResourceForkLoadOpts } from './resource-fork';
+import type { ResourceFork } from './resource-fork';
 import type {
   Catalog,
   ChildrenBatchListener,
