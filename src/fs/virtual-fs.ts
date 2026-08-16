@@ -44,10 +44,18 @@ export interface Catalog {
   ensureContent(id: number, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined>;
   children(parentId: number, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]>;
   lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined>;
-  /** Parse a resource fork via ranged reads (header, map, selected payloads). */
+  /** Parse a resource fork via ranged reads (header and map; payloads on demand). */
   loadResourceFork(node: VNode, opts?: ResourceForkLoadOpts): Promise<import('./resource-fork').ResourceFork | null>;
   /** Enough of the resource fork to decode Finder icons. */
   loadIconResources(node: VNode, signal?: AbortSignal): Promise<import('./resource-fork').ResourceFork | null>;
+  /**
+   * AFP Desktop DB bitmaps for a type/creator (often B&W ICN#). Local catalogs omit this.
+   */
+  loadDesktopIcons?(
+    type: string,
+    creator: string,
+    signal?: AbortSignal,
+  ): Promise<{ iconType: number; data: Uint8Array }[] | null>;
   /**
    * Ranged reads of a file’s data or resource bytes. The catalog may keep a
    * backend handle open until `fn` returns.
@@ -428,12 +436,15 @@ export class VirtualFS implements Catalog {
     const loaded = resource ? node.resource.length : node.data.length;
     const hinted = resource ? (node.resourceBytes ?? loaded) : (node.dataBytes ?? loaded);
     if (Math.max(loaded, hinted) < 16) return null;
-    return this.withRangeReader(
+    const rangeOpts = { resource, signal: opts?.signal };
+    const rf = await this.withRangeReader(
       node,
       (read) =>
         opts?.finderIcons ? loadFinderIconFork(read) : ResourceFork.fromReader(read, opts?.want),
-      { resource, signal: opts?.signal },
+      rangeOpts,
     );
+    rf?.bindFill((fn) => this.withRangeReader(node, fn, rangeOpts));
+    return rf;
   }
 
   async loadIconResources(node: VNode, signal?: AbortSignal): Promise<ResourceFork | null> {

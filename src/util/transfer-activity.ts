@@ -1,8 +1,16 @@
 /** In-flight file copy/import/download jobs for the Finder transfer window. */
 
+import { isAbortError } from './abort';
+
 export type TransferKind = 'file' | 'folder';
 
-export type TransferStatus = 'queued' | 'running' | 'done' | 'error';
+export type TransferStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
+
+/** Catalog subset used to delete a dest file left behind by a cancelled write. */
+export type TransferDest = {
+  lookup(parentId: number, name: string): Promise<{ id: number; isDir: boolean } | undefined>;
+  remove(id: number): Promise<void>;
+};
 
 export interface TransferJob {
   id: string;
@@ -20,6 +28,15 @@ export interface TransferJob {
   detail?: string;
 }
 
+/** In-progress dest item to overlay in a Finder folder listing. */
+export interface TransferWriteProgress {
+  jobId: string;
+  name: string;
+  kind: TransferKind;
+  pct: number;
+  indeterminate: boolean;
+}
+
 export interface TransferStart {
   name: string;
   kind: TransferKind;
@@ -34,8 +51,19 @@ type Listener = () => void;
 
 const FILE_ICON = '/icons/FILE16.png';
 
+type WriteLoc = { dest: TransferDest; parentId: number; name: string };
+
+type JobRec = TransferJob & {
+  lastBytes: number;
+  lastTick: number;
+  abort: AbortController;
+  /** Top-level dest shown in Finder while this job is still writing. */
+  dest?: WriteLoc;
+  partial?: WriteLoc;
+};
+
 class TransferActivity {
-  private jobs = new Map<string, TransferJob & { lastBytes: number; lastTick: number }>();
+  private jobs = new Map<string, JobRec>();
   private order: string[] = [];
   private listeners = new Set<Listener>();
   private seq = 1;
@@ -87,13 +115,125 @@ class TransferActivity {
   }
 
   /** Move a queued job to running (e.g. the next extracted file). */
-  begin(id: string, detail?: string): void {
+  begin(id: string, detail?: string): boolean {
     const j = this.jobs.get(id);
-    if (!j || j.status !== 'queued') return;
+    if (!j || j.status !== 'queued') return false;
     j.status = 'running';
     j.lastTick = performance.now();
     if (detail !== undefined) j.detail = detail;
     this.emit();
+    return true;
+  }
+
+  signal(id: string): AbortSignal | undefined {
+    return this.jobs.get(id)?.abort.signal;
+  }
+
+  isCancelled(id: string): boolean {
+    const j = this.jobs.get(id);
+    return !!j && (j.status === 'cancelled' || j.abort.signal.aborted);
+  }
+
+  /** Abort a running job or skip a queued one. Nested extract tasks are cancelled too. */
+  cancel(id: string): void {
+    const j = this.jobs.get(id);
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    j.status = 'cancelled';
+    j.rate = 0;
+    j.detail = undefined;
+    j.dest = undefined;
+    if (!j.abort.signal.aborted) j.abort.abort();
+    for (const child of this.jobs.values()) {
+      if (child.parentId === id) this.cancel(child.id);
+    }
+    this.emit();
+  }
+
+  /**
+   * Dest folder + name for Finder overlay (the copy target, including folders).
+   * Call as soon as the dest name is known so the item can appear before the write.
+   */
+  setDest(id: string, dest: TransferDest, parentId: number, name: string): void {
+    const j = this.jobs.get(id);
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    j.dest = { dest, parentId, name };
+    this.emit();
+  }
+
+  /**
+   * Remember the dest file currently being written so cancel can delete a
+   * partial copy. Folder jobs should point this at the file in flight, not the folder.
+   */
+  watchPartial(id: string, dest: TransferDest, parentId: number, name: string): void {
+    const j = this.jobs.get(id);
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    j.partial = { dest, parentId, name };
+  }
+
+  /** Running/queued writes targeting `parentId` in `dest` (top-level dest or in-flight file). */
+  writesIn(dest: TransferDest, parentId: number): TransferWriteProgress[] {
+    const out: TransferWriteProgress[] = [];
+    const seen = new Set<string>();
+    for (const j of this.jobs.values()) {
+      if (j.status !== 'running' && j.status !== 'queued') continue;
+      const hits: { name: string; kind: TransferKind }[] = [];
+      if (j.dest && j.dest.dest === dest && j.dest.parentId === parentId) {
+        hits.push({ name: j.dest.name, kind: j.kind });
+      }
+      if (j.partial && j.partial.dest === dest && j.partial.parentId === parentId) {
+        hits.push({ name: j.partial.name, kind: 'file' });
+      }
+      if (!hits.length) continue;
+      const prog = jobProgress(j);
+      for (const hit of hits) {
+        const key = hit.name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          jobId: j.id,
+          name: hit.name,
+          kind: hit.kind,
+          pct: prog.pct,
+          indeterminate: prog.indeterminate,
+        });
+      }
+    }
+    return out;
+  }
+
+  clearPartial(id: string): void {
+    const j = this.jobs.get(id);
+    if (j) j.partial = undefined;
+  }
+
+  /** Delete the watched dest file if it is a file (not a folder). */
+  async discardPartial(id: string): Promise<void> {
+    const j = this.jobs.get(id);
+    const partial = j?.partial;
+    if (!j || !partial) return;
+    j.partial = undefined;
+    try {
+      const node = await partial.dest.lookup(partial.parentId, partial.name);
+      if (node && !node.isDir) await partial.dest.remove(node.id);
+    } catch {
+      /* dest may already be gone */
+    }
+  }
+
+  /** Finish, fail, or drop a partial after the writer stops. */
+  async settle(id: string, err?: unknown): Promise<void> {
+    if (!err) {
+      this.clearPartial(id);
+      this.finish(id);
+      return;
+    }
+    if (isAbortError(err) || this.isCancelled(id)) {
+      await this.discardPartial(id);
+      if (!this.isCancelled(id)) this.cancel(id);
+      return;
+    }
+    this.clearPartial(id);
+    this.fail(id, err instanceof Error ? err.message : String(err));
   }
 
   /** Fail queued children when the parent extract aborts. */
@@ -120,6 +260,14 @@ class TransferActivity {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
     j.bytesTotal = Math.max(n, j.bytesDone);
+    this.emit();
+  }
+
+  setDetail(id: string, detail: string): void {
+    const j = this.jobs.get(id);
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    if (j.detail === detail) return;
+    j.detail = detail;
     this.emit();
   }
 
@@ -157,7 +305,9 @@ class TransferActivity {
 
   finish(id: string): void {
     const j = this.jobs.get(id);
-    if (!j) return;
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    this.clearPartial(id);
+    j.dest = undefined;
     j.status = 'done';
     if (j.bytesTotal <= 0) j.bytesTotal = j.bytesDone;
     j.rate = 0;
@@ -166,7 +316,9 @@ class TransferActivity {
 
   fail(id: string, error: string): void {
     const j = this.jobs.get(id);
-    if (!j) return;
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    this.clearPartial(id);
+    j.dest = undefined;
     j.status = 'error';
     j.error = error;
     j.rate = 0;
@@ -200,6 +352,7 @@ class TransferActivity {
       detail: spec.detail ?? (spec.queued ? 'Queued' : undefined),
       lastBytes: 0,
       lastTick: now,
+      abort: new AbortController(),
     });
     this.order.push(id);
     return id;
@@ -208,6 +361,12 @@ class TransferActivity {
   private emit(): void {
     for (const fn of this.listeners) fn();
   }
+}
+
+function jobProgress(j: TransferJob): { pct: number; indeterminate: boolean } {
+  if (j.status === 'queued') return { pct: 0, indeterminate: false };
+  if (j.bytesTotal <= 0) return { pct: 0, indeterminate: j.status === 'running' };
+  return { pct: Math.min(100, Math.round((j.bytesDone / j.bytesTotal) * 100)), indeterminate: false };
 }
 
 export const transferActivity = new TransferActivity();

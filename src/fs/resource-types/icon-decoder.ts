@@ -388,20 +388,32 @@ function decodeCicn(resType: string, data: Uint8Array): DecodedIcon | null {
   return null;
 }
 
-/** AFP Desktop DB iconType → resource type / size heuristic. */
+/** AFP Desktop DB iconType → resource type. Size disambiguates odd servers. */
 export function decodeDesktopIcon(iconType: number, data: Uint8Array): DecodedIcon | null {
-  // Common Desktop Manager icon types (simplified mapping).
-  const map: Record<number, string> = {
+  const byType: Record<number, string> = {
     1: 'ICN#',
-    2: 'ics#',
-    0x101: 'icl8',
-    0x201: 'ics8',
-    0x401: 'icl4',
-    0x501: 'ics4',
+    2: 'icl4',
+    3: 'icl8',
+    4: 'ics#',
+    5: 'ics4',
+    6: 'ics8',
   };
-  const type = map[iconType];
-  if (type) return decodeIcon(type, data);
+  const mapped = byType[iconType];
+  if (mapped) {
+    if (iconType === 2 && data.length === 64) return decodeIcon('ics#', data);
+    if (iconType === 6 && data.length === 256 && looksLikeIcnHash(data)) return decodeIcon('ICN#', data);
+    return decodeIcon(mapped, data);
+  }
+  if (data.length === 256) return decodeIcon('ICN#', data);
+  if (data.length === 64) return decodeIcon('ics#', data);
   return decodeIcon('', data);
+}
+
+function looksLikeIcnHash(data: Uint8Array): boolean {
+  if (data.length !== 256) return false;
+  let maskBits = 0;
+  for (let i = 128; i < 256; i++) maskBits |= data[i]!;
+  return maskBits !== 0;
 }
 
 export function decodeICNHash(data: Uint8Array): DecodedIcon | null {

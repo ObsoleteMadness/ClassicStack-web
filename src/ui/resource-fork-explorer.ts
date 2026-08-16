@@ -4,7 +4,7 @@
  */
 
 import type { Catalog, VNode } from '../fs/virtual-fs';
-import { ResourceFork } from '../fs/resource-fork';
+import { ResourceFork, resourceFetchCap, type ResourceEntry } from '../fs/resource-fork';
 import {
   decodeFref,
   describeBndl,
@@ -24,6 +24,11 @@ import { formatBytes } from './format-bytes';
 import { enableWindowMove, enableWindowResize } from './window-resize';
 
 const ICON_TYPE_SET = new Set<string>(SUPPORTED_ICON_TYPES);
+const HEX_PREVIEW_BYTES = 512;
+
+function payloadCap(type: string): number {
+  return resourceFetchCap(type) || HEX_PREVIEW_BYTES;
+}
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -189,7 +194,7 @@ export class ResourceForkExplorer extends HTMLElement {
     return this.inspect?.types.find((g) => g.type === this.selectedType);
   }
 
-  private selectedEntry(): { entry: import('../fs/resource-fork').ResourceEntry; index: number } | null {
+  private selectedEntry(): { entry: ResourceEntry; index: number } | null {
     const group = this.group();
     if (!group) return null;
     if (this.selectedKey) {
@@ -203,16 +208,25 @@ export class ResourceForkExplorer extends HTMLElement {
   private async refreshPreview(gen: number): Promise<void> {
     this.previewUrl = null;
     const sel = this.selectedEntry();
-    if (!sel || !this.rf || !ICON_TYPE_SET.has(sel.entry.type)) {
+    if (!sel || !this.rf) {
       if (gen === this.loadGen) this.paintDetail();
       return;
     }
-    const bytes = this.rf.readBytes(sel.entry);
-    const decoded = decodeIcon(sel.entry.type, bytes);
-    const url = decoded ? await decodedIconToDataUrl(decoded) : null;
+    if (gen === this.loadGen) this.paintDetail();
+    const bytes = await this.pullSelectedBytes(sel.entry);
     if (gen !== this.loadGen) return;
-    this.previewUrl = url;
+    if (ICON_TYPE_SET.has(sel.entry.type)) {
+      const decoded = decodeIcon(sel.entry.type, bytes);
+      this.previewUrl = decoded ? await decodedIconToDataUrl(decoded) : null;
+      if (gen !== this.loadGen) return;
+    }
+    this.paintEntries();
     this.paintDetail();
+  }
+
+  private async pullSelectedBytes(entry: ResourceEntry): Promise<Uint8Array> {
+    if (!this.rf) return new Uint8Array();
+    return this.rf.pullBytes(entry, payloadCap(entry.type));
   }
 
   private paint(): void {
@@ -314,7 +328,7 @@ export class ResourceForkExplorer extends HTMLElement {
         return `<button type="button" class="rsrc-explorer__res${isSel}" data-act="res" data-key="${escapeHtml(key)}">
           <span class="rsrc-explorer__res-id">${e.id}</span>
           <span class="rsrc-explorer__res-name">${name}${hint ? `<span class="rsrc-explorer__hint">${escapeHtml(hint)}</span>` : ''}</span>
-          <span class="rsrc-explorer__res-size">${escapeHtml(formatBytes(e.length))}</span>
+          <span class="rsrc-explorer__res-size">${e.length < 0 ? '—' : escapeHtml(formatBytes(e.length))}</span>
           <span class="rsrc-explorer__res-attr">0x${e.attributes.toString(16).padStart(2, '0')}</span>
         </button>`;
       })
@@ -333,6 +347,10 @@ export class ResourceForkExplorer extends HTMLElement {
     const sel = this.selectedEntry();
     if (!sel || !this.rf) {
       el.innerHTML = '';
+      return;
+    }
+    if (!this.rf.hasPayload(sel.entry)) {
+      el.innerHTML = `<p class="rsrc-explorer__empty">Reading resource…</p>`;
       return;
     }
     const bytes = this.rf.readBytes(sel.entry);
@@ -381,8 +399,9 @@ export class ResourceForkExplorer extends HTMLElement {
     }
 
     const dump = hexDump(bytes);
+    const unread = sel.entry.length > bytes.length ? sel.entry.length - bytes.length : dump.truncated ? bytes.length - HEX_PREVIEW_BYTES : 0;
     parts.push(
-      `<pre class="rsrc-explorer__hex">${escapeHtml(dump.text) || '(empty)'}${dump.truncated ? `\n… ${bytes.length - 512} more bytes` : ''}</pre>`,
+      `<pre class="rsrc-explorer__hex">${escapeHtml(dump.text) || '(empty)'}${unread > 0 ? `\n… ${unread} more bytes` : ''}</pre>`,
     );
     el.innerHTML = parts.join('');
   }

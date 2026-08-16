@@ -18,6 +18,7 @@ function afpResultName(result: number): string {
   const s = result | 0;
   if (s === C.NoErr) return 'NoErr';
   if (s === C.ErrObjectNotFnd) return 'ObjectNotFound';
+  if (s === C.ErrItemNotFound) return 'ItemNotFound';
   if (s === C.ErrParamErr) return 'ParamErr';
   if (s === C.ErrCallNotSuppt) return 'CallNotSupported';
   if (s === C.ErrAccessDenied) return 'AccessDenied';
@@ -488,14 +489,16 @@ export class AfpServer {
         case C.CmdGetVolParms:
           reply = this.getVolParms(sess, block);
           break;
-        case C.CmdOpenDT:
-          sess.dtRef = 1;
+        case C.CmdOpenDT: {
+          const vol = block.length >= 4 ? be16(block, 2) : 1;
+          sess.dtRef = vol || 1;
           {
             const out = new Uint8Array(2);
-            writeBe16(out, 0, 1);
+            writeBe16(out, 0, sess.dtRef);
             reply = [out, C.NoErr];
           }
           break;
+        }
         case C.CmdCloseDT:
           sess.dtRef = 0;
           reply = [new Uint8Array(), C.NoErr];
@@ -841,7 +844,8 @@ export class AfpServer {
     if (!n) return [new Uint8Array(), C.ErrObjectNotFnd];
     const src = fork.resource ? n.resource : n.data;
     if (offset >= src.length) return [new Uint8Array(), C.ErrEOFErr];
-    const end = Math.min(offset + count, src.length);
+    const want = Math.min(count, asp.QuantumSize);
+    const end = Math.min(offset + want, src.length);
     const slice = src.subarray(offset, end);
     const result = end >= src.length && slice.length < count ? C.ErrEOFErr : C.NoErr;
     return [slice.slice(), result];
@@ -1030,15 +1034,13 @@ export class AfpServer {
     const key = `icon:${creator}:${type}:${iconType}:`;
     // try exact tag 0 first — scan keys is hard; store canonical without tag lookup
     const data = (await this.fs.desktopGet(`${key}0`)) ?? (await this.fs.desktopGet(key + '0'));
-    if (!data) return [new Uint8Array(), C.ErrObjectNotFnd];
+    if (!data) return [new Uint8Array(), C.ErrItemNotFound];
     return [data.subarray(0, length || data.length), C.NoErr];
   }
 
   private async getIconInfo(block: Uint8Array): Promise<[Uint8Array, number]> {
     void block;
-    const out = new Uint8Array(4);
-    writeBe32(out, 0, 0); // tag
-    return [out, C.NoErr];
+    return [new Uint8Array(), C.ErrItemNotFound];
   }
 
   private readPathName(block: Uint8Array, start: number): string {

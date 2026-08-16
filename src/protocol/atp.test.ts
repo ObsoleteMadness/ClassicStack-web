@@ -37,6 +37,13 @@ describe('ATP / ASP OpenSess framing', () => {
     expect(atp.inferredEomSeq(8, new Set([0, 2]))).toBe(0);
   });
 
+  it('sizes the TReq bitmap to the payload, not a fixed 8-packet window', () => {
+    expect(atp.bitmapForPayload(16)).toBe(0x01);
+    expect(atp.bitmapForPayload(578)).toBe(0x01);
+    expect(atp.bitmapForPayload(579)).toBe(0x03);
+    expect(atp.bitmapForPayload(asp.QuantumSize)).toBe(0xff);
+  });
+
   it('detects STS separately from EOM', () => {
     const h = atp.decodeHeader(atp.encodeHeader({ control: atp.TRESP | atp.STS, bitmap: 1, transId: 1, userData: 0 }));
     expect(atp.hasSTS(h)).toBe(true);

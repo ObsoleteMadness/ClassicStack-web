@@ -1,5 +1,7 @@
 /** Name clashes when copying, moving, or importing into a folder. */
 
+import { isAbortError } from '../util/abort';
+
 export type NameConflictChoice = 'replace' | 'rename' | 'cancel';
 
 export class TransferCancelled extends Error {
@@ -10,7 +12,11 @@ export class TransferCancelled extends Error {
 }
 
 export function isTransferCancelled(err: unknown): boolean {
-  return err instanceof TransferCancelled || (err instanceof Error && err.name === 'TransferCancelled');
+  return (
+    err instanceof TransferCancelled ||
+    (err instanceof Error && err.name === 'TransferCancelled') ||
+    isAbortError(err)
+  );
 }
 
 export function splitItemName(name: string): { stem: string; ext: string } {

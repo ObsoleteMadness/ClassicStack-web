@@ -114,14 +114,17 @@ export class RemoteVfs implements Catalog {
     const hinted = resource ? (node.resourceBytes ?? loaded) : (node.dataBytes ?? loaded);
     if (Math.max(loaded, hinted) < 16) return null;
     try {
-      return await this.withRangeReader(
+      const rangeOpts = { resource, signal: opts?.signal };
+      const rf = await this.withRangeReader(
         node,
         (read) =>
           opts?.finderIcons
             ? loadFinderIconFork(read, iconForkLoadOptions(node))
             : ResourceFork.fromReader(read, opts?.want),
-        { resource, signal: opts?.signal },
+        rangeOpts,
       );
+      rf?.bindFill((fn) => this.withRangeReader(node, fn, rangeOpts));
+      return rf;
     } catch (err) {
       if (isAbortError(err)) throw err;
       return null;
@@ -130,6 +133,19 @@ export class RemoteVfs implements Catalog {
 
   async loadIconResources(node: VNode, signal?: AbortSignal): Promise<ResourceFork | null> {
     return this.loadResourceFork(node, { finderIcons: true, signal });
+  }
+
+  async loadDesktopIcons(
+    type: string,
+    creator: string,
+    signal?: AbortSignal,
+  ): Promise<{ iconType: number; data: Uint8Array }[] | null> {
+    try {
+      return await this.client.loadDesktopIcons(type, creator, this.volId, signal);
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      return null;
+    }
   }
 
   async withRangeReader<T>(

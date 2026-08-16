@@ -25,6 +25,8 @@ export type ExpandTrackFile = {
 export type ImportItemTrack = {
   onBytes?: (n: number) => void;
   onDone?: (err?: Error) => void;
+  /** Parent job caption while cataloging an archive (before nested files exist). */
+  onStatus?: (detail: string) => void;
   /** Reset the parent job and announce every extracted file (queued) before writes start. */
   onExpandBegin?: (bytesTotal: number, files: ExpandTrackFile[]) => void;
   /** Nested job while a dropped wrapper is decoded (BinHex / MacBinary / later StuffIt). */

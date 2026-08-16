@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ResourceFork, loadFinderIconFork, loadResourceForkPartial } from './resource-fork';
-import { decodeIcon, decodeICNHash, type DecodedIcon } from './resource-types/icon-decoder';
+import { decodeIcon, decodeICNHash, decodeDesktopIcon, type DecodedIcon } from './resource-types/icon-decoder';
 import { IconSet, IconSize } from './resource-types/icon-set';
 
 function writeAscii4(buf: Uint8Array, o: number, s: string): void {
@@ -152,6 +152,15 @@ describe('resource fork + icon decode', () => {
     expect(icon?.pixels[3]).toBe(255);
   });
 
+  it('maps AFP desktop iconType 1 to ICN#', () => {
+    const data = new Uint8Array(256);
+    data.fill(0xff, 0, 128);
+    data.fill(0xff, 128, 256);
+    const icon = decodeDesktopIcon(1, data);
+    expect(icon?.typeCode).toBe('ICN#');
+    expect(icon?.width).toBe(32);
+  });
+
   it('decodes icl8 with system palette', () => {
     const data = new Uint8Array(1024);
     data.fill(0); // white
@@ -207,10 +216,11 @@ describe('resource fork + icon decode', () => {
     expect(rf!.findById('ICN#', 128)?.length).toBe(256);
     const set = IconSet.fromResourceFork(128, rf!);
     expect(set?.getIconBySize(IconSize.Large, false)?.width).toBe(32);
-    const total = reads.reduce((n, r) => n + r.count, 0);
     expect(reads.some((r) => r.offset === 0 && r.count === fork.length)).toBe(false);
     expect(reads[0]).toEqual({ offset: 0, count: 16 });
-    expect(total).toBeGreaterThan(16);
+    expect(reads.filter((r) => r.count === 4)).toEqual([]);
+    const icnRead = reads.find((r) => r.count === 4 + 256);
+    expect(icnRead).toBeTruthy();
   });
 
   it('does not pull unmapped ICN# payloads when loading Finder icons', async () => {
@@ -235,6 +245,7 @@ describe('resource fork + icon decode', () => {
     expect(rf?.findById('ICN#', 128)?.length).toBe(256);
     expect(rf?.findById('ICN#', 999)).toBeUndefined();
     expect(rf?.findById('BNDL', 128)).toBeTruthy();
+    expect(reads.filter((r) => r.count === 4)).toEqual([]);
     const payloadReads = reads.filter(
       (r) => r.offset < extraEnd && r.offset + r.count > extraStart,
     );
@@ -242,7 +253,7 @@ describe('resource fork + icon decode', () => {
     expect(reads.reduce((n, r) => n + r.count, 0)).toBeLessThan(fork.length);
   });
 
-  it('parses the same map through fromReader as fromBytes without a full-fork read', async () => {
+  it('parses the same map through fromReader as fromBytes without pulling payloads', async () => {
     const fork = buildForkWithICN();
     const fromBuf = ResourceFork.fromBytes(fork);
     const reads: { offset: number; count: number }[] = [];
@@ -250,8 +261,18 @@ describe('resource fork + icon decode', () => {
       reads.push({ offset, count });
       return fork.subarray(offset, Math.min(fork.length, offset + count));
     });
-    expect(fromRead?.findById('ICN#', 128)?.length).toBe(fromBuf.findById('ICN#', 128)?.length);
-    expect(reads.some((r) => r.offset === 0 && r.count === fork.length)).toBe(false);
+    const icn = fromRead?.findById('ICN#', 128);
+    expect(icn?.length).toBe(-1);
+    expect(icn?.payload).toBeUndefined();
+    expect(fromRead?.hasPayload(icn!)).toBe(false);
+    expect(reads).toHaveLength(2);
     expect(reads[0]).toEqual({ offset: 0, count: 16 });
+    expect(reads.filter((r) => r.count === 4)).toEqual([]);
+    const pulled = await fromRead!.pullBytes(icn!);
+    expect(icn?.length).toBe(fromBuf.findById('ICN#', 128)?.length);
+    expect(pulled.length).toBe(256);
+    expect(fromRead?.hasPayload(icn!)).toBe(true);
+    expect(reads).toHaveLength(3);
+    expect(reads[2]!.count).toBe(4 + 256);
   });
 });

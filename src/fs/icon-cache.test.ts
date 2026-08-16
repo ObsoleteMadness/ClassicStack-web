@@ -7,6 +7,7 @@ import {
   iconForkLoadOptions,
   iconSetForFile,
   isCdevStyleType,
+  isVolumeDesktopFile,
   shouldReadIconFork,
 } from './icon-cache';
 import { CDEV_ICON_ID, CUSTOM_ICON_ID, IconSize } from './resource-types/icon-set';
@@ -104,6 +105,15 @@ describe('iconSetForFile', () => {
   });
 });
 
+describe('isVolumeDesktopFile', () => {
+  it('matches the classic Finder Desktop file only', () => {
+    expect(isVolumeDesktopFile('Desktop', 'FNDR', 'ERIK')).toBe(true);
+    expect(isVolumeDesktopFile('Desktop DB', 'FNDR', 'ERIK')).toBe(false);
+    expect(isVolumeDesktopFile('Desktop', 'TEXT', 'ERIK')).toBe(false);
+    expect(isVolumeDesktopFile('Desktop', 'FNDR', 'MACS')).toBe(false);
+  });
+});
+
 describe('shouldReadIconFork', () => {
   it('skips ordinary documents with no bundle or custom-icon flag', () => {
     expect(shouldReadIconFork(finder('TEXT', 'ttxt'), 'TEXT')).toBe(false);
@@ -124,7 +134,7 @@ describe('shouldReadIconFork', () => {
         small: '/icons/APPL16.png',
         large: '/icons/APPL32.png',
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 });
 
@@ -181,5 +191,159 @@ describe('IconCache.getForNode', () => {
     });
     expect(names).toEqual(['Icon\r', 'Icon0x0D']);
     expect(urls.large).toMatch(/DIR32\.png/);
+  });
+
+  it('does not read the resource fork of a Desktop FNDR/ERIK file', async () => {
+    const cache = new IconCache();
+    let forks = 0;
+    const file: VNode = {
+      id: 9,
+      parentId: 2,
+      name: 'Desktop',
+      isDir: false,
+      data: new Uint8Array(),
+      resource: new Uint8Array(64),
+      finderInfo: finder('FNDR', 'ERIK'),
+      createDate: 0,
+      modDate: 0,
+      resourceBytes: 50_000,
+    };
+    const urls = await cache.getForNode(file, undefined, async () => {
+      forks += 1;
+      return ResourceFork.fromEntries([entry('ICN#', 128, icn())]);
+    });
+    expect(forks).toBe(0);
+    expect(urls.large).toMatch(/FNDR32\.png/);
+  });
+
+  it('asks AFP GetIcon only after the resource fork has no icon', async () => {
+    const cache = new IconCache();
+    const order: string[] = [];
+    const file: VNode = {
+      id: 9,
+      parentId: 2,
+      name: 'SimpleText',
+      isDir: false,
+      data: new Uint8Array(),
+      resource: new Uint8Array(),
+      finderInfo: finder('APPL', 'ttxt', HAS_BUNDLE),
+      createDate: 0,
+      modDate: 0,
+      resourceBytes: 100,
+    };
+    await cache.getForNode(
+      file,
+      undefined,
+      async () => {
+        order.push('fork');
+        return null;
+      },
+      {
+        loadDesktopIcons: async () => {
+          order.push('desktop');
+          return [{ iconType: 1, data: icn() }];
+        },
+      },
+    );
+    expect(order[0]).toBe('fork');
+    expect(order.indexOf('fork')).toBeLessThan(order.indexOf('desktop'));
+  });
+
+  it('does not call AFP GetIcon when the resource fork already has an icon', async () => {
+    const cache = new IconCache();
+    let desktopCalls = 0;
+    const file: VNode = {
+      id: 9,
+      parentId: 2,
+      name: 'SimpleText',
+      isDir: false,
+      data: new Uint8Array(),
+      resource: new Uint8Array(),
+      finderInfo: finder('APPL', 'ttxt', HAS_BUNDLE),
+      createDate: 0,
+      modDate: 0,
+      resourceBytes: 256,
+    };
+    const rf = ResourceFork.fromEntries([entry('ICN#', 128, icn())]);
+    await cache.getForNode(
+      file,
+      undefined,
+      async () => rf,
+      {
+        loadDesktopIcons: async () => {
+          desktopCalls += 1;
+          return [{ iconType: 1, data: icn() }];
+        },
+      },
+    );
+    expect(desktopCalls).toBe(0);
+  });
+
+  it('skips AFP desktop fetch when the listing signal is already aborted', async () => {
+    const cache = new IconCache();
+    const ac = new AbortController();
+    ac.abort();
+    let desktopCalls = 0;
+    const file: VNode = {
+      id: 9,
+      parentId: 2,
+      name: 'SimpleText',
+      isDir: false,
+      data: new Uint8Array(),
+      resource: new Uint8Array(),
+      finderInfo: finder('APPL', 'ttxt', HAS_BUNDLE),
+      createDate: 0,
+      modDate: 0,
+      resourceBytes: 100,
+    };
+    await expect(
+      cache.getForNode(file, undefined, async () => null, {
+        loadDesktopIcons: async () => {
+          desktopCalls += 1;
+          return null;
+        },
+        signal: ac.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(desktopCalls).toBe(0);
+  });
+
+  it('still reads the resource fork for icl8 after AFP only had B&W', async () => {
+    const cache = new IconCache();
+    const fi = finder('APPL', 'ttxt', HAS_BUNDLE);
+    const base = {
+      parentId: 2,
+      isDir: false as const,
+      data: new Uint8Array(),
+      resource: new Uint8Array(),
+      finderInfo: fi,
+      createDate: 0,
+      modDate: 0,
+    };
+    await cache.getForNode(
+      { ...base, id: 9, name: 'Stub', resourceBytes: 0 },
+      undefined,
+      async () => null,
+      {
+        loadDesktopIcons: async () => [{ iconType: 1, data: icn() }],
+      },
+    );
+    let forks = 0;
+    const rf = ResourceFork.fromEntries([
+      entry('ICN#', 128, icn()),
+      entry('icl8', 128, new Uint8Array(1024)),
+    ]);
+    await cache.getForNode(
+      { ...base, id: 10, name: 'App', resourceBytes: 2048 },
+      undefined,
+      async () => {
+        forks += 1;
+        return rf;
+      },
+      {
+        loadDesktopIcons: async () => [{ iconType: 4, data: new Uint8Array(64) }],
+      },
+    );
+    expect(forks).toBe(1);
   });
 });

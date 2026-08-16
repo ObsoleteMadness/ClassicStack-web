@@ -5,7 +5,8 @@ import { crc16Ibm } from '../protocol/crc16';
 import { decodeMacRoman, encodeMacRoman } from '../protocol/macroman';
 import { decompressClassic, decompressSit5, SitError } from './stuffit-codec';
 import { ostypeFromBytes } from './mac-file';
-import type { ByteRangeReader } from './byte-range';
+import { log } from '../util/logger';
+import { SparseBytes, type ByteRangeReader } from './byte-range';
 
 export type SitFormat = 'classic' | 'sit5';
 
@@ -272,6 +273,17 @@ function walkClassicHeaders(totalSize: number, readHeader: (pos: number) => Uint
   return members;
 }
 
+function logSitCatalogMember(m: SitPackedMember): void {
+  if (m.isFolder) {
+    log.trace(`sit folder “${m.name}”`, 'expand');
+    return;
+  }
+  log.trace(
+    `sit header “${m.name}” rsrc=${m.rsrcClen}/${m.rsrcUlen} data=${m.dataClen}/${m.dataUlen}`,
+    'expand',
+  );
+}
+
 function parseClassic(data: Uint8Array): SitEntry[] {
   const totalSize = Math.min(be32(data, 6), data.length);
   const members = walkClassicHeaders(totalSize, (pos) => data.subarray(pos, pos + SIT_ENTRY));
@@ -289,7 +301,9 @@ async function parseClassicFromReader(read: ByteRangeReader, prefix: Uint8Array,
     pos += SIT_ENTRY;
     const full = path.length ? `${path.join('/')}/${h.name}` : h.name;
     if (h.rsrcFolder === START_FOLDER || h.dataFolder === START_FOLDER) {
-      members.push(packedFolder('classic', full, '    ', '    ', h.finderFlags, h.createDate, h.modDate));
+      const folder = packedFolder('classic', full, '    ', '    ', h.finderFlags, h.createDate, h.modDate);
+      logSitCatalogMember(folder);
+      members.push(folder);
       path.push(h.name);
       continue;
     }
@@ -301,7 +315,9 @@ async function parseClassicFromReader(read: ByteRangeReader, prefix: Uint8Array,
     pos += h.rsrcClen;
     const dataOffset = pos;
     pos += h.dataClen;
-    members.push(memberFromClassic(full, h, rsrcOffset, dataOffset));
+    const member = memberFromClassic(full, h, rsrcOffset, dataOffset);
+    logSitCatalogMember(member);
+    members.push(member);
   }
   return members;
 }
@@ -348,6 +364,7 @@ function finishSitMember(m: SitPackedMember, dPacked: Uint8Array, rPacked: Uint8
 /** Decompress one catalog member through ranged fork reads. */
 export async function extractSitMember(read: ByteRangeReader, m: SitPackedMember): Promise<SitEntry> {
   if (m.isFolder) {
+    log.trace(`sit extract folder “${m.name}”`, 'expand');
     return {
       name: m.name,
       data: new Uint8Array(),
@@ -360,6 +377,10 @@ export async function extractSitMember(read: ByteRangeReader, m: SitPackedMember
       modDate: m.modDate,
     };
   }
+  log.trace(
+    `sit extract “${m.name}” packed rsrc=${m.rsrcClen} data=${m.dataClen}`,
+    'expand',
+  );
   const rPacked = m.rsrcClen > 0 ? await readExact(read, m.rsrcOffset, m.rsrcClen) : new Uint8Array();
   const dPacked = m.dataClen > 0 ? await readExact(read, m.dataOffset, m.dataClen) : new Uint8Array();
   return finishSitMember(m, dPacked, rPacked);
@@ -600,18 +621,23 @@ async function parseSit5FromReader(read: ByteRangeReader, prefix: Uint8Array): P
   while (i < numTotal) {
     const layout = await readSit5LayoutFromReader(read, cursor);
     if (!layout) break;
+    const before = members.length;
     const next = applySit5Layout(layout, cursor, dirs, members, numTotal);
     cursor = next.cursor;
     numTotal = next.numTotal;
-    if (next.consumed) i++;
+    if (next.consumed) {
+      i++;
+      if (members.length > before) logSitCatalogMember(members[members.length - 1]!);
+    }
   }
   return members;
 }
 
 async function readSit5LayoutFromReader(read: ByteRangeReader, cursor: number): Promise<Sit5Layout | null> {
+  const sparse = new SparseBytes(read);
   let want = 256;
   for (;;) {
-    const bytes = await read(cursor, want);
+    const bytes = await sparse.slice(cursor, want);
     if (bytes.length === 0) return null;
     const layout = readSit5Layout(bytes, cursor);
     if (layout) return layout;
@@ -650,8 +676,14 @@ export async function parseStuffItFromReader(
   const prefix = await read(0, 100);
   const unsupported = sitUnsupportedTypeCode(prefix);
   if (unsupported) throw new SitError(`Unsupported type ${unsupported}`, 'unsupported');
-  if (prefix.length >= 22 && isClassic(prefix)) return parseClassicFromReader(read, prefix, fileSize);
-  if (isSit5(prefix)) return parseSit5FromReader(read, prefix);
+  if (prefix.length >= 22 && isClassic(prefix)) {
+    log.trace(`sit catalog classic size=${fileSize ?? be32(prefix, 6)}`, 'expand');
+    return parseClassicFromReader(read, prefix, fileSize);
+  }
+  if (isSit5(prefix)) {
+    log.trace(`sit catalog sit5 entries=${be16(prefix, 92)}`, 'expand');
+    return parseSit5FromReader(read, prefix);
+  }
   return null;
 }
 

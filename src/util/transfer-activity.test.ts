@@ -81,6 +81,17 @@ describe('transferActivity', () => {
     transferActivity.clearFinished();
   });
 
+  it('updates a running job caption without resetting bytes', () => {
+    const id = transferActivity.start({ name: 'Pack.sit', kind: 'file', bytesTotal: 80 });
+    transferActivity.addBytes(id, 20);
+    transferActivity.setDetail(id, 'Reading archive');
+    const job = transferActivity.list().find((j) => j.id === id)!;
+    expect(job.detail).toBe('Reading archive');
+    expect(job.bytesDone).toBe(20);
+    transferActivity.finish(id);
+    transferActivity.clearFinished();
+  });
+
   it('queues nested extract jobs and begins them later', () => {
     const parent = transferActivity.start({ name: 'Pack.sit', kind: 'file', bytesTotal: 80 });
     const [a, b] = transferActivity.startMany([
@@ -100,5 +111,102 @@ describe('transferActivity', () => {
     transferActivity.finish(a!);
     transferActivity.clearFinished();
     expect(transferActivity.list().some((j) => j.id === parent)).toBe(false);
+  });
+
+  it('cancels a queued job without starting it', () => {
+    const id = transferActivity.start({ name: 'Later', kind: 'file', bytesTotal: 8, queued: true });
+    transferActivity.cancel(id);
+    const job = transferActivity.list().find((j) => j.id === id)!;
+    expect(job.status).toBe('cancelled');
+    expect(transferActivity.begin(id)).toBe(false);
+    expect(transferActivity.hasRunning()).toBe(false);
+    transferActivity.finish(id);
+    expect(job.status).toBe('cancelled');
+    transferActivity.clearFinished();
+  });
+
+  it('cancels a running parent and its queued children', () => {
+    const parent = transferActivity.start({ name: 'Pack.sit', kind: 'file', bytesTotal: 80 });
+    const [a, b] = transferActivity.startMany([
+      { name: 'A', kind: 'file', bytesTotal: 4, parentId: parent, queued: true },
+      { name: 'B', kind: 'file', bytesTotal: 5, parentId: parent, queued: true },
+    ]);
+    transferActivity.begin(a!, 'Expanding');
+    transferActivity.cancel(parent);
+    expect(transferActivity.list().find((j) => j.id === parent)?.status).toBe('cancelled');
+    expect(transferActivity.list().find((j) => j.id === a)?.status).toBe('cancelled');
+    expect(transferActivity.list().find((j) => j.id === b)?.status).toBe('cancelled');
+    expect(transferActivity.signal(a!)?.aborted).toBe(true);
+    transferActivity.clearFinished();
+  });
+
+  it('deletes a watched dest file when a cancelled write settles', async () => {
+    const removed: number[] = [];
+    const dest = {
+      async lookup() {
+        return { id: 42, isDir: false };
+      },
+      async remove(id: number) {
+        removed.push(id);
+      },
+    };
+    const id = transferActivity.start({ name: 'ReadMe', kind: 'file', bytesTotal: 100 });
+    transferActivity.watchPartial(id, dest, 2, 'ReadMe');
+    transferActivity.cancel(id);
+    await transferActivity.settle(id, transferActivity.signal(id)!.reason ?? new DOMException('Aborted', 'AbortError'));
+    expect(removed).toEqual([42]);
+    expect(transferActivity.list().find((j) => j.id === id)?.status).toBe('cancelled');
+    transferActivity.clearFinished();
+  });
+
+  it('lists dest names being written into a folder for Finder overlay', () => {
+    const dest = {
+      async lookup() {
+        return undefined;
+      },
+      async remove() {},
+    };
+    const other = {
+      async lookup() {
+        return undefined;
+      },
+      async remove() {},
+    };
+    const file = transferActivity.start({ name: 'ReadMe', kind: 'file', bytesTotal: 100 });
+    transferActivity.setDest(file, dest, 2, 'ReadMe copy');
+    transferActivity.addBytes(file, 40);
+    const folder = transferActivity.start({ name: 'Docs', kind: 'folder', bytesTotal: 200 });
+    transferActivity.setDest(folder, dest, 2, 'Docs');
+    transferActivity.watchPartial(folder, dest, 9, 'inner');
+    expect(transferActivity.writesIn(dest, 2)).toEqual([
+      { jobId: file, name: 'ReadMe copy', kind: 'file', pct: 40, indeterminate: false },
+      { jobId: folder, name: 'Docs', kind: 'folder', pct: 0, indeterminate: false },
+    ]);
+    expect(transferActivity.writesIn(dest, 9)).toEqual([
+      { jobId: folder, name: 'inner', kind: 'file', pct: 0, indeterminate: false },
+    ]);
+    expect(transferActivity.writesIn(other, 2)).toEqual([]);
+    transferActivity.finish(file);
+    transferActivity.finish(folder);
+    expect(transferActivity.writesIn(dest, 2)).toEqual([]);
+    transferActivity.clearFinished();
+  });
+
+  it('does not delete a dest folder registered as the partial', async () => {
+    const removed: number[] = [];
+    const dest = {
+      async lookup() {
+        return { id: 7, isDir: true };
+      },
+      async remove(id: number) {
+        removed.push(id);
+      },
+    };
+    const id = transferActivity.start({ name: 'Docs', kind: 'folder', bytesTotal: 10 });
+    transferActivity.watchPartial(id, dest, 2, 'Docs');
+    transferActivity.cancel(id);
+    await transferActivity.discardPartial(id);
+    expect(removed).toEqual([]);
+    transferActivity.clearFinished();
   });
 });

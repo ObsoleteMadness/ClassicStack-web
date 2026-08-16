@@ -3,14 +3,14 @@
 import { AspSession } from '../asp-client';
 import type { AtpClient } from '../atp-client';
 import * as asp from '../../protocol/asp';
+import * as atp from '../../protocol/atp';
 import * as C from '../../protocol/afp/constants';
 import * as cmd from './commands';
 import { desEncryptBlock } from '../../hash/des';
-import { encodeMacRoman, decodeMacRoman } from '../../protocol/macroman';
-import { be16, be32 } from '../../protocol/binary';
+import { encodeMacRoman } from '../../protocol/macroman';
 import { log } from '../../util/logger';
 import { AsyncSemaphore } from '../../util/async-semaphore';
-import { throwIfAborted } from '../../util/abort';
+import { isAbortError, throwIfAborted } from '../../util/abort';
 
 /** Keep OpenFork sessions (and other long AFP tasks) from flooding a classic server. */
 const MAX_PARALLEL_TASKS = 3;
@@ -47,6 +47,18 @@ function passwordKey(password: string, shiftLeft: boolean): Uint8Array {
   return key;
 }
 
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  if (chunks.length === 1) return chunks[0]!;
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
+
 export class AfpClient {
   sess: AspSession;
   volId = 0;
@@ -65,6 +77,12 @@ export class AfpClient {
   private inFlight = 0;
   private readonly lists = new AsyncSemaphore(MAX_PARALLEL_LISTS);
   private readonly tasks = new AsyncSemaphore(MAX_PARALLEL_TASKS);
+  /** VolumeID → DTRefNum (Netatalk uses the same value). */
+  private readonly dtRefs = new Map<number, number>();
+  private readonly dtUnavailable = new Set<number>();
+  private readonly desktopInfo = new Map<string, cmd.DesktopIconInfo[]>();
+  private readonly desktopInfoInflight = new Map<string, Promise<cmd.DesktopIconInfo[] | null>>();
+  private readonly desktopIconInflight = new Map<string, Promise<{ iconType: number; data: Uint8Array }[] | null>>();
 
   private constructor(sess: AspSession) {
     this.sess = sess;
@@ -105,37 +123,14 @@ export class AfpClient {
   }
 
   private fpDetail(block: Uint8Array): string {
-    const op = block[0] ?? 0;
-    try {
-      if (op === C.CmdEnumerate && block.length >= 16) {
-        return ` vol=${be16(block, 2)} did=${be32(block, 4)} start=${be16(block, 14)} n=${be16(block, 12)}`;
-      }
-      if (op === C.CmdOpenFork && block.length >= 13) {
-        return ` ${block[1]! & 0x80 ? 'rsrc' : 'data'} did=${be32(block, 4)}`;
-      }
-      if ((op === C.CmdRead || op === C.CmdWrite) && block.length >= 12) {
-        return ` fork=${be16(block, 2)} off=${be32(block, 4)} n=${be32(block, 8)}`;
-      }
-      if (op === C.CmdOpenVol && block.length >= 5) {
-        const n = block[4]!;
-        return ` “${decodeMacRoman(block.subarray(5, 5 + n))}”`;
-      }
-      if (op === C.CmdCloseFork && block.length >= 4) {
-        return ` fork=${be16(block, 2)}`;
-      }
-      if (op === C.CmdGetFileDirParms && block.length >= 12) {
-        return ` did=${be32(block, 4)}`;
-      }
-    } catch {
-      /* keep name only */
-    }
-    return '';
+    return cmd.afpRequestDetail(block);
   }
 
   private async fp(
     block: Uint8Array,
-    opts?: { bitmap?: number; timeoutMs?: number },
+    opts?: { bitmap?: number; timeoutMs?: number; signal?: AbortSignal },
   ): Promise<{ result: number; data: Uint8Array }> {
+    throwIfAborted(opts?.signal);
     const name = C.afpCmdName(block[0] ?? 0);
     const detail = this.fpDetail(block);
     this.inFlight++;
@@ -225,6 +220,7 @@ export class AfpClient {
     node: number,
     socket: number,
   ): Promise<AfpServerInfo> {
+    log.trace(`probe n=${network} node=${node} sock=${socket}`, 'afp');
     const sess = new AspSession(atp, network, node, socket);
     const status = await sess.getStatus();
     const info = cmd.parseServerInfo(status);
@@ -241,6 +237,7 @@ export class AfpClient {
     node: number,
     socket: number,
   ): Promise<AfpClient> {
+    log.trace(`openSession n=${network} node=${node} sock=${socket}`, 'afp');
     const sess = new AspSession(atp, network, node, socket);
     const status = await sess.getStatus();
     const info = cmd.parseServerInfo(status);
@@ -270,6 +267,7 @@ export class AfpClient {
     socket: number,
     volume?: string,
   ): Promise<AfpClient> {
+    log.trace(`connect n=${network} node=${node} sock=${socket}`, 'afp');
     const client = await AfpClient.openSession(atp, network, node, socket);
     await client.login({ kind: 'guest' });
     const volName = volume ?? client.volumes[0]?.name;
@@ -279,6 +277,7 @@ export class AfpClient {
   }
 
   async login(creds: AfpCredentials): Promise<void> {
+    log.trace(creds.kind === 'guest' ? 'login guest' : `login user “${creds.username}”`, 'afp');
     if (creds.kind === 'guest') {
       const uam = cmd.pickGuestUam(this.uams);
       log.info(`FPLogin guest (${this.version}, ${uam})`, 'afp');
@@ -357,6 +356,7 @@ export class AfpClient {
   }
 
   async refreshVolumes(): Promise<{ flags: number; name: string }[]> {
+    log.trace('refreshVolumes', 'afp');
     const parms = await this.fp(cmd.getSrvrParms());
     if (parms.result !== C.NoErr) {
       throw new Error(`FPGetSrvrParms ${C.afpResultName(parms.result)} (${parms.result})`);
@@ -377,6 +377,7 @@ export class AfpClient {
   }
 
   async openVolume(name: string): Promise<number> {
+    log.trace(`openVolume “${name}”`, 'afp');
     const already = this.openVolIds.get(name);
     if (already != null) {
       this.volId = already;
@@ -429,6 +430,7 @@ export class AfpClient {
     onBatch?: (batch: cmd.DirEntry[]) => void | Promise<void>,
     signal?: AbortSignal,
   ): Promise<cmd.DirEntry[]> {
+    log.trace(`list did=${dirId} path=“${path}” vol=${this.vid(volId)}`, 'afp');
     return this.lists.run(() => this.listUnlocked(dirId, path, volId, onBatch, signal), signal);
   }
 
@@ -472,6 +474,7 @@ export class AfpClient {
     volId?: number,
     signal?: AbortSignal,
   ): Promise<cmd.DirEntry | undefined> {
+    log.trace(`stat did=${dirId} path=“${path}” vol=${this.vid(volId)}`, 'afp');
     return this.tasks.run(() => this.statUnlocked(dirId, path, volId), signal);
   }
 
@@ -497,8 +500,9 @@ export class AfpClient {
   private async withOpenFork<T>(
     openCmd: Uint8Array,
     fn: (forkRef: number) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
-    const open = await this.fp(openCmd);
+    const open = await this.fp(openCmd, { signal });
     if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
     const { forkRef } = cmd.parseOpenFork(open.data);
     try {
@@ -519,6 +523,42 @@ export class AfpClient {
   }
 
   /**
+   * FPRead of exactly `count` (short at EOF). Each Command is at most one ASP
+   * quantum; ATP bitmap matches the payload so System 7 replies without EOM
+   * still complete.
+   */
+  private async readForkRange(
+    forkRef: number,
+    offset: number,
+    count: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
+    throwIfAborted(signal);
+    if (count <= 0) return new Uint8Array();
+    const chunks: Uint8Array[] = [];
+    let got = 0;
+    while (got < count) {
+      throwIfAborted(signal);
+      const n = Math.min(asp.QuantumSize, count - got);
+      const rr = await this.fp(cmd.readFork(forkRef, offset + got, n), {
+        bitmap: atp.bitmapForPayload(n),
+        signal,
+      });
+      if (rr.result === C.ErrEOFErr) {
+        if (rr.data.length) chunks.push(rr.data);
+        break;
+      }
+      if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
+      if (rr.data.length === 0) break;
+      chunks.push(rr.data);
+      got += rr.data.length;
+      if (rr.data.length < n) break;
+    }
+    if (chunks.length === 0) return new Uint8Array();
+    return concatChunks(chunks);
+  }
+
+  /**
    * Open a fork and run ranged FPReads (header / map / selected resources).
    */
   async withForkReader<T>(
@@ -529,6 +569,10 @@ export class AfpClient {
     volId?: number,
     signal?: AbortSignal,
   ): Promise<T> {
+    log.trace(
+      `withForkReader “${path}” did=${dirId} ${resource ? 'rsrc' : 'data'} vol=${this.vid(volId)}`,
+      'afp',
+    );
     return this.tasks.run(
       () => this.withForkReaderUnlocked(path, dirId, resource, fn, volId, signal),
       signal,
@@ -548,51 +592,28 @@ export class AfpClient {
     return this.withOpenFork(
       cmd.openFork(this.vid(volId), dirId, 0, C.AccessRead, flag, path),
       async (forkRef) => {
-        const read = async (offset: number, count: number): Promise<Uint8Array> => {
-          throwIfAborted(signal);
-          if (count <= 0) return new Uint8Array();
-          const chunks: Uint8Array[] = [];
-          let got = 0;
-          while (got < count) {
-            const n = Math.min(4096, count - got);
-            const bitmap = n <= 578 ? 0x01 : 0xff;
-            const rr = await this.fp(cmd.readFork(forkRef, offset + got, n), { bitmap });
-            if (rr.result === C.ErrEOFErr) {
-              if (rr.data.length) chunks.push(rr.data);
-              break;
-            }
-            if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
-            if (rr.data.length === 0) break;
-            chunks.push(rr.data);
-            got += rr.data.length;
-            if (rr.data.length < n) break;
-          }
-          if (chunks.length === 1) return chunks[0]!;
-          const total = chunks.reduce((n, c) => n + c.length, 0);
-          const out = new Uint8Array(total);
-          let o = 0;
-          for (const c of chunks) {
-            out.set(c, o);
-            o += c.length;
-          }
-          return out;
-        };
+        const read = (offset: number, count: number) =>
+          this.readForkRange(forkRef, offset, count, signal);
         return await fn(read);
       },
+      signal,
     );
   }
 
   async mkdir(name: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
+    log.trace(`mkdir “${name}” did=${dirId} vol=${this.vid(volId)}`, 'afp');
     const r = await this.fp(cmd.createDir(this.vid(volId), dirId, name));
     if (r.result !== C.NoErr) throw new Error(`FPCreateDir ${r.result}`);
   }
 
   async remove(path: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
+    log.trace(`remove “${path}” did=${dirId} vol=${this.vid(volId)}`, 'afp');
     const r = await this.fp(cmd.deletePath(this.vid(volId), dirId, path));
     if (r.result !== C.NoErr) throw new Error(`FPDelete ${r.result}`);
   }
 
   async rename(path: string, newName: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
+    log.trace(`rename “${path}” → “${newName}” did=${dirId} vol=${this.vid(volId)}`, 'afp');
     const r = await this.fp(cmd.rename(this.vid(volId), dirId, path, newName));
     if (r.result !== C.NoErr) throw new Error(`FPRename ${r.result}`);
   }
@@ -604,6 +625,10 @@ export class AfpClient {
     newName: string,
     volId?: number,
   ): Promise<void> {
+    log.trace(
+      `moveAndRename “${srcName}” src=${srcDir} dst=${dstDir} “${newName}” vol=${this.vid(volId)}`,
+      'afp',
+    );
     const r = await this.fp(cmd.moveAndRename(this.vid(volId), srcDir, srcName, dstDir, newName));
     if (r.result !== C.NoErr) {
       throw new Error(`FPMoveAndRename ${C.afpResultName(r.result)} (${r.result})`);
@@ -618,6 +643,10 @@ export class AfpClient {
     onBytes?: (n: number) => void,
     signal?: AbortSignal,
   ): Promise<Uint8Array> {
+    log.trace(
+      `readFile “${path}” did=${dirId} ${resource ? 'rsrc' : 'data'} vol=${this.vid(volId)}`,
+      'afp',
+    );
     return this.tasks.run(() => this.readFileUnlocked(path, dirId, resource, volId, onBytes, signal), signal);
   }
 
@@ -649,7 +678,11 @@ export class AfpClient {
         let offset = 0;
         for (;;) {
           throwIfAborted(signal);
-          const rr = await this.fp(cmd.readFork(forkRef, offset, 4096), { bitmap: 0xff });
+          const n = asp.QuantumSize;
+          const rr = await this.fp(cmd.readFork(forkRef, offset, n), {
+            bitmap: atp.bitmapForPayload(n),
+            signal,
+          });
           if (rr.result === C.ErrEOFErr) {
             if (rr.data.length) {
               chunks.push(rr.data);
@@ -662,16 +695,9 @@ export class AfpClient {
           chunks.push(rr.data);
           onBytes?.(rr.data.length);
           offset += rr.data.length;
-          if (rr.data.length < 4096) break;
+          if (rr.data.length < n) break;
         }
-        const total = chunks.reduce((n, c) => n + c.length, 0);
-        const out = new Uint8Array(total);
-        let o = 0;
-        for (const c of chunks) {
-          out.set(c, o);
-          o += c.length;
-        }
-        return out;
+        return concatChunks(chunks);
       },
     );
   }
@@ -685,6 +711,10 @@ export class AfpClient {
     onBytes?: (n: number) => void,
     signal?: AbortSignal,
   ): Promise<void> {
+    log.trace(
+      `writeFile “${path}” did=${dirId} ${resource ? 'rsrc' : 'data'} ${data.length}b vol=${this.vid(volId)}`,
+      'afp',
+    );
     return this.tasks.run(() => this.writeFileUnlocked(path, data, dirId, resource, volId, onBytes, signal), signal);
   }
 
@@ -707,8 +737,7 @@ export class AfpClient {
     await this.withOpenFork(
       cmd.openFork(vol, dirId, 0, C.AccessRead | C.AccessWrite, flag, path),
       async (forkRef) => {
-        // ASP Write quantum; keep under ATP multi-packet budget (ClassicStack QuantumSize).
-        const chunkSize = 4096;
+        const chunkSize = asp.QuantumSize;
         let offset = 0;
         while (offset < data.length) {
           throwIfAborted(signal);
@@ -724,6 +753,158 @@ export class AfpClient {
     );
   }
 
+  async openDesktop(volId?: number, signal?: AbortSignal): Promise<number> {
+    throwIfAborted(signal);
+    const vol = this.vid(volId);
+    if (!vol) return 0;
+    if (this.dtUnavailable.has(vol)) return 0;
+    const existing = this.dtRefs.get(vol);
+    if (existing) return existing;
+    const r = await this.fp(cmd.openDT(vol), { signal });
+    if (r.result !== C.NoErr) {
+      log.trace(`FPOpenDT ${C.afpResultName(r.result)}`, 'afp');
+      this.dtUnavailable.add(vol);
+      return 0;
+    }
+    const dtRef = cmd.parseOpenDT(r.data) || vol;
+    this.dtRefs.set(vol, dtRef);
+    return dtRef;
+  }
+
+  private desktopMiss(result: number): boolean {
+    return (
+      result === C.ErrItemNotFound ||
+      result === C.ErrObjectNotFnd ||
+      result === C.ErrCallNotSuppt ||
+      result === C.ErrParamErr
+    );
+  }
+
+  /** If `work` was cancelled for a different listing, start over; otherwise return/throw. */
+  private async takeDesktopWork<T>(work: Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
+    try {
+      const value = await work;
+      throwIfAborted(signal);
+      return value;
+    } catch (err) {
+      if (isAbortError(err) && signal && !signal.aborted) return undefined;
+      throw err;
+    }
+  }
+
+  private async iconInfoForCreator(
+    dtRef: number,
+    creator: string,
+    vol: number,
+    signal?: AbortSignal,
+  ): Promise<cmd.DesktopIconInfo[] | null> {
+    throwIfAborted(signal);
+    const key = `${vol}:${creator.padEnd(4, ' ').slice(0, 4)}`;
+    const hit = this.desktopInfo.get(key);
+    if (hit) return hit;
+    for (;;) {
+      throwIfAborted(signal);
+      const pending = this.desktopInfoInflight.get(key);
+      if (pending) {
+        const joined = await this.takeDesktopWork(pending, signal);
+        if (joined !== undefined) return joined;
+        continue;
+      }
+      const work = this.iconInfoForCreatorUnlocked(dtRef, creator, key, signal);
+      this.desktopInfoInflight.set(key, work);
+      void work.finally(() => {
+        if (this.desktopInfoInflight.get(key) === work) this.desktopInfoInflight.delete(key);
+      });
+      const got = await this.takeDesktopWork(work, signal);
+      if (got !== undefined) return got;
+    }
+  }
+
+  private async iconInfoForCreatorUnlocked(
+    dtRef: number,
+    creator: string,
+    cacheKey: string,
+    signal?: AbortSignal,
+  ): Promise<cmd.DesktopIconInfo[] | null> {
+    const infos: cmd.DesktopIconInfo[] = [];
+    for (let index = 1; index <= 64; index++) {
+      throwIfAborted(signal);
+      const r = await this.fp(cmd.getIconInfo(dtRef, creator, index), { signal });
+      if (r.result === C.ErrItemNotFound || r.result === C.ErrObjectNotFnd) break;
+      if (this.desktopMiss(r.result) && r.result !== C.NoErr) {
+        this.desktopInfo.set(cacheKey, infos);
+        return infos.length ? infos : null;
+      }
+      if (r.result !== C.NoErr) break;
+      const info = cmd.parseGetIconInfo(r.data);
+      if (!info) break;
+      infos.push(info);
+    }
+    this.desktopInfo.set(cacheKey, infos);
+    return infos;
+  }
+
+  /**
+   * Volume Desktop DB bitmaps for a type/creator. Used when the resource fork
+   * (or Icon\\r) did not yield an icon. Classic AppleShare often only has ICN#.
+   */
+  async loadDesktopIcons(
+    type: string,
+    creator: string,
+    volId?: number,
+    signal?: AbortSignal,
+  ): Promise<{ iconType: number; data: Uint8Array }[] | null> {
+    throwIfAborted(signal);
+    const vol = this.vid(volId);
+    const cacheKey = `${vol}:${creator.padEnd(4, ' ').slice(0, 4)}|${type.padEnd(4, ' ').slice(0, 4)}`;
+    for (;;) {
+      throwIfAborted(signal);
+      const pending = this.desktopIconInflight.get(cacheKey);
+      if (pending) {
+        const joined = await this.takeDesktopWork(pending, signal);
+        if (joined !== undefined) return joined;
+        continue;
+      }
+      const work = this.loadDesktopIconsUnlocked(type, creator, volId, signal);
+      this.desktopIconInflight.set(cacheKey, work);
+      void work.finally(() => {
+        if (this.desktopIconInflight.get(cacheKey) === work) this.desktopIconInflight.delete(cacheKey);
+      });
+      const got = await this.takeDesktopWork(work, signal);
+      if (got !== undefined) return got;
+    }
+  }
+
+  private async loadDesktopIconsUnlocked(
+    type: string,
+    creator: string,
+    volId?: number,
+    signal?: AbortSignal,
+  ): Promise<{ iconType: number; data: Uint8Array }[] | null> {
+    const dtRef = await this.openDesktop(volId, signal);
+    if (!dtRef) return null;
+    const vol = this.vid(volId);
+    let infos: cmd.DesktopIconInfo[] | null = null;
+    try {
+      infos = await this.iconInfoForCreator(dtRef, creator, vol, signal);
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      infos = null;
+    }
+    const want = cmd.desktopIconsToFetch(infos, type);
+    const out: { iconType: number; data: Uint8Array }[] = [];
+    for (const spec of want) {
+      throwIfAborted(signal);
+      const r = await this.fp(cmd.getIcon(dtRef, creator, type, spec.iconType, spec.size), { signal });
+      if (r.result === C.NoErr && r.data.length) {
+        out.push({ iconType: spec.iconType, data: r.data });
+        continue;
+      }
+      if (!this.desktopMiss(r.result) && r.result !== C.NoErr) break;
+    }
+    return out.length ? out : null;
+  }
+
   async setFinderInfo(
     path: string,
     finderInfo: Uint8Array,
@@ -731,6 +912,7 @@ export class AfpClient {
     volId?: number,
     dates?: { createDate?: number; modDate?: number },
   ): Promise<void> {
+    log.trace(`setFinderInfo “${path}” did=${dirId} vol=${this.vid(volId)}`, 'afp');
     let bitmap = C.FDBitmapFinderInfo;
     if (dates?.createDate) bitmap |= C.FDBitmapCreateDate;
     if (dates?.modDate) bitmap |= C.FDBitmapModDate;
@@ -739,6 +921,13 @@ export class AfpClient {
   }
 
   async close(): Promise<void> {
+    log.trace('close', 'afp');
+    for (const dtRef of this.dtRefs.values()) {
+      await this.fp(cmd.closeDT(dtRef)).catch(() => undefined);
+    }
+    this.dtRefs.clear();
+    this.dtUnavailable.clear();
+    this.desktopInfo.clear();
     if (this.loggedIn) {
       await this.fp(cmd.logout()).catch(() => undefined);
       this.loggedIn = false;

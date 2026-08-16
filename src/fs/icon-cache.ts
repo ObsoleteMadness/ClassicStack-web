@@ -8,7 +8,7 @@ import { openDB, type IDBPDatabase } from './idb-shim';
 import { ResourceFork, type FinderIconForkOpts } from './resource-fork';
 import { forkBytesFromNode } from './resource-inspect';
 import { parseBndl } from './resource-types/bndl';
-import { decodedIconToDataUrl } from './resource-types/icon-decoder';
+import { decodedIconToDataUrl, decodeDesktopIcon } from './resource-types/icon-decoder';
 import {
   CDEV_ICON_ID,
   CUSTOM_ICON_ID,
@@ -18,6 +18,17 @@ import {
 } from './resource-types/icon-set';
 import type { VNode } from './virtual-fs';
 import { escapeHostFilename } from '../protocol/host-filename';
+import { isAbortError, throwIfAborted } from '../util/abort';
+import {
+  HAS_BUNDLE,
+  HAS_CUSTOM_ICON,
+  FINDER_IS_INVISIBLE,
+  finderFlags,
+  finderIconId,
+  isFinderInvisible,
+} from './finder-info';
+
+export { HAS_BUNDLE, HAS_CUSTOM_ICON, FINDER_IS_INVISIBLE, finderFlags, isFinderInvisible, finderIconId };
 
 export const CUSTOM_FOLDER_ICON_NAME = 'Icon\r';
 /** Host-escaped form of Icon\\r (ClassicStack reserved-char token). */
@@ -29,17 +40,22 @@ export function isCustomFolderIconName(name: string): boolean {
 
 const ICON_CACHE_DB = 'classicstack-icon-cache';
 /** Bump when decoded-icon preference or extract rules change so stale BW PNGs are dropped. */
-const ICON_CACHE_DB_VERSION = 3;
-/** Finder FileInfo/DInfo: custom icon (Icon\\r or id -16455). */
-export const HAS_CUSTOM_ICON = 0x0400;
-/** Finder FileInfo: BNDL resources in the file's resource fork. */
-export const HAS_BUNDLE = 0x2000;
-/** Finder FileInfo/DInfo flag: item is invisible (AppleDouble FinderInfo). */
-export const FINDER_IS_INVISIBLE = 0x4000;
+const ICON_CACHE_DB_VERSION = 4;
 
 export interface IconUrls {
   small: string;
   large: string;
+}
+
+export type DesktopIconBlob = { iconType: number; data: Uint8Array };
+
+export interface IconLookupExtras {
+  loadDesktopIcons?: (
+    type: string,
+    creator: string,
+    signal?: AbortSignal,
+  ) => Promise<DesktopIconBlob[] | null>;
+  signal?: AbortSignal;
 }
 
 interface BundleCacheEntry {
@@ -61,23 +77,13 @@ export function readTypeCreator(finderInfo: Uint8Array): { type: string; creator
   return { type: padOsType(type), creator: padOsType(creator) };
 }
 
-export function finderFlags(finderInfo: Uint8Array): number {
-  return ((finderInfo[8] ?? 0) << 8) | (finderInfo[9] ?? 0);
-}
-
-/** True when FinderInfo has kIsInvisible. */
-export function isFinderInvisible(finderInfo: Uint8Array): boolean {
-  return (finderFlags(finderInfo) & FINDER_IS_INVISIBLE) !== 0;
-}
-
-function finderIconId(finderInfo: Uint8Array): number {
-  const hi = finderInfo[16] ?? 0;
-  const lo = finderInfo[17] ?? 0;
-  return (((hi << 8) | lo) << 16) >> 16;
-}
-
 function cacheKey(creator: string, type: string): string {
   return `${padOsType(creator)}|${padOsType(type)}`;
+}
+
+/** Classic Finder volume Desktop file (FNDR/ERIK); later a volume icon cache, not a glyph source. */
+export function isVolumeDesktopFile(name: string, type: string, creator: string): boolean {
+  return name === 'Desktop' && padOsType(type) === 'FNDR' && padOsType(creator) === 'ERIK';
 }
 
 /** Control panels, extensions, and chooser devices store their icon at -4064. */
@@ -95,7 +101,7 @@ export function shouldReadIconFork(
 ): boolean {
   const flags = finderFlags(finderInfo);
   if ((flags & HAS_CUSTOM_ICON) !== 0) return true;
-  if (cached) return false;
+  if (cached && !isSystemIconUrls(cached)) return false;
   const t = padOsType(type);
   return (flags & HAS_BUNDLE) !== 0 || t === 'APPL' || isCdevStyleType(t);
 }
@@ -225,8 +231,15 @@ async function resolveFolderIcon(size: 16 | 32): Promise<string> {
 }
 
 async function iconSetToUrls(set: IconSet): Promise<IconUrls | null> {
-  const smallIcon = set.getIconBySize(IconSize.Small) ?? set.getIconBySize(IconSize.Large);
-  const largeIcon = set.getIconBySize(IconSize.Large) ?? set.getIconBySize(IconSize.Small);
+  const largeIcon =
+    set.getIconBySize(IconSize.Large, true) ??
+    set.getIconBySize(IconSize.Large, false) ??
+    set.getIconBySize(IconSize.Small, true) ??
+    set.getIconBySize(IconSize.Small, false);
+  const smallIcon =
+    set.getIconBySize(IconSize.Small, true) ??
+    set.getIconBySize(IconSize.Small, false) ??
+    largeIcon;
   if (!smallIcon && !largeIcon) return null;
   const small = smallIcon ? await decodedIconToDataUrl(smallIcon) : null;
   const large = largeIcon ? await decodedIconToDataUrl(largeIcon) : null;
@@ -237,12 +250,20 @@ async function iconSetToUrls(set: IconSet): Promise<IconUrls | null> {
   };
 }
 
+function iconSetHasColor(set: IconSet): boolean {
+  return set.icons.some((icon) => icon.isColor);
+}
+
 export class IconCache {
   private memory = new Map<string, IconUrls>();
   private bundleCache = new Map<string, BundleCacheEntry>();
   private dirMemory = new Map<string, IconUrls>();
+  private desktopMemory = new Map<string, IconUrls>();
   private typeInflight = new Map<string, Promise<IconUrls>>();
   private dirInflight = new Map<string, Promise<IconUrls>>();
+  private desktopInflight = new Map<string, Promise<IconUrls | null>>();
+  /** Type/creator keys whose cached glyph came from an 8-bit/cicn family (not ICN# / AFP B&W). */
+  private colorKeys = new Set<string>();
   private db: IDBPDatabase | null = null;
   private initPromise: Promise<void> | null = null;
   private systemReady: Promise<void> | null = null;
@@ -280,8 +301,11 @@ export class IconCache {
     this.memory.clear();
     this.bundleCache.clear();
     this.dirMemory.clear();
+    this.desktopMemory.clear();
+    this.colorKeys.clear();
     this.typeInflight.clear();
     this.dirInflight.clear();
+    this.desktopInflight.clear();
     await this.init();
     if (!this.db) return;
     await this.clearStore('typeIcons');
@@ -313,15 +337,24 @@ export class IconCache {
   }
 
   private async persist(key: string, urls: IconUrls): Promise<void> {
-    await this.init();
-    await this.db?.put('typeIcons', { key, small: urls.small, large: urls.large });
+    try {
+      await this.init();
+      await this.db?.put('typeIcons', { key, small: urls.small, large: urls.large });
+    } catch {
+      /* private mode / tests without IndexedDB */
+    }
   }
 
   private async loadPersisted(key: string): Promise<IconUrls | null> {
-    await this.init();
-    const row = await this.db?.get('typeIcons', key);
-    if (!row) return null;
-    return { small: row.small as string, large: row.large as string };
+    try {
+      await this.init();
+      const row = await this.db?.get('typeIcons', key);
+      if (!row) return null;
+      this.colorKeys.add(key);
+      return { small: row.small as string, large: row.large as string };
+    } catch {
+      return null;
+    }
   }
 
   /** Resolve icons for a VirtualFS node (local share or remote AFP). */
@@ -329,25 +362,47 @@ export class IconCache {
     node: VNode,
     findChild?: (parentId: number, name: string) => Promise<VNode | undefined>,
     loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
+    extras?: IconLookupExtras,
   ): Promise<IconUrls> {
     await this.ensureDefaults();
     if (node.isDir) {
       return this.getForDirectory(String(node.id), node, findChild, loadIconFork);
     }
     const { type, creator } = readTypeCreator(node.finderInfo);
+    if (isVolumeDesktopFile(node.name, type, creator)) {
+      return this.getForTypeCreator(type, creator);
+    }
     const key = cacheKey(creator, type);
     const cached = this.memory.get(key) ?? (await this.loadPersisted(key));
     if (cached) this.memory.set(key, cached);
     const custom = (finderFlags(node.finderInfo) & HAS_CUSTOM_ICON) !== 0;
-    if (cached && !custom) return cached;
+    if (cached && !custom && this.colorKeys.has(key)) return cached;
 
-    if (!custom) {
+    throwIfAborted(extras?.signal);
+
+    const rsrcHint = node.resourceBytes ?? node.resource.length;
+    const needFork =
+      !!loadIconFork &&
+      (shouldReadIconFork(node.finderInfo, type, this.colorKeys.has(key) ? cached : null) ||
+        rsrcHint >= 16);
+
+    if (!custom && !needFork) {
       const pending = this.typeInflight.get(key);
-      if (pending) return pending;
+      if (pending) {
+        try {
+          const urls = await pending;
+          throwIfAborted(extras?.signal);
+          return urls;
+        } catch (err) {
+          if (!(isAbortError(err) && extras?.signal && !extras.signal.aborted)) {
+            throw err;
+          }
+        }
+      }
     }
 
-    const work = this.resolveFileNode(node, type, creator, cached, loadIconFork);
-    if (!custom) {
+    const work = this.resolveFileNode(node, type, creator, cached, loadIconFork, extras);
+    if (!custom && !needFork) {
       this.typeInflight.set(key, work);
       void work.finally(() => {
         if (this.typeInflight.get(key) === work) this.typeInflight.delete(key);
@@ -362,17 +417,25 @@ export class IconCache {
     creator: string,
     cached: IconUrls | null,
     loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
+    extras?: IconLookupExtras,
   ): Promise<IconUrls> {
+    throwIfAborted(extras?.signal);
     let fork: ResourceFork | null = null;
     const rsrcHint = node.resourceBytes ?? node.resource.length;
-    if (loadIconFork && (shouldReadIconFork(node.finderInfo, type, cached) || rsrcHint >= 16)) {
+    if (
+      loadIconFork &&
+      (shouldReadIconFork(node.finderInfo, type, this.colorKeys.has(cacheKey(creator, type)) ? cached : null) ||
+        rsrcHint >= 16)
+    ) {
       try {
+        throwIfAborted(extras?.signal);
         fork = await loadIconFork(node);
-      } catch {
+      } catch (err) {
+        if (isAbortError(err)) throw err;
         fork = null;
       }
     }
-    return this.getForFile({
+    const urls = await this.getForFile({
       type,
       creator,
       resource: node.resource,
@@ -380,6 +443,63 @@ export class IconCache {
       finderInfo: node.finderInfo,
       fork,
     });
+    if (!isSystemIconUrls(urls)) return urls;
+    if (fork && iconSetForFile(fork, type, node.finderInfo)) return urls;
+    const desktop = await this.desktopFallback(type, creator, extras);
+    if (desktop) return desktop;
+    return urls;
+  }
+
+  private async desktopFallback(
+    type: string,
+    creator: string,
+    extras?: IconLookupExtras,
+  ): Promise<IconUrls | null> {
+    if (!extras?.loadDesktopIcons) return null;
+    throwIfAborted(extras.signal);
+    const key = cacheKey(creator, type);
+    const hit = this.desktopMemory.get(key);
+    if (hit) return hit;
+
+    const start = (): Promise<IconUrls | null> => {
+      const work = (async () => {
+        throwIfAborted(extras.signal);
+        try {
+          const blobs = await extras.loadDesktopIcons!(type, creator, extras.signal);
+          throwIfAborted(extras.signal);
+          if (!blobs?.length) return null;
+          const icons = blobs
+            .map((b) => decodeDesktopIcon(b.iconType, b.data))
+            .filter((i): i is NonNullable<typeof i> => i != null);
+          if (!icons.length) return null;
+          const urls = await iconSetToUrls(new IconSet(icons));
+          if (urls) this.desktopMemory.set(key, urls);
+          return urls;
+        } catch (err) {
+          if (isAbortError(err)) throw err;
+          return null;
+        }
+      })();
+      this.desktopInflight.set(key, work);
+      void work.finally(() => {
+        if (this.desktopInflight.get(key) === work) this.desktopInflight.delete(key);
+      });
+      return work;
+    };
+
+    for (;;) {
+      throwIfAborted(extras.signal);
+      const pending = this.desktopInflight.get(key);
+      const work = pending ?? start();
+      try {
+        const urls = await work;
+        throwIfAborted(extras.signal);
+        return urls;
+      } catch (err) {
+        if (isAbortError(err) && extras.signal && !extras.signal.aborted) continue;
+        throw err;
+      }
+    }
   }
 
   /** Resolve icons when only Finder info is known (remote listings). */
@@ -462,7 +582,8 @@ export class IconCache {
             }
           }
         }
-      } catch {
+      } catch (err) {
+        if (isAbortError(err)) throw err;
         /* fall through */
       }
     }
@@ -514,7 +635,7 @@ export class IconCache {
     const rf = forkFromNode(args.resource, args.data, args.fork ?? null);
     const custom = (finderFlags(args.finderInfo) & HAS_CUSTOM_ICON) !== 0;
     const cached = this.memory.get(key) ?? (await this.loadPersisted(key));
-    if (cached && !custom) {
+    if (cached && !custom && this.colorKeys.has(key) && !rf) {
       this.memory.set(key, cached);
       return cached;
     }
@@ -534,8 +655,10 @@ export class IconCache {
 
     try {
       await this.tryBundle(rf, args.type, args.creator, key);
-      const hit = this.memory.get(key);
-      if (hit && !isSystemIconUrls(hit)) return hit;
+      if (this.colorKeys.has(key)) {
+        const hit = this.memory.get(key);
+        if (hit && !isSystemIconUrls(hit)) return hit;
+      }
 
       const set = iconSetForFile(rf, args.type, args.finderInfo);
       if (set) {
@@ -543,7 +666,10 @@ export class IconCache {
         if (urls) {
           if (!custom) {
             this.memory.set(key, urls);
-            await this.persist(key, urls);
+            if (iconSetHasColor(set)) {
+              this.colorKeys.add(key);
+              await this.persist(key, urls);
+            }
           }
           return urls;
         }
@@ -591,7 +717,10 @@ export class IconCache {
       const urls = await iconSetToUrls(set);
       if (!urls) return;
       this.memory.set(k, urls);
-      await this.persist(k, urls);
+      if (iconSetHasColor(set)) {
+        this.colorKeys.add(k);
+        await this.persist(k, urls);
+      }
     };
 
     for (const [ftype, localId] of fref) {
@@ -601,7 +730,7 @@ export class IconCache {
       if (ownerKey !== creator) await persistSet(cacheKey(creator, ftype), set);
     }
 
-    if (this.memory.get(key)) return;
+    if (this.colorKeys.has(key)) return;
     const set = iconSetForFile(rf, type, new Uint8Array(32));
     if (set) await persistSet(key, set);
   }

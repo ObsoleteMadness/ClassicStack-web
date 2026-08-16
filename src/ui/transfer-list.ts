@@ -20,6 +20,7 @@ function jobPct(j: TransferJob): number {
 
 function jobRate(j: TransferJob): string {
   if (j.status === 'queued') return 'Queued';
+  if (j.status === 'cancelled') return 'Cancelled';
   if (j.status === 'running' && j.rate > 0) return formatBytesPerSec(j.rate);
   if (j.status === 'error') return 'Failed';
   if (j.status === 'done') return 'Done';
@@ -38,6 +39,15 @@ function structureKey(jobs: TransferJob[]): string {
   return jobs.map((j) => `${j.id}:${j.parentId ?? ''}`).join(',');
 }
 
+function canCancel(j: TransferJob): boolean {
+  return j.status === 'running' || j.status === 'queued';
+}
+
+function cancelBtnHtml(j: TransferJob): string {
+  if (!canCancel(j)) return '';
+  return `<button type="button" class="file-transfer__cancel" data-act="cancel-transfer" data-job="${escapeHtml(j.id)}" aria-label="Cancel ${escapeHtml(j.name)}" title="Cancel">✕</button>`;
+}
+
 function rowHtml(j: TransferJob, nested = false): string {
   const pct = jobPct(j);
   const err = j.error ? `<div class="file-transfer__error">${escapeHtml(j.error)}</div>` : '';
@@ -47,13 +57,20 @@ function rowHtml(j: TransferJob, nested = false): string {
       : `<img class="file-transfer__icon" src="${escapeHtml(j.iconSrc)}" alt="" width="16" height="16" />`;
   const nestClass = nested ? ' file-transfer--sub' : '';
   const statusClass =
-    j.status === 'error' ? ' file-transfer--error' : j.status === 'queued' ? ' file-transfer--queued' : '';
+    j.status === 'error'
+      ? ' file-transfer--error'
+      : j.status === 'queued'
+        ? ' file-transfer--queued'
+        : j.status === 'cancelled'
+          ? ' file-transfer--cancelled'
+          : '';
   return `<div class="file-transfer${nestClass}${statusClass}" data-id="${escapeHtml(j.id)}">
       ${icon}
       <div class="file-transfer__main">
         <div class="file-transfer__top">
           <span class="file-transfer__name" title="${escapeHtml(j.name)}" aria-label="${escapeHtml(j.name)}">${escapeHtml(j.name)}</span>
           <span class="file-transfer__rate">${escapeHtml(jobRate(j))}</span>
+          ${cancelBtnHtml(j)}
         </div>
         <div class="file-transfer__bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}">
           <div class="file-transfer__bar-fill" style="width:${pct}%"></div>
@@ -76,6 +93,14 @@ function paintRow(row: HTMLElement, j: TransferJob): void {
   if (meta) meta.textContent = jobSize(j);
   row.classList.toggle('file-transfer--error', j.status === 'error');
   row.classList.toggle('file-transfer--queued', j.status === 'queued');
+  row.classList.toggle('file-transfer--cancelled', j.status === 'cancelled');
+  const top = row.querySelector('.file-transfer__top');
+  let cancel = row.querySelector('.file-transfer__cancel');
+  if (canCancel(j)) {
+    if (!cancel && top) top.insertAdjacentHTML('beforeend', cancelBtnHtml(j));
+  } else {
+    cancel?.remove();
+  }
   let err = row.querySelector('.file-transfer__error');
   if (j.error) {
     if (!err) {

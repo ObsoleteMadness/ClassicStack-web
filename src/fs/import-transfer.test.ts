@@ -224,6 +224,73 @@ describe('importExpandedTree', () => {
     ]);
     expect(started).toEqual(['A', 'Folder/B']);
   });
+
+  it('skips an extracted file whose nested job was cancelled', async () => {
+    const { fs, created } = mockCatalog();
+    const ac = new AbortController();
+    ac.abort();
+    await importExpandedTree(
+      fs,
+      2,
+      [
+        {
+          kind: 'file',
+          name: 'Keep',
+          data: Uint8Array.of(1),
+          resource: new Uint8Array(),
+          finderInfo: makeFinderInfo('TEXT', 'ttxt'),
+        },
+        {
+          kind: 'file',
+          name: 'Skip',
+          data: Uint8Array.of(2),
+          resource: new Uint8Array(),
+          finderInfo: makeFinderInfo('TEXT', 'ttxt'),
+        },
+      ],
+      {
+        onExpand: (item) => (item.name === 'Skip' ? { signal: ac.signal } : {}),
+      },
+    );
+    expect(created.map((n) => n.name)).toEqual(['Keep']);
+  });
+
+  it('deletes a partial dest file when an extracted write is aborted', async () => {
+    const { fs, created } = mockCatalog();
+    const removed: string[] = [];
+    const ac = new AbortController();
+    const origCreate = fs.createFile.bind(fs);
+    fs.createFile = async (parentId, name, data, resource, finderInfo, onBytes, signal) => {
+      const node = await origCreate(parentId, name, data, resource, finderInfo, onBytes, signal);
+      ac.abort();
+      const err = new Error('Aborted');
+      err.name = 'AbortError';
+      throw err;
+    };
+    await expect(
+      importExpandedTree(
+        fs,
+        2,
+        [
+          {
+            kind: 'file',
+            name: 'ReadMe',
+            data: Uint8Array.of(1, 2, 3),
+            resource: new Uint8Array(),
+            finderInfo: makeFinderInfo('TEXT', 'ttxt'),
+          },
+        ],
+        {
+          signal: ac.signal,
+          removePartial: async (_parentId, name) => {
+            removed.push(name);
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(created.map((n) => n.name)).toEqual(['ReadMe']);
+    expect(removed).toEqual(['ReadMe']);
+  });
 });
 
 describe('hfsTimeToAfp', () => {

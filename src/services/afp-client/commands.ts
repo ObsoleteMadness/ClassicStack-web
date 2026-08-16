@@ -218,6 +218,8 @@ export interface DirEntry {
   createDate: number;
   modDate: number;
   finderInfo: Uint8Array;
+  /** AFP file/dir attribute bits when the attributes bitmap was requested. */
+  attributes?: number;
 }
 
 export function parseEnumerate(b: Uint8Array, fileBitmap: number, dirBitmap: number): DirEntry[] {
@@ -282,7 +284,10 @@ function parseParms(b: Uint8Array, bitmap: number, isDir: boolean): DirEntry {
     modDate: 0,
     finderInfo: new Uint8Array(32),
   };
-  if (bitmap & C.FDBitmapAttributes) o += 2;
+  if (bitmap & C.FDBitmapAttributes) {
+    entry.attributes = be16(b, o);
+    o += 2;
+  }
   if (bitmap & C.FDBitmapParentDID) {
     entry.parentId = be32(b, o);
     o += 4;
@@ -527,6 +532,147 @@ export function parseServerInfo(b: Uint8Array): {
   return { serverName, versions, uams, flags };
 }
 
+function putOSType(out: number[], s: string): void {
+  const t = (s || '????').padEnd(4, ' ').slice(0, 4);
+  const b = encodeMacRoman(t);
+  for (let i = 0; i < 4; i++) out.push(b[i] ?? 0x20);
+}
+
+function readOSType(b: Uint8Array, o: number): string {
+  if (o + 4 > b.length) return '????';
+  return decodeMacRoman(b.subarray(o, o + 4));
+}
+
+function padOsType(s: string): string {
+  return (s || '????').padEnd(4, ' ').slice(0, 4);
+}
+
+/** FPOpenDT: cmd pad VolumeID(2). Reply: DTRefNum(2) — Netatalk echoes VolumeID. */
+export function openDT(volId: number): Uint8Array {
+  const out: number[] = [C.CmdOpenDT, 0];
+  appendBe16(out, volId);
+  return new Uint8Array(out);
+}
+
+export function parseOpenDT(b: Uint8Array): number {
+  if (b.length < 2) return 0;
+  return be16(b, 0);
+}
+
+export function closeDT(dtRef: number): Uint8Array {
+  const out: number[] = [C.CmdCloseDT, 0];
+  appendBe16(out, dtRef);
+  return new Uint8Array(out);
+}
+
+/**
+ * FPGetIcon: cmd pad DTRef(2) creator(4) type(4) iconType(1) pad(1) length(2).
+ * Reply is the raw icon bitmap (often ICN# 256 bytes).
+ */
+export function getIcon(
+  dtRef: number,
+  creator: string,
+  type: string,
+  iconType: number,
+  length: number,
+): Uint8Array {
+  const out: number[] = [C.CmdGetIcon, 0];
+  appendBe16(out, dtRef);
+  putOSType(out, creator);
+  putOSType(out, type);
+  out.push(iconType & 0xff, 0);
+  appendBe16(out, length);
+  return new Uint8Array(out);
+}
+
+/** FPGetIconInfo: cmd pad DTRef(2) creator(4) iconIndex(2). Index is 1-based. */
+export function getIconInfo(dtRef: number, creator: string, iconIndex: number): Uint8Array {
+  const out: number[] = [C.CmdGetIconInfo, 0];
+  appendBe16(out, dtRef);
+  putOSType(out, creator);
+  appendBe16(out, iconIndex);
+  return new Uint8Array(out);
+}
+
+export interface DesktopIconInfo {
+  tag: number;
+  type: string;
+  iconType: number;
+  size: number;
+}
+
+/** Reply: IconTag(4) FileType(4) IconType(1) pad(1) Size(2). */
+export function parseGetIconInfo(b: Uint8Array): DesktopIconInfo | null {
+  if (b.length < 12) return null;
+  const size = be16(b, 10);
+  const iconType = b[8]!;
+  if (!iconType && !size) return null;
+  return {
+    tag: be32(b, 0),
+    type: readOSType(b, 4),
+    iconType,
+    size,
+  };
+}
+
+export function desktopIconLength(iconType: number, fallback = 256): number {
+  switch (iconType) {
+    case C.IconTypeICN:
+      return 256;
+    case C.IconTypeIcl4:
+      return 512;
+    case C.IconTypeIcl8:
+      return 1024;
+    case C.IconTypeIcs:
+      return 64;
+    case C.IconTypeIcs4:
+      return 128;
+    case C.IconTypeIcs8:
+      return 256;
+    default:
+      return fallback;
+  }
+}
+
+const DESKTOP_ICON_PROBE: { iconType: number; size: number }[] = [
+  { iconType: C.IconTypeIcl8, size: 1024 },
+  { iconType: C.IconTypeICN, size: 256 },
+  { iconType: C.IconTypeIcs, size: 64 },
+];
+
+function desktopIconRank(iconType: number): number {
+  const i = DESKTOP_ICON_PROBE.findIndex((p) => p.iconType === iconType);
+  return i < 0 ? DESKTOP_ICON_PROBE.length : i;
+}
+
+/** Icons to FPGetIcon: colour / large first. Always keep a 32px probe if Info only listed ics#. */
+export function desktopIconsToFetch(
+  infos: DesktopIconInfo[] | null | undefined,
+  fileType: string,
+): { iconType: number; size: number }[] {
+  const want = padOsType(fileType);
+  const matches = (infos ?? []).filter((i) => padOsType(i.type) === want && i.iconType);
+  const seen = new Set<number>();
+  const out: { iconType: number; size: number }[] = [];
+  const add = (iconType: number, size: number) => {
+    if (seen.has(iconType)) return;
+    seen.add(iconType);
+    out.push({ iconType, size: size || desktopIconLength(iconType) });
+  };
+  for (const i of [...matches].sort((a, b) => desktopIconRank(a.iconType) - desktopIconRank(b.iconType))) {
+    add(i.iconType, i.size);
+  }
+  if (!out.length) {
+    for (const p of DESKTOP_ICON_PROBE) add(p.iconType, p.size);
+    return out;
+  }
+  const hasLarge = out.some(
+    (i) => i.iconType === C.IconTypeICN || i.iconType === C.IconTypeIcl4 || i.iconType === C.IconTypeIcl8,
+  );
+  if (!hasLarge) add(C.IconTypeICN, 256);
+  return out;
+}
+
 /** FPGetSrvrMsg request: cmd(1) pad(1) messageType(2) bitmap(2). */
 export function getSrvrMsg(messageType: number, bitmap = C.SrvrMsgBitmapText): Uint8Array {
   const out: number[] = [C.CmdGetSrvrMsg, 0];
@@ -544,6 +690,94 @@ export function parseGetSrvrMsg(b: Uint8Array): { messageType: number; bitmap: n
   const n = b[4]!;
   const text = decodeMacRoman(b.subarray(5, 5 + Math.min(n, b.length - 5)));
   return { messageType, bitmap, text };
+}
+
+function readPStringAt(block: Uint8Array, o: number): { s: string; next: number } {
+  if (o >= block.length) return { s: '', next: o };
+  const n = block[o]!;
+  const end = Math.min(block.length, o + 1 + n);
+  return { s: decodeMacRoman(block.subarray(o + 1, end)), next: o + 1 + n };
+}
+
+function cmdPathAt(block: Uint8Array, off: number): string {
+  if (off + 2 > block.length) return '';
+  const n = block[off + 1]!;
+  const raw = decodeMacRoman(block.subarray(off + 2, off + 2 + Math.min(n, block.length - off - 2)));
+  return raw.replace(/\0+/g, '/').replace(/^\/+|\/+$/g, '');
+}
+
+function qpath(block: Uint8Array, off: number): string {
+  const p = cmdPathAt(block, off);
+  return p ? ` “${p}”` : '';
+}
+
+/** Extra fields for AFP command traces (no password bytes). */
+export function afpRequestDetail(block: Uint8Array): string {
+  const op = block[0] ?? 0;
+  try {
+    if (op === C.CmdEnumerate && block.length >= 16) {
+      return ` vol=${be16(block, 2)} did=${be32(block, 4)} start=${be16(block, 14)} n=${be16(block, 12)}`;
+    }
+    if (op === C.CmdOpenFork && block.length >= 14) {
+      return ` ${block[1]! & 0x80 ? 'rsrc' : 'data'} did=${be32(block, 4)}${qpath(block, 12)}`;
+    }
+    if ((op === C.CmdRead || op === C.CmdWrite) && block.length >= 12) {
+      return ` fork=${be16(block, 2)} off=${be32(block, 4)} n=${be32(block, 8)}`;
+    }
+    if (op === C.CmdCloseFork && block.length >= 4) {
+      return ` fork=${be16(block, 2)}`;
+    }
+    if (op === C.CmdCloseVol && block.length >= 4) {
+      return ` vol=${be16(block, 2)}`;
+    }
+    if (op === C.CmdOpenVol && block.length >= 5) {
+      const n = block[4]!;
+      return ` “${decodeMacRoman(block.subarray(5, 5 + n))}”`;
+    }
+    if (op === C.CmdGetFileDirParms && block.length >= 14) {
+      return ` did=${be32(block, 4)}${qpath(block, 12)}`;
+    }
+    if (op === C.CmdSetFileDirParms && block.length >= 12) {
+      return ` did=${be32(block, 4)}${qpath(block, 10)}`;
+    }
+    if ((op === C.CmdCreateDir || op === C.CmdCreateFile || op === C.CmdDelete) && block.length >= 10) {
+      return ` did=${be32(block, 4)}${qpath(block, 8)}`;
+    }
+    if (op === C.CmdRename && block.length >= 10) {
+      return ` did=${be32(block, 4)}${qpath(block, 8)}`;
+    }
+    if (op === C.CmdMoveAndRename && block.length >= 12) {
+      return ` src=${be32(block, 4)} dst=${be32(block, 8)}${qpath(block, 12)}`;
+    }
+    if (op === C.CmdGetSrvrMsg && block.length >= 4) {
+      return ` type=${be16(block, 2)}`;
+    }
+    if (op === C.CmdOpenDT && block.length >= 4) {
+      return ` vol=${be16(block, 2)}`;
+    }
+    if (op === C.CmdCloseDT && block.length >= 4) {
+      return ` dt=${be16(block, 2)}`;
+    }
+    if (op === C.CmdGetIcon && block.length >= 16) {
+      return ` creator=“${readOSType(block, 4)}” type=“${readOSType(block, 8)}” itype=${block[12]!}`;
+    }
+    if (op === C.CmdGetIconInfo && block.length >= 10) {
+      return ` creator=“${readOSType(block, 4)}” idx=${be16(block, 8)}`;
+    }
+    if (op === C.CmdLogin) {
+      const ver = readPStringAt(block, 1);
+      const uam = readPStringAt(block, ver.next);
+      const user = readPStringAt(block, uam.next);
+      const who = user.s ? ` user=“${user.s}”` : '';
+      return ` ${ver.s} ${uam.s}${who}`;
+    }
+    if (op === C.CmdLoginCont && block.length >= 4) {
+      return ` id=${be16(block, 2)} auth=${Math.max(0, block.length - 4)}b`;
+    }
+  } catch {
+    /* keep name only */
+  }
+  return '';
 }
 
 function readPList(b: Uint8Array, off: number): string[] {

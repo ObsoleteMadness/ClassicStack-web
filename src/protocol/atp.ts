@@ -15,6 +15,12 @@ export const MaxATPData = 578;
 export const DDPType = 3;
 export const HeaderSize = 8;
 
+/** TReq bitmap for a payload of `bytes` (one bit per 578-byte ATP slot, max 8). */
+export function bitmapForPayload(bytes: number): number {
+  const n = Math.min(Math.max(Math.ceil(Math.max(bytes, 1) / MaxATPData), 1), MaxResponsePackets);
+  return (1 << n) - 1;
+}
+
 /** 3-bit TRel timeout in the low bits of an XO TReq control byte (ClassicStack TRel30s). */
 export const TRel30s = 0;
 

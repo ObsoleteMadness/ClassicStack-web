@@ -4,6 +4,7 @@ import * as asp from '../protocol/asp';
 import { be16, u32ToI32 } from '../protocol/binary';
 import type { AtpClient, AtpInboundTReq } from './atp-client';
 import { log } from '../util/logger';
+import { throwIfAborted } from '../util/abort';
 
 let nextDyn = 128;
 
@@ -197,12 +198,15 @@ export class AspSession {
 
   async command(
     block: Uint8Array,
-    opts?: { bitmap?: number; timeoutMs?: number },
+    opts?: { bitmap?: number; timeoutMs?: number; signal?: AbortSignal },
   ): Promise<{ result: number; data: Uint8Array }> {
     if (!this.opened) throw new Error('ASP session not open');
+    throwIfAborted(opts?.signal);
     return this.enqueueCmd(async () => {
-      // Re-check after waiting in the queue (ClassicStack Command checks stop
-      // at entry; a server CloseSession can land while we were queued).
+      // Drop cancelled work here so it never takes a sequence number or the wire.
+      // In-flight Command (already sent) still runs to completion — System 7
+      // cannot cancel it, and overlapping seqs would be dropped.
+      throwIfAborted(opts?.signal);
       if (!this.opened) throw new Error('ASP session not open');
       const seq = this.nextSeq();
       log.trace(

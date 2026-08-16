@@ -23,6 +23,21 @@ import {
   pickAfpVersion,
   pickCleartextUam,
   getFileDirParms,
+  afpRequestDetail,
+  createDir,
+  deletePath,
+  logout,
+  closeVol,
+  closeFork,
+  rename,
+  moveAndRename,
+  openDT,
+  parseOpenDT,
+  closeDT,
+  getIcon,
+  getIconInfo,
+  parseGetIconInfo,
+  desktopIconsToFetch,
 } from './commands';
 
 describe('AFP client wirePath + Pascal framing', () => {
@@ -129,6 +144,30 @@ describe('AFP client parseEnumerate', () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]!.isDir).toBe(false);
     expect(entries[0]!.name).toBe('Doc');
+  });
+
+  it('reads AFP attribute bits from the file/dir parms bitmap', () => {
+    const name = encodeMacRoman('Locked');
+    const params = new Uint8Array(4 + 1 + name.length);
+    writeBe16(params, 0, 0x0020);
+    writeBe16(params, 2, 4);
+    params[4] = name.length;
+    params.set(name, 5);
+    let entryLen = 2 + params.length;
+    if (entryLen % 2) entryLen++;
+    const entry = new Uint8Array(entryLen);
+    entry[0] = entryLen;
+    entry[1] = 0;
+    entry.set(params, 2);
+    const body = new Uint8Array(6 + entry.length);
+    const bm = C.FDBitmapAttributes | C.FDBitmapLongName;
+    writeBe16(body, 0, bm);
+    writeBe16(body, 2, bm);
+    writeBe16(body, 4, 1);
+    body.set(entry, 6);
+    const entries = parseEnumerate(body, bm, bm);
+    expect(entries[0]!.name).toBe('Locked');
+    expect(entries[0]!.attributes).toBe(0x0020);
   });
 });
 
@@ -297,5 +336,83 @@ describe('AFP login packets', () => {
     expect(be16(b, 2)).toBe(1);
     expect(be32(b, 4)).toBe(2);
     expect(b[12]).toBe(C.PathTypeLongNames);
+  });
+});
+
+describe('AFP client request traces', () => {
+  it('includes path and fork fields for every command this client sends', () => {
+    expect(afpRequestDetail(createFile(1, 2, 'Hello'))).toContain('Hello');
+    expect(afpRequestDetail(createDir(1, 2, 'Docs'))).toContain('Docs');
+    expect(afpRequestDetail(deletePath(1, 2, 'Old'))).toContain('Old');
+    expect(afpRequestDetail(rename(1, 2, 'A', 'B'))).toContain('A');
+    expect(afpRequestDetail(moveAndRename(1, 2, 'X', 3, 'Y'))).toContain('X');
+    expect(afpRequestDetail(openFork(1, 2, 0, C.AccessRead, C.ForkFlagData, 'Pack.sit'))).toContain(
+      'Pack.sit',
+    );
+    expect(afpRequestDetail(readFork(7, 100, 50))).toMatch(/fork=7 off=100 n=50/);
+    expect(afpRequestDetail(writeFork(7, 0, 4096))).toMatch(/fork=7 off=0 n=4096/);
+    expect(afpRequestDetail(closeFork(7))).toContain('fork=7');
+    expect(afpRequestDetail(closeVol(3))).toContain('vol=3');
+    expect(afpRequestDetail(getFileDirParms(1, 2, 0, 0, 'Icon\r'))).toContain('Icon');
+    expect(afpRequestDetail(setFileDirParms(1, 2, C.FDBitmapFinderInfo, 'ReadMe', new Uint8Array(32)))).toContain(
+      'ReadMe',
+    );
+    expect(afpRequestDetail(getSrvrMsg(C.SrvrMsgTypeServer))).toContain('type=');
+    expect(afpRequestDetail(openDT(3))).toContain('vol=3');
+    expect(afpRequestDetail(getIcon(3, 'ttxt', 'APPL', C.IconTypeICN, 256))).toMatch(/ttxt/);
+    expect(afpRequestDetail(getIconInfo(3, 'ttxt', 1))).toMatch(/idx=1/);
+    expect(afpRequestDetail(loginGuest())).toMatch(/AFPVersion/);
+    expect(afpRequestDetail(loginCleartext('pete', 'secret'))).toContain('pete');
+    expect(afpRequestDetail(loginCleartext('pete', 'secret'))).not.toContain('secret');
+    expect(afpRequestDetail(logout())).toBe('');
+  });
+});
+
+describe('AFP desktop icon commands', () => {
+  it('packs FPOpenDT / FPGetIcon / FPGetIconInfo like Inside Macintosh', () => {
+    const odt = openDT(7);
+    expect(odt[0]).toBe(C.CmdOpenDT);
+    expect(odt.length).toBe(4);
+    expect(be16(odt, 2)).toBe(7);
+    expect(parseOpenDT(new Uint8Array([0, 7]))).toBe(7);
+
+    const gi = getIcon(7, 'ttxt', 'APPL', C.IconTypeICN, 256);
+    expect(gi[0]).toBe(51);
+    expect(gi.length).toBe(16);
+    expect(be16(gi, 2)).toBe(7);
+    expect([...gi.subarray(4, 8)]).toEqual([...encodeMacRoman('ttxt')]);
+    expect([...gi.subarray(8, 12)]).toEqual([...encodeMacRoman('APPL')]);
+    expect(gi[12]).toBe(C.IconTypeICN);
+    expect(be16(gi, 14)).toBe(256);
+
+    const info = getIconInfo(7, 'ttxt', 1);
+    expect(info[0]).toBe(52);
+    expect(info.length).toBe(10);
+    expect(be16(info, 8)).toBe(1);
+
+    const close = closeDT(7);
+    expect(close[0]).toBe(C.CmdCloseDT);
+    expect(be16(close, 2)).toBe(7);
+  });
+
+  it('parses FPGetIconInfo and probes ICN# when the creator list is empty', () => {
+    const reply = new Uint8Array(12);
+    reply.set(encodeMacRoman('APPL'), 4);
+    reply[8] = C.IconTypeICN;
+    writeBe16(reply, 10, 256);
+    expect(parseGetIconInfo(reply)).toEqual({
+      tag: 0,
+      type: 'APPL',
+      iconType: C.IconTypeICN,
+      size: 256,
+    });
+    expect(desktopIconsToFetch(null, 'APPL')).toEqual([
+      { iconType: C.IconTypeIcl8, size: 1024 },
+      { iconType: C.IconTypeICN, size: 256 },
+      { iconType: C.IconTypeIcs, size: 64 },
+    ]);
+    expect(desktopIconsToFetch([parseGetIconInfo(reply)!], 'APPL')).toEqual([
+      { iconType: C.IconTypeICN, size: 256 },
+    ]);
   });
 });

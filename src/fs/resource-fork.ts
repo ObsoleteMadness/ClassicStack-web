@@ -4,7 +4,8 @@
 
 import { be16, be32 } from '../protocol/binary';
 import { decodeMacRoman } from '../protocol/macroman';
-import { type ByteRangeReader, bufferRangeReader } from './byte-range';
+import { type ByteRangeReader, type RangeFill, SparseBytes } from './byte-range';
+import { isCompressedResource, maybeDecompressResource, RES_COMPRESSED } from './resource-compress';
 import { parseBndl } from './resource-types/bndl';
 import { SUPPORTED_ICON_TYPES } from './resource-types/icon-decoder';
 import { CDEV_ICON_ID, CUSTOM_ICON_ID, DEFAULT_ICON_ID } from './resource-types/icon-set';
@@ -60,39 +61,56 @@ function readAscii4(b: Uint8Array, o: number): string {
 }
 
 export class ResourceFork {
-  private readonly bytes: Uint8Array;
+  private readonly store: SparseBytes;
   private readonly entries: ResourceEntry[] = [];
   fileHeader: FileHeader | null = null;
   resourceMap: ResourceMap | null = null;
 
-  private constructor(bytes: Uint8Array) {
-    this.bytes = bytes;
+  constructor(store: SparseBytes) {
+    this.store = store;
   }
 
   static fromBytes(bytes: Uint8Array): ResourceFork {
-    const rf = new ResourceFork(bytes);
+    const rf = new ResourceFork(SparseBytes.fromBuffer(bytes));
     rf.parse();
     return rf;
   }
 
   /**
-   * Parse a resource fork through ranged reads: header, map, then payloads
-   * accepted by `want` (all under the size cap when `want` is omitted).
+   * Header + map through the virtual fork image. With `want`, also faults in
+   * those payloads. Other resources populate on `pullBytes`.
    */
   static async fromReader(
     read: ByteRangeReader,
     want?: (type: string, id: number) => boolean,
   ): Promise<ResourceFork | null> {
-    const map = await readForkMap(read);
+    const store = new SparseBytes(read);
+    const map = await readForkMap(store.asReader());
     if (!map) return null;
-    const entries = await loadMappedPayloads(read, map.dataOffset, map.mapped, want ?? (() => true));
-    return want ? forkFromSparse(map, entries) : forkFromMap(map, entries);
+    if (want) {
+      const entries = await loadMappedPayloads(store.asReader(), map.dataOffset, map.mapped, want);
+      return forkFromSparse(map, entries, store);
+    }
+    return forkFromMap(map, entriesFromMap(map), store);
   }
 
   /** Resource fork that only holds the given payloads (no full fork image). */
   static fromEntries(entries: ResourceEntry[]): ResourceFork {
-    const rf = new ResourceFork(new Uint8Array());
+    const rf = new ResourceFork(new SparseBytes());
     rf.entries.push(...entries);
+    return rf;
+  }
+
+  /** Later misses reopen a catalog reader (AFP fork is not kept open). */
+  bindFill(fill: RangeFill): void {
+    this.store.bindInner(null);
+    this.store.bindFill(fill);
+  }
+
+  static hydrate(store: SparseBytes, entries: ResourceEntry[], header: FileHeader): ResourceFork {
+    const rf = new ResourceFork(store);
+    rf.entries.push(...entries);
+    rf.fileHeader = header;
     return rf;
   }
 
@@ -124,35 +142,106 @@ export class ResourceFork {
 
   readBytes(entry: ResourceEntry): Uint8Array {
     if (entry.payload) return entry.payload.slice();
-    const end = entry.dataOffset + entry.length;
-    if (entry.dataOffset < 0 || end > this.bytes.length) return new Uint8Array();
-    return this.bytes.subarray(entry.dataOffset, end).slice();
+    if (entry.length < 0) return new Uint8Array();
+    const raw = this.store.peek(entry.dataOffset, entry.length)?.slice() ?? new Uint8Array();
+    return this.cacheDecoded(entry, raw);
+  }
+
+  /** True when this entry’s data is already in the sparse image or a payload. */
+  hasPayload(entry: ResourceEntry): boolean {
+    if (entry.payload !== undefined) return true;
+    if (entry.length < 0) return false;
+    return this.store.has(entry.dataOffset, entry.length);
+  }
+
+  /**
+   * Fault this resource in one range (4-byte length prefix + payload).
+   */
+  async pullBytes(entry: ResourceEntry, maxBytes?: number): Promise<Uint8Array> {
+    const cap = maxBytes ?? resourceFetchCap(entry.type);
+    if (this.hasPayload(entry)) {
+      const have = this.readBytes(entry);
+      return have.length > cap ? have.subarray(0, cap) : have;
+    }
+    if (entry.dataOffset < 0) return new Uint8Array();
+    if (entry.length >= 0) {
+      const raw = await this.store.slice(
+        entry.dataOffset,
+        compressedFetchSize(entry.attributes, entry.length, cap),
+      );
+      const full = await this.ensureCompressed(entry, raw);
+      const decoded = this.cacheDecoded(entry, full, true);
+      return decoded.length > cap ? decoded.subarray(0, cap) : decoded;
+    }
+    const got = await this.readPrefixed(entry.dataOffset, entry.attributes, cap);
+    if (!got) return new Uint8Array();
+    entry.length = got.dataLen;
+    entry.dataOffset += 4;
+    const decoded = this.cacheDecoded(entry, got.payload, true);
+    return decoded.length > cap ? decoded.subarray(0, cap) : decoded;
+  }
+
+  private cacheDecoded(entry: ResourceEntry, raw: Uint8Array, cacheAlways = false): Uint8Array {
+    const decoded = maybeDecompressResource(raw, entry.attributes);
+    if (decoded !== raw) {
+      entry.payload = decoded;
+      entry.length = decoded.length;
+      return decoded.slice();
+    }
+    if (cacheAlways) entry.payload = decoded;
+    return decoded;
+  }
+
+  private async ensureCompressed(entry: ResourceEntry, raw: Uint8Array): Promise<Uint8Array> {
+    if (entry.length < 0 || raw.length >= entry.length) return raw;
+    if (!needsFullCompressed(raw, entry.attributes, entry.length)) return raw;
+    if (entry.length > MAX_RESOURCE_BYTES) return raw;
+    return this.store.slice(entry.dataOffset, entry.length);
+  }
+
+  private async readPrefixed(
+    prefixPos: number,
+    attributes: number,
+    cap: number,
+  ): Promise<{ dataLen: number; payload: Uint8Array } | null> {
+    let got = await readPrefixedBlock(this.store.asReader(), prefixPos, cap);
+    if (!got) return null;
+    if (
+      needsFullCompressed(got.payload, attributes, got.dataLen) &&
+      got.dataLen <= MAX_RESOURCE_BYTES
+    ) {
+      got = (await readPrefixedBlock(this.store.asReader(), prefixPos, got.dataLen)) ?? got;
+    }
+    return got;
   }
 
   private parse(): void {
-    if (this.bytes.length < 16) return;
+    const hdr = this.store.peek(0, 16);
+    if (!hdr || hdr.length < 16) return;
 
-    const dataOffset = be32(this.bytes, 0);
-    const mapOffset = be32(this.bytes, 4);
-    const dataLength = be32(this.bytes, 8);
-    const mapLength = be32(this.bytes, 12);
+    const dataOffset = be32(hdr, 0);
+    const mapOffset = be32(hdr, 4);
+    const dataLength = be32(hdr, 8);
+    const mapLength = be32(hdr, 12);
     this.fileHeader = { dataOffset, mapOffset, dataLength, mapLength };
 
-    const forkLength = this.bytes.length;
+    const forkLength = this.store.length;
     if (dataLength > forkLength || forkLength - dataLength < dataOffset) return;
     if (mapLength > forkLength || forkLength - mapLength < mapOffset) return;
     if (dataOffset < mapOffset + mapLength && dataOffset + dataLength > mapOffset) return;
     if (mapOffset + mapLength > forkLength) return;
 
-    const mapBuf = this.bytes.subarray(mapOffset, mapOffset + mapLength);
-    if (mapBuf.length < 30) return;
+    const mapBuf = this.store.peek(mapOffset, mapLength);
+    if (!mapBuf || mapBuf.length < 30) return;
     this.resourceMap = readResourceMapHeader(mapBuf);
     if (!this.resourceMap) return;
 
     for (const mapped of listMappedResources(mapBuf)) {
       const dataEntryPos = dataOffset + mapped.dataBlockOffset;
       if (dataEntryPos < 0 || dataEntryPos + 4 > forkLength) continue;
-      const dataLen = be32(this.bytes, dataEntryPos);
+      const lenBuf = this.store.peek(dataEntryPos, 4);
+      if (!lenBuf || lenBuf.length < 4) continue;
+      const dataLen = be32(lenBuf, 0);
       this.entries.push({
         name: mapped.name,
         type: mapped.type,
@@ -229,7 +318,6 @@ function listMappedResources(mapBuf: Uint8Array): MappedResource[] {
 }
 
 export type ForkByteReader = ByteRangeReader;
-export const bufferForkReader = bufferRangeReader;
 
 const MAX_MAP_BYTES = 64 * 1024;
 const MAX_RESOURCE_BYTES = 128 * 1024;
@@ -255,6 +343,30 @@ const PAYLOAD_MAX: Record<string, number> = {
   ich4: 1152,
   cicn: 32 * 1024,
 };
+
+/** Bytes to pull with the length prefix in one FPRead (not a second 4-byte read). */
+const FETCH_CAP: Record<string, number> = {
+  BNDL: 256,
+  FREF: 64,
+  'ICN#': 256,
+  ICON: 128,
+  'ics#': 64,
+  'icm#': 48,
+  'ich#': 576,
+  icl8: 1024,
+  ics8: 256,
+  icm8: 192,
+  ich8: 2304,
+  icl4: 512,
+  ics4: 128,
+  icm4: 96,
+  ich4: 1152,
+  cicn: 32 * 1024,
+};
+
+export function resourceFetchCap(type: string): number {
+  return FETCH_CAP[type] ?? PAYLOAD_MAX[type] ?? 512;
+}
 
 export interface FinderIconForkOpts {
   /** Resource ids to fetch in addition to BNDL-mapped Finder icons. */
@@ -298,6 +410,42 @@ async function readForkMap(read: ForkByteReader): Promise<ForkMap | null> {
   };
 }
 
+/** Map listing only: `length` is -1 and `dataOffset` points at the 4-byte prefix. */
+function entriesFromMap(map: ForkMap): ResourceEntry[] {
+  return map.mapped.map((item) => ({
+    name: item.name,
+    type: item.type,
+    id: item.id,
+    length: -1,
+    attributes: item.attributes,
+    dataOffset: map.dataOffset + item.dataBlockOffset,
+  }));
+}
+
+function compressedFetchSize(attributes: number, onDisk: number, cap: number): number {
+  if (attributes & RES_COMPRESSED) return Math.min(onDisk, MAX_RESOURCE_BYTES);
+  return Math.min(onDisk, cap);
+}
+
+function needsFullCompressed(raw: Uint8Array, attributes: number, dataLen: number): boolean {
+  if (dataLen <= 0 || raw.length >= dataLen) return false;
+  return isCompressedResource(raw, attributes);
+}
+
+/** One range: 4-byte length prefix plus up to `cap` payload bytes. */
+async function readPrefixedBlock(
+  read: ForkByteReader,
+  prefixPos: number,
+  cap: number,
+): Promise<{ dataLen: number; payload: Uint8Array } | null> {
+  const block = await read(prefixPos, 4 + Math.max(0, cap));
+  if (block.length < 4) return null;
+  const dataLen = be32(block, 0);
+  if (dataLen <= 0) return { dataLen, payload: new Uint8Array() };
+  const n = Math.min(dataLen, cap, block.length - 4);
+  return { dataLen, payload: n > 0 ? block.subarray(4, 4 + n) : new Uint8Array() };
+}
+
 async function loadMappedPayloads(
   read: ForkByteReader,
   dataOffset: number,
@@ -308,12 +456,20 @@ async function loadMappedPayloads(
   for (const item of mapped) {
     if (!want(item.type, item.id)) continue;
     const pos = dataOffset + item.dataBlockOffset;
-    const lenBuf = await read(pos, 4);
-    if (lenBuf.length < 4) continue;
-    const dataLen = be32(lenBuf, 0);
-    if (dataLen <= 0) continue;
-    const cap = PAYLOAD_MAX[item.type] ?? MAX_RESOURCE_BYTES;
-    if (dataLen > cap) {
+    const got = await readPrefixedBlock(read, pos, resourceFetchCap(item.type));
+    if (!got) continue;
+    if (got.dataLen <= 0) continue;
+    let payload = got.payload;
+    let dataLen = got.dataLen;
+    if (needsFullCompressed(payload, item.attributes, dataLen) && dataLen <= MAX_RESOURCE_BYTES) {
+      const full = await readPrefixedBlock(read, pos, dataLen);
+      if (full) {
+        payload = full.payload;
+        dataLen = full.dataLen;
+      }
+    }
+    const maxKeep = PAYLOAD_MAX[item.type] ?? MAX_RESOURCE_BYTES;
+    if (dataLen > maxKeep) {
       entries.push({
         name: item.name,
         type: item.type,
@@ -324,34 +480,32 @@ async function loadMappedPayloads(
       });
       continue;
     }
-    const payload = await read(pos + 4, dataLen);
+    const decoded = maybeDecompressResource(payload, item.attributes);
     entries.push({
       name: item.name,
       type: item.type,
       id: item.id,
-      length: payload.length,
+      length: decoded.length,
       attributes: item.attributes,
-      dataOffset: 0,
-      payload,
+      dataOffset: pos + 4,
+      payload: decoded,
     });
   }
   return entries;
 }
 
-function forkFromMap(map: ForkMap, entries: ResourceEntry[]): ResourceFork {
-  const rf = ResourceFork.fromEntries(entries);
-  rf.fileHeader = {
+function forkFromMap(map: ForkMap, entries: ResourceEntry[], store = new SparseBytes()): ResourceFork {
+  return ResourceFork.hydrate(store, entries, {
     dataOffset: map.dataOffset,
     mapOffset: map.mapOffset,
     dataLength: map.dataLength,
     mapLength: map.mapLength,
-  };
-  return rf;
+  });
 }
 
-function forkFromSparse(map: ForkMap, entries: ResourceEntry[]): ResourceFork | null {
+function forkFromSparse(map: ForkMap, entries: ResourceEntry[], store?: SparseBytes): ResourceFork | null {
   if (!entries.length) return null;
-  return forkFromMap(map, entries);
+  return forkFromMap(map, entries, store);
 }
 
 /**
@@ -374,12 +528,14 @@ export async function loadFinderIconFork(
   read: ForkByteReader,
   opts?: FinderIconForkOpts,
 ): Promise<ResourceFork | null> {
-  const map = await readForkMap(read);
+  const store = new SparseBytes(read);
+  const virt = store.asReader();
+  const map = await readForkMap(virt);
   if (!map) return null;
 
   const extraIds = new Set<number>(opts?.extraIds ?? []);
   const meta = await loadMappedPayloads(
-    read,
+    virt,
     map.dataOffset,
     map.mapped,
     (type) => type === 'BNDL' || type === 'FREF',
@@ -399,10 +555,10 @@ export async function loadFinderIconFork(
     ids.add(CUSTOM_ICON_ID);
   }
 
-  const icons = await loadMappedPayloads(read, map.dataOffset, map.mapped, (type, id) => {
+  const icons = await loadMappedPayloads(virt, map.dataOffset, map.mapped, (type, id) => {
     if (!ICON_TYPE_SET.has(type)) return false;
     if (opts?.includeAllIcons) return true;
     return ids.has(id);
   });
-  return forkFromSparse(map, [...meta, ...icons]);
+  return forkFromSparse(map, [...meta, ...icons], store);
 }

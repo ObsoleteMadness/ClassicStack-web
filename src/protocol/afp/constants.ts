@@ -27,15 +27,25 @@ export const CmdSetForkParms = 31;
 export const CmdWrite = 33;
 export const CmdGetFileDirParms = 34;
 export const CmdSetFileDirParms = 35;
+/** ASP Write (bitmap in the write buffer). Other Desktop DB calls use 48–55. */
 export const CmdAddIcon = 192;
-export const CmdGetIcon = 193;
-export const CmdGetIconInfo = 194;
-export const CmdAddAPPL = 195;
-export const CmdRemoveAPPL = 196;
-export const CmdGetAPPL = 197;
+/** Inside Macintosh AFP: afpGetIcon=51, afpGtIcnInfo=52 (not 193/194). */
+export const CmdGetIcon = 51;
+export const CmdGetIconInfo = 52;
+export const CmdAddAPPL = 53;
+export const CmdRemoveAPPL = 54;
+export const CmdGetAPPL = 55;
 export const CmdGetSrvrMsg = 38;
 export const CmdOpenDT = 48;
 export const CmdCloseDT = 49;
+
+/** Desktop Manager iconType byte used by FPGetIcon (often only ICN# is stored). */
+export const IconTypeICN = 1;
+export const IconTypeIcl4 = 2;
+export const IconTypeIcl8 = 3;
+export const IconTypeIcs = 4;
+export const IconTypeIcs4 = 5;
+export const IconTypeIcs8 = 6;
 
 const AFP_CMD_NAME: Record<number, string> = {
   [CmdCloseVol]: 'FPCloseVol',
@@ -140,6 +150,7 @@ export const AFPVersion21 = 'AFPVersion 2.1';
 export const NoErr = 0;
 export const ErrAccessDenied = -5000;
 export const ErrObjectExists = -5017;
+export const ErrItemNotFound = -5012;
 export const ErrObjectNotFnd = -5018;
 export const ErrParamErr = -5019;
 export const ErrAuthContinue = -5021;
@@ -158,6 +169,8 @@ export function afpResultName(result: number): string {
       return 'AccessDenied';
     case ErrObjectExists:
       return 'ObjectExists';
+    case ErrItemNotFound:
+      return 'ItemNotFound';
     case ErrObjectNotFnd:
       return 'ObjectNotFound';
     case ErrParamErr:

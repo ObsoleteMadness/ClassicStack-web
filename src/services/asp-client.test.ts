@@ -78,6 +78,19 @@ describe('ASP Command serialization', () => {
     expect(atp.maxInflight).toBe(1);
     expect(atp.seqs).toEqual([0, 1]);
   });
+
+  it('does not send a queued Command after its abort signal fires', async () => {
+    const atp = new FakeAtp();
+    const sess = new AspSession(atp as unknown as AtpClient, 0, 1, 251);
+    sess.opened = true;
+    const ac = new AbortController();
+    const first = sess.command(new Uint8Array([9]));
+    const second = sess.command(new Uint8Array([193]), { signal: ac.signal });
+    ac.abort();
+    await first;
+    await expect(second).rejects.toMatchObject({ name: 'AbortError' });
+    expect(atp.seqs).toEqual([0]);
+  });
 });
 
 describe('ASP sockets vs ClassicStack client/asp', () => {

@@ -129,7 +129,7 @@ export function groupResourceTypes(entries: readonly ResourceEntry[]): ResourceT
     .map(([type, ents]) => ({
       type,
       count: ents.length,
-      bytes: ents.reduce((n, e) => n + e.length, 0),
+      bytes: ents.reduce((n, e) => n + Math.max(0, e.length), 0),
       entries: [...ents].sort((a, b) => a.id - b.id || (a.name ?? '').localeCompare(b.name ?? '')),
     }))
     .sort((a, b) => {

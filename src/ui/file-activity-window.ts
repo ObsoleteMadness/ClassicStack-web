@@ -78,6 +78,10 @@ export class FileActivityWindow extends HTMLElement {
   private onClick(e: MouseEvent): void {
     const t = (e.target as HTMLElement).closest('[data-act]') as HTMLElement | null;
     if (t?.dataset.act === 'close') this.hide();
+    if (t?.dataset.act === 'cancel-transfer' && t.dataset.job) {
+      e.preventDefault();
+      transferActivity.cancel(t.dataset.job);
+    }
   }
 }
 
