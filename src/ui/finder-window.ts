@@ -15,12 +15,16 @@ import {
   type IconUrls,
 } from '../fs/icon-cache';
 import { expandArchiveFile, expandFailureMessage, isExpandableArchive, type ExpandedNode } from '../fs/expand-incoming';
+import { expandSitInPlace } from '../fs/expand-inplace';
 import type { WelcomePackProgress } from '../fs/welcome-pack';
 import { importExpandedTree, type ImportItemTrack } from '../fs/import-transfer';
 import { filenameExtension } from '../fs/extension-map';
+import { ResourceFork, loadResourceForkPartial } from '../fs/resource-fork';
+import { forkBytesFromNode } from '../fs/resource-inspect';
+import { decodeVers1, versInfoForGetInfo, type VersGetInfo, type VersRec } from '../fs/resource-types/vers';
 import { loadPrefs, savePrefs } from '../util/prefs';
 import { log } from '../util/logger';
-import { isAbortError } from '../util/abort';
+import { isAbortError, throwIfAborted } from '../util/abort';
 import { uiIcons } from './lucide-icon';
 import { enableWindowResize } from './window-resize';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
@@ -205,6 +209,9 @@ export class FinderWindow extends HTMLElement {
   /** Resolved icon URLs keyed by ListItem.key (or type|creator). */
   private iconUrls = new Map<string, IconUrls>();
   private iconLoadGen = 0;
+  /** Cached `vers` 1 Get Info strings, keyed by node id. */
+  private versInfo = new Map<number, { stamp: string; info: VersGetInfo | null }>();
+  private versPending = new Set<number>();
   /** Cancels the in-flight cwd / column listing when navigating to another folder. */
   private navListAbort: AbortController | null = null;
   /** Per-folder list-view disclose listings; aborted on collapse or navigation. */
@@ -473,19 +480,41 @@ export class FinderWindow extends HTMLElement {
     return id;
   }
 
-  private trackImportItem(item: { name: string; isDir: boolean; bytesTotal: number }): ImportItemTrack & {
+  private trackImportItem(
+    item: { name: string; isDir: boolean; bytesTotal: number },
+    dest: Catalog = this.vfs,
+  ): ImportItemTrack & {
     onBytes: (n: number) => void;
     onDone: (err?: Error) => void;
   } {
     const id = this.startTransfer(item.name, item.isDir, item.bytesTotal);
     const queuedByPath = new Map<string, string>();
-    const bind = (jobId: string) => ({
-      onBytes: (n: number) => transferActivity.addBytes(jobId, n),
+    const bind = (jobId: string): ImportItemTrack & {
+      onBytes: (n: number) => void;
+      onDone: (err?: Error) => void;
+    } => ({
+      onBytes: (n) => {
+        throwIfAborted(transferActivity.signal(jobId));
+        transferActivity.addBytes(jobId, n);
+      },
       onDone: (err?: Error) => {
-        if (err) {
-          transferActivity.fail(jobId, err.message);
+        if (!err) {
+          void transferActivity.settle(jobId);
+          return;
+        }
+        void transferActivity.settle(jobId, err);
+        if (!isAbortError(err) && !transferActivity.isCancelled(jobId)) {
           transferActivity.failQueued(jobId, err.message);
-        } else transferActivity.finish(jobId);
+        }
+      },
+      signal: transferActivity.signal(jobId),
+      removePartial: async (parentId, name) => {
+        try {
+          const node = await dest.lookup(parentId, name);
+          if (node && !node.isDir) await dest.remove(node.id);
+        } catch {
+          /* dest may already be gone */
+        }
       },
     });
     return {
@@ -1447,6 +1476,8 @@ export class FinderWindow extends HTMLElement {
     } else if (existing?.getAttribute('data-id') !== String(preview.id)) {
       existing?.remove();
       view.insertAdjacentHTML('beforeend', this.itemInfoHtml(preview, { variant: 'column' }));
+    } else {
+      this.ensureVersInfo(preview);
     }
 
     this.syncClipboardButtons();
@@ -1767,6 +1798,7 @@ export class FinderWindow extends HTMLElement {
     const resizer = opts.variant === 'column' ? this.colResizerHtml('preview') : '';
     const paneOpen = opts.variant === 'column' ? `<div class="column-pane">` : '';
     const paneClose = opts.variant === 'column' ? `</div>` : '';
+    if (!node.isDir) this.ensureVersInfo(node);
     return `<div class="${shellClass}" data-preview data-id="${node.id}"${colAttrs}>
       ${paneOpen}
       <div class="preview-hero">
@@ -1779,12 +1811,91 @@ export class FinderWindow extends HTMLElement {
         ${node.isDir ? '' : `<div class="preview-row"><span>Resource</span><span>${formatBytes(node.resourceBytes ?? node.resource.length)}</span></div>`}
         <div class="preview-row"><span>Created</span><span>${fromMacTime(node.createDate).toLocaleString()}</span></div>
         <div class="preview-row"><span>Modified</span><span>${fromMacTime(node.modDate).toLocaleString()}</span></div>
+        ${this.versRowsHtml(node)}
       </div>
       ${typeCreatorFields}
       ${folderActions}
       ${paneClose}
       ${resizer}
     </div>`;
+  }
+
+  private versStamp(node: VNode): string {
+    return `${node.modDate}:${node.resourceBytes ?? node.resource.length}:${node.data.length}`;
+  }
+
+  private cachedVersInfo(node: VNode): VersGetInfo | null | undefined {
+    const hit = this.versInfo.get(node.id);
+    if (!hit || hit.stamp !== this.versStamp(node)) return undefined;
+    return hit.info;
+  }
+
+  private versRowsHtml(node: VNode): string {
+    const info = this.cachedVersInfo(node);
+    if (!info) return '';
+    return this.versRowsMarkup(info);
+  }
+
+  private versRowsMarkup(info: VersGetInfo): string {
+    const rows: string[] = [];
+    if (info.version) {
+      rows.push(
+        `<div class="preview-row" data-vers="version"><span>Version</span><span>${this.escape(info.version)}</span></div>`,
+      );
+    }
+    if (info.copyright) {
+      rows.push(
+        `<div class="preview-row preview-row--block" data-vers="copyright"><span>Copyright</span><span>${this.escape(info.copyright)}</span></div>`,
+      );
+    }
+    return rows.join('');
+  }
+
+  private ensureVersInfo(node: VNode): void {
+    if (node.isDir) return;
+    if (this.cachedVersInfo(node) !== undefined) return;
+    if (this.versPending.has(node.id)) return;
+    const rsrcHint = node.resourceBytes ?? node.resource.length;
+    if (rsrcHint < 16 && node.resource.length < 16 && node.data.length < 16) return;
+    this.versPending.add(node.id);
+    void this.loadVersInfo(node);
+  }
+
+  private async loadVersInfo(node: VNode): Promise<void> {
+    const stamp = this.versStamp(node);
+    try {
+      const rec = await this.readVers1(node);
+      this.versInfo.set(node.id, { stamp, info: rec ? versInfoForGetInfo(rec) : null });
+      this.patchVersInDom(node.id);
+    } catch {
+      this.versInfo.set(node.id, { stamp, info: null });
+    } finally {
+      this.versPending.delete(node.id);
+    }
+  }
+
+  private async readVers1(node: VNode): Promise<VersRec | null> {
+    if (node.resource.length >= 16 || node.data.length >= 16) {
+      const picked = forkBytesFromNode(node);
+      if (picked.bytes.length >= 16) return decodeVers1(ResourceFork.fromBytes(picked.bytes));
+    }
+    const rsrcHint = node.resourceBytes ?? 0;
+    if (rsrcHint < 16 || node.resource.length >= 16) return null;
+    const rf = await this.vfs.withRangeReader(
+      node,
+      (read) => loadResourceForkPartial(read, (type, id) => type === 'vers' && id === 1),
+      { resource: true },
+    );
+    return rf ? decodeVers1(rf) : null;
+  }
+
+  private patchVersInDom(id: number): void {
+    const hit = this.versInfo.get(id);
+    const markup = hit?.info ? this.versRowsMarkup(hit.info) : '';
+    this.querySelectorAll(`[data-preview][data-id="${id}"] .preview-meta`).forEach((meta) => {
+      meta.querySelectorAll('[data-vers]').forEach((el) => el.remove());
+      if (markup) meta.insertAdjacentHTML('beforeend', markup);
+    });
   }
 
   /** Resolve icon for a single node and patch list + properties glyphs. */
@@ -2026,7 +2137,15 @@ export class FinderWindow extends HTMLElement {
       return;
     }
 
-    const act = t.closest('[data-act]')?.getAttribute('data-act');
+    const actEl = t.closest('[data-act]') as HTMLElement | null;
+    const act = actEl?.getAttribute('data-act');
+    if (act === 'cancel-transfer') {
+      e.preventDefault();
+      e.stopPropagation();
+      const jobId = actEl?.getAttribute('data-job');
+      if (jobId) transferActivity.cancel(jobId);
+      return;
+    }
     if (act) {
       await this.handleAction(act);
       return;
@@ -3101,28 +3220,40 @@ export class FinderWindow extends HTMLElement {
     const plan = await this.planPlacement(dest, destParent, node.name, node.isDir);
     const expected = node.isDir ? 0 : nodeByteSize(node);
     const jobId = this.startTransfer(plan.destName, node.isDir, expected, node.finderInfo);
+    const signal = transferActivity.signal(jobId);
     await this.withOwnVfsMutation(async () => {
       dest.beginBatch();
       try {
+        throwIfAborted(signal);
         if (plan.replaceId != null) await dest.remove(plan.replaceId);
         const creditRead = !!src.reportsChunkedBytes && !dest.reportsChunkedBytes;
         const creditWrite = !!dest.reportsChunkedBytes || !creditRead;
         const snap = await this.snapshotNode(
           src,
           node,
-          creditRead ? (n) => transferActivity.addBytes(jobId, n) : undefined,
+          creditRead ? (n) => {
+            throwIfAborted(signal);
+            transferActivity.addBytes(jobId, n);
+          } : undefined,
+          signal,
         );
+        throwIfAborted(signal);
         transferActivity.setTotal(jobId, clipByteSize(snap));
         await this.writeClipNode(
           dest,
           destParent,
           snap,
-          creditWrite ? (n) => transferActivity.addBytes(jobId, n) : undefined,
+          creditWrite ? (n) => {
+            throwIfAborted(signal);
+            transferActivity.addBytes(jobId, n);
+          } : undefined,
           plan.destName,
+          jobId,
         );
-        transferActivity.finish(jobId);
+        throwIfAborted(signal);
+        await transferActivity.settle(jobId);
       } catch (err) {
-        transferActivity.fail(jobId, err instanceof Error ? err.message : String(err));
+        await transferActivity.settle(jobId, err);
         throw err;
       } finally {
         dest.endBatch();
@@ -3217,7 +3348,7 @@ export class FinderWindow extends HTMLElement {
               );
             }
           },
-          onItem: (item) => this.trackImportItem(item),
+          onItem: (item) => this.trackImportItem(item, destCat),
           resolveConflict: (info) => this.host.promptNameConflict(info),
         }),
       );
@@ -3237,6 +3368,7 @@ export class FinderWindow extends HTMLElement {
     } catch (err) {
       if (isTransferCancelled(err)) {
         this.setStatus('Transfer cancelled');
+        await this.refreshAfterMutation();
         return;
       }
       console.error(err);
@@ -3640,7 +3772,30 @@ export class FinderWindow extends HTMLElement {
     const track = this.trackImportItem({ name: node.name, isDir: false, bytesTotal });
     this.setStatus(`Expanding “${node.name}”…`, { busy: true });
     try {
-      const full = (await this.vfs.ensureContent(id, track.onBytes)) ?? node;
+      const inPlace = await expandSitInPlace(this.vfs, node, {
+        fileSize: node.dataBytes ?? node.data.length,
+        track,
+        resolveConflict: (info) => this.host.promptNameConflict(info),
+        wrapWrite: (fn) =>
+          this.withOwnVfsMutation(async () => {
+            this.vfs.beginBatch();
+            try {
+              await fn();
+            } finally {
+              this.vfs.endBatch();
+            }
+          }),
+      });
+      if (inPlace) {
+        track.onDone();
+        this.setStatus(`Expanded “${node.name}”`);
+        iconCache.clearDirectoryCache();
+        this.iconUrls.clear();
+        this.iconLoadGen++;
+        await this.refreshAfterMutation();
+        return;
+      }
+      const full = (await this.vfs.ensureContent(id, track.onBytes, track.signal)) ?? node;
       let expanded;
       try {
         expanded = expandArchiveFile(full.name, full.data);
@@ -3685,8 +3840,9 @@ export class FinderWindow extends HTMLElement {
       await this.refreshAfterMutation();
     } catch (err) {
       if (isTransferCancelled(err)) {
-        track.onDone();
+        track.onDone(err instanceof Error ? err : new Error(String(err)));
         this.setStatus('Transfer cancelled');
+        await this.refreshAfterMutation();
         return;
       }
       track.onDone(err instanceof Error ? err : new Error(String(err)));
@@ -3796,13 +3952,20 @@ export class FinderWindow extends HTMLElement {
     if (!node) return;
     this.setStatus(mode === 'cut' ? 'Cutting…' : 'Copying…', { busy: true });
     const jobId = this.startTransfer(node.name, node.isDir, nodeByteSize(node), node.finderInfo);
+    const signal = transferActivity.signal(jobId);
     try {
       const item = await this.snapshotNode(
         this.vfs,
         node,
-        this.vfs.reportsChunkedBytes ? (n) => transferActivity.addBytes(jobId, n) : undefined,
+        this.vfs.reportsChunkedBytes
+          ? (n) => {
+              throwIfAborted(signal);
+              transferActivity.addBytes(jobId, n);
+            }
+          : undefined,
+        signal,
       );
-      transferActivity.finish(jobId);
+      await transferActivity.settle(jobId);
       this.clipboard = {
         mode,
         items: [item],
@@ -3814,7 +3977,11 @@ export class FinderWindow extends HTMLElement {
         `${mode === 'cut' ? 'Cut' : 'Copied'} “${node.name}” — paste in this share or another`,
       );
     } catch (err) {
-      transferActivity.fail(jobId, err instanceof Error ? err.message : String(err));
+      await transferActivity.settle(jobId, err);
+      if (isTransferCancelled(err)) {
+        this.setStatus('Transfer cancelled');
+        return;
+      }
       this.setStatus(`${mode === 'cut' ? 'Cut' : 'Copy'} failed: ${(err as Error).message}`);
     }
   }
@@ -3823,13 +3990,16 @@ export class FinderWindow extends HTMLElement {
     fs: Catalog,
     node: VNode,
     onBytes?: (n: number) => void,
+    signal?: AbortSignal,
   ): Promise<ClipNode> {
+    throwIfAborted(signal);
     if (node.isDir) {
-      const kids = await fs.children(node.id);
+      const kids = await fs.children(node.id, undefined, signal);
       const out: ClipNode[] = [];
       for (const k of kids) {
-        const full = k.isDir ? k : ((await fs.ensureContent(k.id, onBytes)) ?? k);
-        out.push(await this.snapshotNode(fs, full, onBytes));
+        throwIfAborted(signal);
+        const full = k.isDir ? k : ((await fs.ensureContent(k.id, onBytes, signal)) ?? k);
+        out.push(await this.snapshotNode(fs, full, onBytes, signal));
       }
       return {
         name: node.name,
@@ -3840,7 +4010,7 @@ export class FinderWindow extends HTMLElement {
         kids: out,
       };
     }
-    const full = (await fs.ensureContent(node.id, onBytes)) ?? node;
+    const full = (await fs.ensureContent(node.id, onBytes, signal)) ?? node;
     return {
       name: full.name,
       isDir: false,
@@ -3895,13 +4065,17 @@ export class FinderWindow extends HTMLElement {
     }
     const zipName = node.name || 'archive';
     const jobId = this.startTransfer(zipName, node.isDir, node.isDir ? 0 : nodeByteSize(node), node.finderInfo);
+    const signal = transferActivity.signal(jobId);
     try {
       let listed = node.isDir ? 0 : nodeByteSize(node);
       const entries = await collectFsZipEntries(
         this.vfs,
         node,
         '',
-        (n) => transferActivity.addBytes(jobId, n),
+        (n) => {
+          throwIfAborted(signal);
+          transferActivity.addBytes(jobId, n);
+        },
         node.isDir
           ? (n) => {
               listed += n;
@@ -3909,13 +4083,19 @@ export class FinderWindow extends HTMLElement {
             }
           : undefined,
         loadPrefs().zipExportStyle,
+        signal,
       );
+      throwIfAborted(signal);
       downloadZipEntries(zipName, entries);
-      transferActivity.finish(jobId);
+      await transferActivity.settle(jobId);
       this.setStatus(`Downloaded ${zipName}.zip`);
     } catch (err) {
+      await transferActivity.settle(jobId, err);
+      if (isTransferCancelled(err)) {
+        this.setStatus('Transfer cancelled');
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
-      transferActivity.fail(jobId, msg);
       this.setStatus(`Download failed: ${msg}`);
     }
   }
@@ -4089,7 +4269,7 @@ export class FinderWindow extends HTMLElement {
               { busy: true },
             );
           },
-          onItem: (item) => this.trackImportItem(item),
+          onItem: (item) => this.trackImportItem(item, this.vfs),
           resolveConflict: (info) => this.host.promptNameConflict(info),
         }),
       );
@@ -4105,6 +4285,7 @@ export class FinderWindow extends HTMLElement {
     } catch (err) {
       if (isTransferCancelled(err)) {
         this.setStatus('Transfer cancelled');
+        await this.refreshAfterMutation();
         return;
       }
       this.setStatus(`Import failed: ${(err as Error).message}`);
@@ -4244,7 +4425,7 @@ export class FinderWindow extends HTMLElement {
         if (fileCount <= 0) return;
         this.setStatus('Adding Welcome Pack Items…', { busy: true });
       },
-      onItem: (item) => this.trackImportItem(item),
+      onItem: (item) => this.trackImportItem(item, this.localVfs ?? this.host?.localCatalog() ?? this.vfs),
     };
     try {
       const result = opts.seed
@@ -4366,17 +4547,24 @@ export class FinderWindow extends HTMLElement {
             for (const { item, plan } of planned) {
               if (plan.replaceId != null) await this.vfs.remove(plan.replaceId);
               const jobId = this.startTransfer(plan.destName, item.isDir, clipByteSize(item), item.finderInfo);
+              const signal = transferActivity.signal(jobId);
               try {
                 await this.writeClipNode(
                   this.vfs,
                   destParent,
                   item,
-                  (n) => transferActivity.addBytes(jobId, n),
+                  (n) => {
+                    throwIfAborted(signal);
+                    transferActivity.addBytes(jobId, n);
+                  },
                   plan.destName,
+                  jobId,
                 );
-                transferActivity.finish(jobId);
+                throwIfAborted(signal);
+                await transferActivity.settle(jobId);
               } catch (err) {
-                transferActivity.fail(jobId, err instanceof Error ? err.message : String(err));
+                await transferActivity.settle(jobId, err);
+                if (isTransferCancelled(err)) continue;
                 throw err;
               }
             }
@@ -4398,6 +4586,7 @@ export class FinderWindow extends HTMLElement {
     } catch (err) {
       if (isTransferCancelled(err)) {
         this.setStatus('Transfer cancelled');
+        await this.refreshAfterMutation();
         return;
       }
       this.setStatus(`Paste failed: ${(err as Error).message}`);
@@ -4410,22 +4599,39 @@ export class FinderWindow extends HTMLElement {
     item: ClipNode,
     onBytes?: (n: number) => void,
     destName = item.name,
+    jobId?: string,
   ): Promise<void> {
+    const signal = jobId ? transferActivity.signal(jobId) : undefined;
+    throwIfAborted(signal);
     const clash = await fs.lookup(parentId, destName);
     const name = clash ? await uniqueCopyName(fs, parentId, destName) : destName;
     if (item.isDir) {
       const dir = await fs.mkdir(parentId, name);
-      for (const kid of item.kids ?? []) await this.writeClipNode(fs, dir.id, kid, onBytes);
+      for (const kid of item.kids ?? []) {
+        throwIfAborted(signal);
+        await this.writeClipNode(fs, dir.id, kid, onBytes, kid.name, jobId);
+      }
       return;
     }
-    await fs.createFile(
-      parentId,
-      name,
-      item.data.slice(),
-      item.resource.slice(),
-      item.finderInfo.slice(),
-      onBytes,
-    );
+    if (jobId) transferActivity.watchPartial(jobId, fs, parentId, name);
+    try {
+      await fs.createFile(
+        parentId,
+        name,
+        item.data.slice(),
+        item.resource.slice(),
+        item.finderInfo.slice(),
+        onBytes,
+        signal,
+      );
+      throwIfAborted(signal);
+      if (jobId) transferActivity.clearPartial(jobId);
+    } catch (err) {
+      if (jobId && (isTransferCancelled(err) || transferActivity.isCancelled(jobId))) {
+        await transferActivity.discardPartial(jobId);
+      }
+      throw err;
+    }
   }
 
   private isEditingField(t: EventTarget | null): boolean {
@@ -4674,20 +4880,23 @@ export async function collectFsZipEntries(
   onBytes?: (n: number) => void,
   onAddTotal?: (n: number) => void,
   style: ZipExportStyle = 'appledouble',
+  signal?: AbortSignal,
 ): Promise<{ name: string; data: Uint8Array }[]> {
+  throwIfAborted(signal);
   const out: { name: string; data: Uint8Array }[] = [];
   const creditRead = vfs.reportsChunkedBytes ? onBytes : undefined;
   const creditLoaded = !vfs.reportsChunkedBytes ? onBytes : undefined;
   if (node.isDir) {
-    const kids = await vfs.children(node.id);
+    const kids = await vfs.children(node.id, undefined, signal);
     const dirPrefix = prefix ? `${prefix}${node.name}/` : `${node.name}/`;
     for (const kid of kids) {
+      throwIfAborted(signal);
       if (!kid.isDir) onAddTotal?.(nodeByteSize(kid));
-      out.push(...(await collectFsZipEntries(vfs, kid, dirPrefix, onBytes, onAddTotal, style)));
+      out.push(...(await collectFsZipEntries(vfs, kid, dirPrefix, onBytes, onAddTotal, style, signal)));
     }
     return out;
   }
-  const full = (await vfs.ensureContent(node.id, creditRead)) ?? node;
+  const full = (await vfs.ensureContent(node.id, creditRead, signal)) ?? node;
   creditLoaded?.(full.data.length + full.resource.length);
   const base = prefix ? `${prefix}${full.name}` : full.name;
   out.push({ name: base, data: full.data });

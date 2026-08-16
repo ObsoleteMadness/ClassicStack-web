@@ -550,11 +550,32 @@ export class AfpClient {
       async (forkRef) => {
         const read = async (offset: number, count: number): Promise<Uint8Array> => {
           throwIfAborted(signal);
-          const bitmap = count <= 578 ? 0x01 : 0xff;
-          const rr = await this.fp(cmd.readFork(forkRef, offset, count), { bitmap });
-          if (rr.result === C.ErrEOFErr) return rr.data;
-          if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
-          return rr.data;
+          if (count <= 0) return new Uint8Array();
+          const chunks: Uint8Array[] = [];
+          let got = 0;
+          while (got < count) {
+            const n = Math.min(4096, count - got);
+            const bitmap = n <= 578 ? 0x01 : 0xff;
+            const rr = await this.fp(cmd.readFork(forkRef, offset + got, n), { bitmap });
+            if (rr.result === C.ErrEOFErr) {
+              if (rr.data.length) chunks.push(rr.data);
+              break;
+            }
+            if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
+            if (rr.data.length === 0) break;
+            chunks.push(rr.data);
+            got += rr.data.length;
+            if (rr.data.length < n) break;
+          }
+          if (chunks.length === 1) return chunks[0]!;
+          const total = chunks.reduce((n, c) => n + c.length, 0);
+          const out = new Uint8Array(total);
+          let o = 0;
+          for (const c of chunks) {
+            out.set(c, o);
+            o += c.length;
+          }
+          return out;
         };
         return await fn(read);
       },
@@ -595,8 +616,9 @@ export class AfpClient {
     resource = false,
     volId?: number,
     onBytes?: (n: number) => void,
+    signal?: AbortSignal,
   ): Promise<Uint8Array> {
-    return this.tasks.run(() => this.readFileUnlocked(path, dirId, resource, volId, onBytes));
+    return this.tasks.run(() => this.readFileUnlocked(path, dirId, resource, volId, onBytes, signal), signal);
   }
 
   private async readFileUnlocked(
@@ -605,7 +627,9 @@ export class AfpClient {
     resource: boolean,
     volId?: number,
     onBytes?: (n: number) => void,
+    signal?: AbortSignal,
   ): Promise<Uint8Array> {
+    throwIfAborted(signal);
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
     // ClassicStack client/afp: ask only for the length bit of the fork being
     // opened. System 7.5 PFS returns kFPBitmapErr if a data-fork open also
@@ -624,6 +648,7 @@ export class AfpClient {
         const chunks: Uint8Array[] = [];
         let offset = 0;
         for (;;) {
+          throwIfAborted(signal);
           const rr = await this.fp(cmd.readFork(forkRef, offset, 4096), { bitmap: 0xff });
           if (rr.result === C.ErrEOFErr) {
             if (rr.data.length) {
@@ -658,8 +683,9 @@ export class AfpClient {
     resource = false,
     volId?: number,
     onBytes?: (n: number) => void,
+    signal?: AbortSignal,
   ): Promise<void> {
-    return this.tasks.run(() => this.writeFileUnlocked(path, data, dirId, resource, volId, onBytes));
+    return this.tasks.run(() => this.writeFileUnlocked(path, data, dirId, resource, volId, onBytes, signal), signal);
   }
 
   private async writeFileUnlocked(
@@ -669,7 +695,9 @@ export class AfpClient {
     resource: boolean,
     volId?: number,
     onBytes?: (n: number) => void,
+    signal?: AbortSignal,
   ): Promise<void> {
+    throwIfAborted(signal);
     const vol = this.vid(volId);
     const cr = await this.fp(cmd.createFile(vol, dirId, path, 0));
     if (cr.result !== C.NoErr && cr.result !== C.ErrObjectExists) {
@@ -683,6 +711,7 @@ export class AfpClient {
         const chunkSize = 4096;
         let offset = 0;
         while (offset < data.length) {
+          throwIfAborted(signal);
           const chunk = data.subarray(offset, Math.min(offset + chunkSize, data.length));
           const wr = await this.fpWrite(cmd.writeFork(forkRef, offset, chunk.length), chunk);
           if (wr.result !== C.NoErr) throw new Error(`FPWrite ${wr.result}`);

@@ -8,6 +8,7 @@ import { be32 } from '../protocol/binary';
 import { importDataTransferInto, readBlobProgress, type ImportProgress } from './import-transfer';
 import { finderInfoFromName } from './extension-map';
 import { throwIfAborted } from '../util/abort';
+import { bufferRangeReader, type ByteRangeReader } from './byte-range';
 
 export type VfsChange = { parentIds: number[] };
 export type VfsChangeListener = (change: VfsChange) => void;
@@ -37,14 +38,23 @@ export interface Catalog {
   endBatch(): void;
   get(id: number): Promise<VNode | undefined>;
   /** Load data/resource forks if the catalog stores them separately (remote AFP). */
-  ensureContent(id: number, onBytes?: (n: number) => void): Promise<VNode | undefined>;
+  ensureContent(id: number, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined>;
   children(parentId: number, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]>;
   lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined>;
-  /** Enough of the resource fork to decode Finder icons (optional; remote AFP). */
+  /** Enough of the resource fork to decode Finder icons (optional; remote volumes). */
   loadIconResources?(
     node: VNode,
     signal?: AbortSignal,
   ): Promise<import('./resource-fork').ResourceFork | null>;
+  /**
+   * Ranged reads of a file’s data or resource bytes. The catalog may keep a
+   * backend handle open until `fn` returns.
+   */
+  withRangeReader<T>(
+    node: VNode,
+    fn: (read: ByteRangeReader) => Promise<T>,
+    opts?: { resource?: boolean; signal?: AbortSignal },
+  ): Promise<T>;
   mkdir(parentId: number, name: string): Promise<VNode>;
   ensureDir(parentId: number, name: string): Promise<VNode>;
   createFile(
@@ -54,6 +64,7 @@ export interface Catalog {
     resource?: Uint8Array,
     finderInfo?: Uint8Array,
     onBytes?: (n: number) => void,
+    signal?: AbortSignal,
   ): Promise<VNode>;
   put(node: VNode): Promise<void>;
   rename(id: number, newName: string): Promise<void>;
@@ -275,7 +286,9 @@ export class VirtualFS implements Catalog {
     resource = new Uint8Array(),
     finderInfo = finderInfoFromName(name),
     _onBytes?: (n: number) => void,
+    signal?: AbortSignal,
   ): Promise<VNode> {
+    throwIfAborted(signal);
     const existing = await this.lookup(parentId, name);
     if (existing) {
       existing.data = data;
@@ -305,8 +318,10 @@ export class VirtualFS implements Catalog {
     file: File,
     onBytes?: (n: number) => void,
     resource?: Uint8Array,
+    signal?: AbortSignal,
   ): Promise<VNode> {
-    const buf = await readBlobProgress(file, onBytes);
+    const buf = await readBlobProgress(file, onBytes, signal);
+    throwIfAborted(signal);
     // Host FS may store reserved Mac chars as ClassicStack "0xNN" tokens (Icon\r → Icon0x0D).
     const name = unescapeHostFilename(file.name);
 
@@ -326,13 +341,13 @@ export class VirtualFS implements Catalog {
     if (buf.length >= 4 && be32(buf, 0) === AS_MAGIC) {
       const as = parseAppleSingle(buf);
       if (as) {
-        return this.createFile(parentId, name, as.data, as.resource, as.finderInfo);
+        return this.createFile(parentId, name, as.data, as.resource, as.finderInfo, onBytes, signal);
       }
     }
     if (buf.length >= 4 && be32(buf, 0) === AD_MAGIC) {
       const ad = parseAppleDouble(buf);
       if (ad) {
-        return this.createFile(parentId, name, new Uint8Array(), ad.resource, ad.finderInfo);
+        return this.createFile(parentId, name, new Uint8Array(), ad.resource, ad.finderInfo, onBytes, signal);
       }
     }
 
@@ -349,7 +364,7 @@ export class VirtualFS implements Catalog {
       return existing;
     }
 
-    const node = await this.createFile(parentId, name, buf, hostResource);
+    const node = await this.createFile(parentId, name, buf, hostResource, undefined, onBytes, signal);
     await this.consumeNamedSidecar(parentId, name, node);
     return node;
   }
@@ -389,8 +404,20 @@ export class VirtualFS implements Catalog {
     await this.remove(sidecar.id);
   }
 
-  async ensureContent(id: number, _onBytes?: (n: number) => void): Promise<VNode | undefined> {
+  async ensureContent(id: number, _onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined> {
+    throwIfAborted(signal);
     return this.get(id);
+  }
+
+  async withRangeReader<T>(
+    node: VNode,
+    fn: (read: ByteRangeReader) => Promise<T>,
+    opts?: { resource?: boolean; signal?: AbortSignal },
+  ): Promise<T> {
+    throwIfAborted(opts?.signal);
+    const full = (await this.ensureContent(node.id, undefined, opts?.signal)) ?? node;
+    const bytes = opts?.resource ? full.resource : full.data;
+    return fn(bufferRangeReader(bytes));
   }
 
   /**
@@ -400,7 +427,7 @@ export class VirtualFS implements Catalog {
    * Notifications are batched for the whole import.
    */
   async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
-    return importDataTransferInto(this, parentId, dt, (p, file, onBytes, resource) => this.importBlob(p, file, onBytes, resource), opts);
+    return importDataTransferInto(this, parentId, dt, (p, file, onBytes, resource, signal) => this.importBlob(p, file, onBytes, resource, signal), opts);
   }
 
   async rename(id: number, newName: string): Promise<void> {

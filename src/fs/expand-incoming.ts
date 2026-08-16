@@ -160,6 +160,10 @@ function tryExpandBytes(
 }
 
 /** Keep unwrapping members that are themselves BinHex / MacBinary / StuffIt / ZIP. */
+export function expandedFromSitEntries(entries: SitEntry[]): ExpandedNode[] {
+  return expandNodes(sitEntriesToTree(entries), 1);
+}
+
 function expandNodes(nodes: ExpandedNode[], depth: number): ExpandedNode[] {
   const out: ExpandedNode[] = [];
   for (const node of nodes) {

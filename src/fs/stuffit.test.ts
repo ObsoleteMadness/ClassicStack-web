@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { crc16Ibm } from '../protocol/crc16';
 import { writeBe16 } from '../protocol/binary';
 import { BitReader, decompressSit13, SitError } from './stuffit-codec';
-import { buildClassicStore, isStuffItArchive, parseStuffIt, sitUnsupportedTypeCode } from './stuffit';
+import { buildClassicStore, extractSitMember, isStuffItArchive, parseStuffIt, parseStuffItFromReader, sitUnsupportedTypeCode } from './stuffit';
+import { bufferRangeReader } from './byte-range';
 import { expandArchiveFile, expandIncoming, isExpandableArchive } from './expand-incoming';
 import { buildBinHex } from './binhex';
 import { makeFinderInfo } from './mac-file';
@@ -81,6 +82,42 @@ describe('classic StuffIt store', () => {
     const notes = out!.find((n) => n.name === 'Notes');
     expect(notes?.kind).toBe('file');
     if (notes?.kind === 'file') expect([...notes.data]).toEqual([...ascii('hi')]);
+  });
+
+  it('reads classic headers through a range reader without fetching packed forks', async () => {
+    const packed = buildClassicStore([
+      { name: 'Notes', data: ascii('hello range'), resource: Uint8Array.of(0xaa) },
+    ]);
+    const reads: { offset: number; count: number }[] = [];
+    const inner = bufferRangeReader(packed);
+    const members = await parseStuffItFromReader(async (offset, count) => {
+      reads.push({ offset, count });
+      return inner(offset, count);
+    }, packed.length);
+    expect(members).toHaveLength(1);
+    const m = members![0]!;
+    expect(m.name).toBe('Notes');
+    expect(m.isFolder).toBe(false);
+    const packedStart = Math.min(m.rsrcOffset, m.dataOffset);
+    const packedEnd = Math.max(m.rsrcOffset + m.rsrcClen, m.dataOffset + m.dataClen);
+    expect(packedEnd).toBeGreaterThan(packedStart);
+    for (const r of reads) {
+      const rEnd = r.offset + r.count;
+      expect(r.offset >= packedEnd || rEnd <= packedStart).toBe(true);
+    }
+    const entry = await extractSitMember(inner, m);
+    expect([...entry.data]).toEqual([...ascii('hello range')]);
+    expect([...entry.resource]).toEqual([0xaa]);
+  });
+
+  it('matches parseStuffIt for a StuffIt 5 archive via range reads', async () => {
+    const mac = testdata('stuffit5-mac.sit');
+    const fromBuf = parseStuffIt(mac);
+    const members = await parseStuffItFromReader(bufferRangeReader(mac), mac.length);
+    expect(members?.map((e) => e.name).sort()).toEqual(fromBuf?.map((e) => e.name).sort());
+    const files = members!.filter((m) => !m.isFolder);
+    const extracted = await Promise.all(files.map((m) => extractSitMember(bufferRangeReader(mac), m)));
+    expect(extracted.map((e) => e.name).sort()).toEqual(fromBuf!.filter((e) => !e.isFolder).map((e) => e.name).sort());
   });
 
   it('parses classic archives whose header magic is ST50', () => {

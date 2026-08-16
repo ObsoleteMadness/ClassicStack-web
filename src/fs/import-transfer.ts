@@ -6,6 +6,7 @@ import { loadPrefs } from '../util/prefs';
 import { log } from '../util/logger';
 import { expandIncoming, isExpandableArchive, type ExpandedDir, type ExpandedFile, type ExpandedNode } from './expand-incoming';
 import type { Catalog, VNode } from './virtual-fs';
+import { throwIfAborted, isAbortError, abortError } from '../util/abort';
 import {
   planItemPlacement,
   TransferCancelled,
@@ -28,6 +29,9 @@ export type ImportItemTrack = {
   onExpandBegin?: (bytesTotal: number, files: ExpandTrackFile[]) => void;
   /** Nested job while a dropped wrapper is decoded (BinHex / MacBinary / later StuffIt). */
   onExpand?: (item: ExpandTrackFile) => ImportItemTrack | undefined;
+  signal?: AbortSignal;
+  /** Delete a dest file left behind if this write is cancelled mid-flight. */
+  removePartial?: (parentId: number, name: string) => Promise<void>;
 };
 
 export type ImportProgress = {
@@ -48,6 +52,7 @@ type ImportBlob = (
   onBytes?: (n: number) => void,
   /** Host resource fork from `..namedfork/rsrc` (Chrome on macOS). */
   resource?: Uint8Array,
+  signal?: AbortSignal,
 ) => Promise<unknown>;
 type ImportFs = Pick<
   Catalog,
@@ -81,6 +86,8 @@ export async function importDataTransferInto(
     const plans = await planIncoming(fs, parentId, groups, opts?.resolveConflict);
     fs.beginBatch();
     try {
+      let imported = 0;
+      let cancelled = false;
       for (let i = 0; i < groups.length; i++) {
         const group = groups[i]!;
         const plan = plans[i]!;
@@ -92,17 +99,24 @@ export async function importDataTransferInto(
           bytesTotal,
         });
         try {
+          throwIfAborted(track?.signal);
           for (const entry of group.entries) {
             const asName = mappedIncomingName(unescapeHostFilename(entry.name), group.name, plan.destName);
             await importFsEntry(fs, parentId, entry, importBlob, tick, track, asName);
           }
           track?.onDone?.();
+          imported++;
         } catch (err) {
           track?.onDone?.(err instanceof Error ? err : new Error(String(err)));
+          if (isAbortError(err)) {
+            cancelled = true;
+            continue;
+          }
           throw err;
         }
       }
-      return groups.length;
+      if (imported === 0 && cancelled) throw new TransferCancelled();
+      return imported;
     } finally {
       fs.endBatch();
     }
@@ -112,6 +126,8 @@ export async function importDataTransferInto(
   const plans = await planIncoming(fs, parentId, groups, opts?.resolveConflict);
   fs.beginBatch();
   try {
+    let imported = 0;
+    let cancelled = false;
     for (let i = 0; i < groups.length; i++) {
       const group = groups[i]!;
       const plan = plans[i]!;
@@ -123,6 +139,7 @@ export async function importDataTransferInto(
         bytesTotal,
       });
       try {
+        throwIfAborted(track?.signal);
         for (const file of group.files) {
           const destTop = mappedIncomingName(
             topFileName(file),
@@ -133,12 +150,18 @@ export async function importDataTransferInto(
           tick();
         }
         track?.onDone?.();
+        imported++;
       } catch (err) {
         track?.onDone?.(err instanceof Error ? err : new Error(String(err)));
+        if (isAbortError(err)) {
+          cancelled = true;
+          continue;
+        }
         throw err;
       }
     }
-    return groups.length;
+    if (imported === 0 && cancelled) throw new TransferCancelled();
+    return imported;
   } finally {
     fs.endBatch();
   }
@@ -192,6 +215,7 @@ async function importFsEntry(
   parentDir?: FileSystemDirectoryEntry,
 ): Promise<void> {
   if (isNamedForkDirName(entry.name)) return;
+  throwIfAborted(track?.signal);
   const name = destName ?? unescapeHostFilename(entry.name);
   if (entry.isDirectory) {
     const dir = await fs.ensureDir(parentId, name);
@@ -220,6 +244,7 @@ async function importFileWithRelativePath(
   track?: ImportItemTrack,
   destTop?: string,
 ): Promise<void> {
+  throwIfAborted(track?.signal);
   const rel = file.webkitRelativePath;
   if (!rel || !rel.includes('/')) {
     const name = destTop ?? unescapeHostFilename(file.name);
@@ -248,14 +273,16 @@ async function importOneFile(
   const name = unescapeHostFilename(file.name);
   const onBytes = track?.onBytes;
   const hostResource = resource?.length ? resource : undefined;
+  throwIfAborted(track?.signal);
   if (hostResource) {
     log.info(`Imported resource fork for “${name}” (${hostResource.length} bytes)`, 'import');
   }
   if (!loadPrefs().autoExpandFiles || !shouldTryExpand(name)) {
-    await importBlob(parentId, file, onBytes, hostResource);
+    await writeTrackedBlob(parentId, name, () => importBlob(parentId, file, onBytes, hostResource, track?.signal), track);
     return;
   }
-  const buf = await readBlobProgress(file, onBytes);
+  const buf = await readBlobProgress(file, onBytes, track?.signal);
+  throwIfAborted(track?.signal);
   let expanded: ExpandedNode[] | null = null;
   try {
     expanded = expandIncoming(name, buf);
@@ -263,11 +290,18 @@ async function importOneFile(
     log.warn(`Couldn’t auto-expand “${name}”: ${err instanceof Error ? err.message : err}`, 'expand');
   }
   if (!expanded) {
-    await importBlob(
+    await writeTrackedBlob(
       parentId,
-      new File([buf], name, { type: file.type, lastModified: file.lastModified }),
-      undefined,
-      hostResource,
+      name,
+      () =>
+        importBlob(
+          parentId,
+          new File([buf], name, { type: file.type, lastModified: file.lastModified }),
+          undefined,
+          hostResource,
+          track?.signal,
+        ),
+      track,
     );
     return;
   }
@@ -279,6 +313,22 @@ async function importOneFile(
     'expand',
   );
   await importExpandedTree(fs, parentId, expanded, track);
+}
+
+async function writeTrackedBlob(
+  parentId: number,
+  name: string,
+  write: () => Promise<unknown>,
+  track?: ImportItemTrack,
+): Promise<void> {
+  throwIfAborted(track?.signal);
+  try {
+    await write();
+    throwIfAborted(track?.signal);
+  } catch (err) {
+    if (isAbortError(err)) await track?.removePartial?.(parentId, name);
+    throw err;
+  }
 }
 
 function shouldTryExpand(name: string): boolean {
@@ -312,10 +362,14 @@ export async function importExpandedTree(
   parentId: number,
   nodes: ExpandedNode[],
   track?: ImportItemTrack,
+  opts?: { announce?: boolean; prefix?: string },
 ): Promise<void> {
-  const files = expandedFiles(nodes);
-  track?.onExpandBegin?.(expandedByteTotal(files), files);
-  await writeExpandedNodes(fs, parentId, nodes, track);
+  const prefix = opts?.prefix ?? '';
+  if (opts?.announce !== false) {
+    const files = expandedFiles(nodes, prefix);
+    track?.onExpandBegin?.(expandedByteTotal(files), files);
+  }
+  await writeExpandedNodes(fs, parentId, nodes, track, prefix);
 }
 
 async function writeExpandedNodes(
@@ -326,6 +380,7 @@ async function writeExpandedNodes(
   prefix = '',
 ): Promise<void> {
   for (const node of nodes) {
+    throwIfAborted(track?.signal);
     const path = prefix ? `${prefix}/${node.name}` : node.name;
     if (node.kind === 'dir') {
       const dir = await fs.ensureDir(parentId, node.name);
@@ -351,21 +406,32 @@ async function importExpandedFile(
     bytesTotal,
     finderInfo: node.finderInfo,
   });
+  if (child?.signal?.aborted) {
+    child.onDone?.(abortError(child.signal));
+    return;
+  }
   const credit = (n: number): void => {
     child?.onBytes?.(n);
     track?.onBytes?.(n);
   };
   let wrote = 0;
+  const signal = child?.signal ?? track?.signal;
+  const removePartial = child?.removePartial ?? track?.removePartial;
   try {
+    throwIfAborted(signal);
     const vnode = await fs.createFile(parentId, node.name, node.data, node.resource, node.finderInfo, (n) => {
+      throwIfAborted(signal);
       wrote += n;
       credit(n);
-    });
+    }, signal);
+    throwIfAborted(signal);
     if (wrote === 0 && bytesTotal > 0) credit(bytesTotal);
     await stampExpandedMeta(fs, vnode, node, false);
     child?.onDone?.();
   } catch (err) {
+    if (isAbortError(err)) await removePartial?.(parentId, node.name);
     child?.onDone?.(err instanceof Error ? err : new Error(String(err)));
+    if (isAbortError(err) && track?.signal && !track.signal.aborted) return;
     throw err;
   }
 }
@@ -644,20 +710,28 @@ function readFileEntry(entry: FileSystemFileEntry): Promise<File> {
 }
 
 /** Read a File, optionally reporting each stream chunk (not the full size up front). */
-export async function readBlobProgress(file: File, onBytes?: (n: number) => void): Promise<Uint8Array> {
+export async function readBlobProgress(file: File, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<Uint8Array> {
+  throwIfAborted(signal);
   if (!onBytes || typeof file.stream !== 'function') {
-    return new Uint8Array(await file.arrayBuffer());
+    const buf = new Uint8Array(await file.arrayBuffer());
+    throwIfAborted(signal);
+    return buf;
   }
   const reader = file.stream().getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value?.byteLength) continue;
-    chunks.push(value);
-    total += value.byteLength;
-    onBytes(value.byteLength);
+  try {
+    for (;;) {
+      throwIfAborted(signal);
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      chunks.push(value);
+      total += value.byteLength;
+      onBytes(value.byteLength);
+    }
+  } finally {
+    reader.releaseLock();
   }
   const out = new Uint8Array(total);
   let o = 0;

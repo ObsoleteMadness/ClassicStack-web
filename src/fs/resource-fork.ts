@@ -4,6 +4,7 @@
 
 import { be16, be32 } from '../protocol/binary';
 import { decodeMacRoman } from '../protocol/macroman';
+import { type ByteRangeReader, bufferRangeReader } from './byte-range';
 import { parseBndl } from './resource-types/bndl';
 import { SUPPORTED_ICON_TYPES } from './resource-types/icon-decoder';
 import { CDEV_ICON_ID, CUSTOM_ICON_ID, DEFAULT_ICON_ID } from './resource-types/icon-set';
@@ -213,7 +214,8 @@ function listMappedResources(mapBuf: Uint8Array): MappedResource[] {
   return out;
 }
 
-export type ForkByteReader = (offset: number, count: number) => Promise<Uint8Array>;
+export type ForkByteReader = ByteRangeReader;
+export const bufferForkReader = bufferRangeReader;
 
 const MAX_MAP_BYTES = 64 * 1024;
 const MAX_RESOURCE_BYTES = 128 * 1024;

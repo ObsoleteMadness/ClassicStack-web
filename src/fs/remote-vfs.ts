@@ -9,6 +9,7 @@ import { be32 } from '../protocol/binary';
 import type { Catalog, VNode, VfsChangeListener, ChildrenBatchListener } from './virtual-fs';
 import { importDataTransferInto, type ImportProgress } from './import-transfer';
 import { finderInfoFromName } from './extension-map';
+import { bufferRangeReader, type ByteRangeReader } from './byte-range';
 import { loadFinderIconFork, ResourceFork } from './resource-fork';
 import { iconForkLoadOptions } from './icon-cache';
 import { isAbortError, throwIfAborted } from '../util/abort';
@@ -60,10 +61,10 @@ export class RemoteVfs implements Catalog {
     return this.nodes.get(id) ?? (id === this.rootId() ? this.ensureRoot() : undefined);
   }
 
-  async ensureContent(id: number, onBytes?: (n: number) => void): Promise<VNode | undefined> {
+  async ensureContent(id: number, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined> {
     const node = await this.get(id);
     if (!node || node.isDir) return node;
-    if (!this.forksLoaded.has(id)) await this.hydrateForks(node, onBytes);
+    if (!this.forksLoaded.has(id)) await this.hydrateForks(node, onBytes, signal);
     return node;
   }
 
@@ -112,18 +113,35 @@ export class RemoteVfs implements Catalog {
     const rsrcLen = node.resourceBytes ?? 0;
     if (rsrcLen < 16) return null;
     try {
-      return await this.client.withForkReader(
-        node.name,
-        node.parentId,
-        true,
+      return await this.withRangeReader(
+        node,
         (read) => loadFinderIconFork(read, iconForkLoadOptions(node)),
-        this.volId,
-        signal,
+        { resource: true, signal },
       );
     } catch (err) {
       if (isAbortError(err)) throw err;
       return null;
     }
+  }
+
+  async withRangeReader<T>(
+    node: VNode,
+    fn: (read: ByteRangeReader) => Promise<T>,
+    opts?: { resource?: boolean; signal?: AbortSignal },
+  ): Promise<T> {
+    throwIfAborted(opts?.signal);
+    if (this.forksLoaded.has(node.id)) {
+      const bytes = opts?.resource ? node.resource : node.data;
+      return fn(bufferRangeReader(bytes));
+    }
+    return this.client.withForkReader(
+      node.name,
+      node.parentId,
+      opts?.resource === true,
+      fn,
+      this.volId,
+      opts?.signal,
+    );
   }
 
   async mkdir(parentId: number, name: string): Promise<VNode> {
@@ -149,9 +167,13 @@ export class RemoteVfs implements Catalog {
     resource = new Uint8Array(),
     finderInfo = finderInfoFromName(name),
     onBytes?: (n: number) => void,
+    signal?: AbortSignal,
   ): Promise<VNode> {
-    await this.client.writeFile(name, data, parentId, false, this.volId, onBytes);
-    if (resource.length) await this.client.writeFile(name, resource, parentId, true, this.volId, onBytes);
+    throwIfAborted(signal);
+    await this.client.writeFile(name, data, parentId, false, this.volId, onBytes, signal);
+    throwIfAborted(signal);
+    if (resource.length) await this.client.writeFile(name, resource, parentId, true, this.volId, onBytes, signal);
+    throwIfAborted(signal);
     if (finderInfo.some((b) => b !== 0)) {
       await this.client.setFinderInfo(name, finderInfo, parentId, this.volId);
     }
@@ -219,7 +241,7 @@ export class RemoteVfs implements Catalog {
   }
 
   async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
-    return importDataTransferInto(this, parentId, dt, (p, file, onBytes, resource) => this.importBlob(p, file, onBytes, resource), opts);
+    return importDataTransferInto(this, parentId, dt, (p, file, onBytes, resource, signal) => this.importBlob(p, file, onBytes, resource, signal), opts);
   }
 
   private async importBlob(
@@ -227,8 +249,11 @@ export class RemoteVfs implements Catalog {
     file: File,
     onBytes?: (n: number) => void,
     resource?: Uint8Array,
+    signal?: AbortSignal,
   ): Promise<VNode> {
+    throwIfAborted(signal);
     const buf = new Uint8Array(await file.arrayBuffer());
+    throwIfAborted(signal);
     const name = unescapeHostFilename(file.name);
     if (name.startsWith('._') && name.length > 2) {
       const ad = parseAppleDouble(buf);
@@ -239,31 +264,34 @@ export class RemoteVfs implements Catalog {
           const data = this.forksLoaded.has(existing.id)
             ? existing.data
             : await this.client.readFile(existing.name, parentId, false, this.volId);
-          return this.createFile(parentId, target, data, ad.resource, ad.finderInfo, onBytes);
+          return this.createFile(parentId, target, data, ad.resource, ad.finderInfo, onBytes, signal);
         }
-        return this.createFile(parentId, target, new Uint8Array(), ad.resource, ad.finderInfo, onBytes);
+        return this.createFile(parentId, target, new Uint8Array(), ad.resource, ad.finderInfo, onBytes, signal);
       }
     }
     if (buf.length >= 4 && be32(buf, 0) === AS_MAGIC) {
       const as = parseAppleSingle(buf);
-      if (as) return this.createFile(parentId, name, as.data, as.resource, as.finderInfo, onBytes);
+      if (as) return this.createFile(parentId, name, as.data, as.resource, as.finderInfo, onBytes, signal);
     }
     if (buf.length >= 4 && be32(buf, 0) === AD_MAGIC) {
       const ad = parseAppleDouble(buf);
-      if (ad) return this.createFile(parentId, name, new Uint8Array(), ad.resource, ad.finderInfo, onBytes);
+      if (ad) return this.createFile(parentId, name, new Uint8Array(), ad.resource, ad.finderInfo, onBytes, signal);
     }
-    return this.createFile(parentId, name, buf, resource, undefined, onBytes);
+    return this.createFile(parentId, name, buf, resource, undefined, onBytes, signal);
   }
 
-  private async hydrateForks(node: VNode, onBytes?: (n: number) => void): Promise<void> {
+  private async hydrateForks(node: VNode, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
     try {
-      node.data = await this.client.readFile(node.name, node.parentId, false, this.volId, onBytes);
-    } catch {
+      node.data = await this.client.readFile(node.name, node.parentId, false, this.volId, onBytes, signal);
+    } catch (err) {
+      if (isAbortError(err)) throw err;
       node.data = EMPTY;
     }
     try {
-      node.resource = await this.client.readFile(node.name, node.parentId, true, this.volId, onBytes);
-    } catch {
+      node.resource = await this.client.readFile(node.name, node.parentId, true, this.volId, onBytes, signal);
+    } catch (err) {
+      if (isAbortError(err)) throw err;
       node.resource = EMPTY;
     }
     node.dataBytes = node.data.length;
