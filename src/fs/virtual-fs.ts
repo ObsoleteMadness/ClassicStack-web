@@ -297,7 +297,7 @@ export class VirtualFS implements Catalog {
     resource?: Uint8Array,
   ): Promise<VNode> {
     const buf = await readBlobProgress(file, onBytes);
-    // Host FS may store reserved Mac chars as OmniTalk "0xNN" tokens (Icon\r → Icon0x0D).
+    // Host FS may store reserved Mac chars as ClassicStack "0xNN" tokens (Icon\r → Icon0x0D).
     const name = unescapeHostFilename(file.name);
 
     // macOS AppleDouble sidecar (._Name) → merge into Name (either import order).

@@ -3,7 +3,7 @@ import * as atp from './atp';
 import * as asp from './asp';
 
 describe('ATP / ASP OpenSess framing', () => {
-  it('packs OpenSess as ALO TReq with a one-packet bitmap (OmniTalk)', () => {
+  it('packs OpenSess as ALO TReq with a one-packet bitmap (ClassicStack)', () => {
     const wss = 128;
     const pkt = atp.encodePacket(
       {

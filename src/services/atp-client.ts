@@ -116,7 +116,7 @@ export class AtpClient {
     this.ensureListen(req.srcSocket);
     const tid = this.nextTid++ & 0xffff;
     if (tid === 0) this.nextTid = 1;
-    // OmniTalk: 2s interval, 5 retries (6 attempts). ASP Command/OpenSess leave this default.
+    // ClassicStack: 2s interval, 5 retries (6 attempts). ASP Command/OpenSess leave this default.
     const timeoutMs = req.timeoutMs ?? 2000;
     const retries = req.retries ?? 5;
     const bitmap = req.bitmap ?? 0xff;

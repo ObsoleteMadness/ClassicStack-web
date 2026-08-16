@@ -1,4 +1,4 @@
-/** Snefru S-boxes (Xerox / Merkle; from OmniTalk / Elliot Nunn). DO NOT EDIT. */
+/** Snefru S-boxes (Xerox / Merkle; from ClassicStack / Elliot Nunn). DO NOT EDIT. */
 
 export const sbox0: number[] = [
   0x64F9001B, 0xFEDDCDF6, 0x7C8FF1E2, 0x11D71514, 0x8B8C18D3, 0xDDDF881E, 0x6EAB5056, 0x88CED8E1, 

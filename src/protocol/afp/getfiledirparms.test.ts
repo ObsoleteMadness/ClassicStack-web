@@ -4,7 +4,7 @@ import { be16, writeBe16, writeBe32 } from '../binary';
 import { encodeMacRoman, decodeMacRoman } from '../macroman';
 
 /**
- * Pin FPGetFileDirParms reply framing against OmniTalk
+ * Pin FPGetFileDirParms reply framing against ClassicStack
  * (core/service/afp/models_test.go TestFPGetFileDirParmsRes_Header).
  *
  * Wire: FileBitmap(2) DirBitmap(2) type(1) pad(1) <params>
@@ -24,7 +24,7 @@ function marshalGetFileDirParms(
   return out;
 }
 
-/** Pack LongName-only params the OmniTalk way: offset(2) then trailing pstring. */
+/** Pack LongName-only params the ClassicStack way: offset(2) then trailing pstring. */
 function packLongNameOnly(displayName: string): Uint8Array {
   const name = encodeMacRoman(displayName.slice(0, 31));
   const fixedSize = 2;
@@ -35,7 +35,7 @@ function packLongNameOnly(displayName: string): Uint8Array {
   return new Uint8Array(out);
 }
 
-/** OmniTalk enumEntry framing. */
+/** ClassicStack enumEntry framing. */
 function enumEntry(isDir: boolean, params: Uint8Array): Uint8Array {
   let len = 2 + params.length;
   if (len % 2) len++;
@@ -47,12 +47,12 @@ function enumEntry(isDir: boolean, params: Uint8Array): Uint8Array {
 }
 
 describe('FPGetFileDirParms reply', () => {
-  it('matches OmniTalk directory header golden', () => {
+  it('matches ClassicStack directory header golden', () => {
     const got = marshalGetFileDirParms(0x07fb, 0x0dff, true, new Uint8Array([0xaa]));
     expect([...got]).toEqual([0x07, 0xfb, 0x0d, 0xff, 0x80, 0x00, 0xaa]);
   });
 
-  it('matches OmniTalk file header golden', () => {
+  it('matches ClassicStack file header golden', () => {
     const got = marshalGetFileDirParms(0x07fb, 0x0dff, false, new Uint8Array([0xaa]));
     expect([...got]).toEqual([0x07, 0xfb, 0x0d, 0xff, 0x00, 0x00, 0xaa]);
   });

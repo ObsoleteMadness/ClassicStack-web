@@ -1,4 +1,4 @@
-/** AFP 2.x constants (OmniTalk core/protocol/afp). */
+/** AFP 2.x constants (ClassicStack core/protocol/afp). */
 
 export const CmdCloseVol = 2;
 export const CmdCloseFork = 4;

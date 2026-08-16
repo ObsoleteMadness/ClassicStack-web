@@ -285,7 +285,7 @@ export class AfpClient {
     const twoWay = cmd.matchUam(this.uams, /2[- ]way.*randnum/i);
     const randnum = cmd.matchUam(this.uams, /randnum/i);
 
-    // OmniTalk LoginNegotiated: password login uses the advertised cleartext UAM
+    // ClassicStack LoginNegotiated: password login uses the advertised cleartext UAM
     // verbatim (System 7 silently ignores a version/UAM it did not advertise).
     if (advertisedClear || (!twoWay && !randnum)) {
       const uam = cmd.pickCleartextUam(this.uams);
@@ -577,7 +577,7 @@ export class AfpClient {
     if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
     const { forkRef } = cmd.parseOpenFork(open.data);
     try {
-      // ASP Write quantum; keep under ATP multi-packet budget (OmniTalk QuantumSize).
+      // ASP Write quantum; keep under ATP multi-packet budget (ClassicStack QuantumSize).
       const chunkSize = 4096;
       let offset = 0;
       while (offset < data.length) {

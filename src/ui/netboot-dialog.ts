@@ -1,6 +1,6 @@
 import { log } from '../util/logger';
 
-/** Bundled ABP ChainLoader (OmniTalk patched build). */
+/** Bundled ABP ChainLoader (ClassicStack patched build). */
 export const BUNDLED_PAYLOAD_URL = '/netboot/ChainLoader.bin';
 /** Client enabler floppy (XPRAM netboot) — download only, not served on the wire. */
 export const BOOTSTRAP_FLOPPY_URL = '/netboot/BootstrapFloppy.dsk';

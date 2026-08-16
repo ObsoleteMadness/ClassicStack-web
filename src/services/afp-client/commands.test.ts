@@ -31,7 +31,7 @@ describe('AFP client wirePath + Pascal framing', () => {
     expect([...wirePath('ReadMe')]).toEqual([0x00, ...encodeMacRoman('ReadMe')]);
   });
 
-  it('CreateFile / OpenFork wrap pathType + Pascal length (OmniTalk PutPString)', () => {
+  it('CreateFile / OpenFork wrap pathType + Pascal length (ClassicStack PutPString)', () => {
     const cf = createFile(1, 2, 'Hello');
     // cmd flag vol(2) dir(4) pathType pascalLen ...
     expect(cf[0]).toBe(C.CmdCreateFile);
@@ -67,7 +67,7 @@ describe('AFP client FPWrite / FPRead headers', () => {
 });
 
 describe('AFP client parseEnumerate', () => {
-  it('parses OmniTalk [len:1][type:1][params] entries', () => {
+  it('parses ClassicStack [len:1][type:1][params] entries', () => {
     const name = encodeMacRoman('Doc');
     // LongName-only params: offset(2)=2, then pstring
     const params = new Uint8Array([0, 2, name.length, ...name]);

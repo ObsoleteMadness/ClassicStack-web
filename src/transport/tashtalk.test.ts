@@ -64,7 +64,7 @@ describe('tashtalk FCS', () => {
     expect(cmd[1 + 31]).toBe(1 << 6);
   });
 
-  it('discards on OmniTalk framing-error / abort escapes (0xFE / 0xFA)', () => {
+  it('discards on ClassicStack framing-error / abort escapes (0xFE / 0xFA)', () => {
     const llap = new Uint8Array([0xfe, 0xfe, 0x81]);
     const [b1, b2] = fcsBytes(llap);
     const dec = new TashTalkDecoder();

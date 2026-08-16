@@ -1,4 +1,4 @@
-/** DDP long + short header codecs (OmniTalk core/protocol/ddp). */
+/** DDP long + short header codecs (ClassicStack core/protocol/ddp). */
 
 import { appendBe16, be16, writeBe16 } from './binary';
 

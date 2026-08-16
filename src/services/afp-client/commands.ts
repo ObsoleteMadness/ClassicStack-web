@@ -16,7 +16,7 @@ function even(out: number[]): void {
 /**
  * AFP pathname bytes (no length prefix): leading NUL, elements joined by NUL.
  * Empty path → single NUL (“this directory”). Wrapped with putPString on the wire
- * (OmniTalk afpWirePath + PutPString).
+ * (ClassicStack afpWirePath + PutPString).
  */
 export function wirePath(path: string): Uint8Array {
   const trimmed = path.replace(/^\/+|\/+$/g, '');
@@ -30,7 +30,7 @@ export function wirePath(path: string): Uint8Array {
   return new Uint8Array(parts);
 }
 
-/** pathType(1) + Pascal pathname (OmniTalk command marshals). */
+/** pathType(1) + Pascal pathname (ClassicStack command marshals). */
 function putPath(out: number[], path: string): void {
   out.push(C.PathTypeLongNames);
   putPString(out, wirePath(path));
@@ -159,7 +159,7 @@ export function openVol(name: string, bitmap = C.VolBitmapID | C.VolBitmapSignat
 
 export function parseOpenVol(b: Uint8Array): { volId: number } {
   // Reply: bitmap echo then params; VolID is typically after signature fields.
-  // Minimal: many servers return bitmap(2) + ... + volID. OmniTalk ParseVolParams:
+  // Minimal: many servers return bitmap(2) + ... + volID. ClassicStack ParseVolParams:
   // walk bitmap. For ID-only bitmap bit5: after attrs/sig/dates...
   // Simplified parse: if body has at least 4 bytes after optional fields, find volID.
   if (b.length < 4) return { volId: 0 };
@@ -215,7 +215,7 @@ export interface DirEntry {
 export function parseEnumerate(b: Uint8Array, fileBitmap: number, dirBitmap: number): DirEntry[] {
   if (b.length < 6) return [];
   // Reply: fileBitmap(2) dirBitmap(2) count(2) then
-  // {entryLen(1) type(1) <params>}×count — OmniTalk ParseEnumerateReply / server buildEnumRecord.
+  // {entryLen(1) type(1) <params>}×count — ClassicStack ParseEnumerateReply / server buildEnumRecord.
   const fbm = be16(b, 0);
   const dbm = be16(b, 2);
   const count = be16(b, 4);
@@ -293,7 +293,7 @@ function parseParms(b: Uint8Array, bitmap: number, isDir: boolean): DirEntry {
     if (bitmap & C.DirBitmapOffspring) o += 2;
   }
   // Long name is a Pascal string at offset from start of parameters (or absolute in record).
-  // OmniTalk stores offset relative to start of the parameter block.
+  // ClassicStack stores offset relative to start of the parameter block.
   if (longNameOff > 0 && longNameOff < b.length) {
     const len = b[longNameOff]!;
     entry.name = decodeMacRoman(b.subarray(longNameOff + 1, longNameOff + 1 + len));
@@ -419,7 +419,7 @@ export function readFork(forkRef: number, offset: number, count: number): Uint8A
   appendBe16(out, forkRef);
   appendBe32(out, offset);
   appendBe32(out, count);
-  // newLineMask + newLineChar (14-byte fixed FPRead block; OmniTalk / System 7.5 PFS)
+  // newLineMask + newLineChar (14-byte fixed FPRead block; ClassicStack / System 7.5 PFS)
   out.push(0, 0);
   return new Uint8Array(out);
 }
@@ -461,7 +461,7 @@ export function setFileDirParms(
   appendBe32(out, dirId);
   appendBe16(out, bitmap);
   putPath(out, path);
-  even(out); // param block word-aligned from start of command (OmniTalk)
+  even(out); // param block word-aligned from start of command (ClassicStack)
   if (bitmap & C.FDBitmapAttributes) appendBe16(out, dates?.attributes ?? 0);
   if (bitmap & C.FDBitmapParentDID) appendBe32(out, 0);
   if (bitmap & C.FDBitmapCreateDate) appendBe32(out, dates?.createDate ?? 0);

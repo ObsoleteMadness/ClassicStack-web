@@ -1,5 +1,5 @@
 /**
- * Host filesystem filename reserved-char escaping (OmniTalk core/fs/codec.go).
+ * Host filesystem filename reserved-char escaping (ClassicStack core/fs/codec.go).
  * Control chars and NTFS-illegal runes are stored as reversible "0xNN" tokens
  * (e.g. Mac "Icon\r" → "Icon0x0D" on disk). Unescape when importing into VFS.
  */
@@ -32,7 +32,7 @@ function upperHexRune(cp: number): string {
   return hex.length < 2 ? hex.padStart(2, '0') : hex;
 }
 
-/** Escape reserved runes as "0xNN" (OmniTalk ReservedSet.escape). */
+/** Escape reserved runes as "0xNN" (ClassicStack ReservedSet.escape). */
 export function escapeHostFilename(s: string): string {
   let needs = false;
   for (const ch of s) {

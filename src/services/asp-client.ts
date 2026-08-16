@@ -22,7 +22,7 @@ export class AspSession {
   private wssReady = false;
   /**
    * System 7 ASP accepts one Command/Write at a time and silently drops any
-   * other sequence (OmniTalk errata). Finder icon prefetch used to pipeline
+   * other sequence (ClassicStack errata). Finder icon prefetch used to pipeline
    * Enumerate + GetFileDirParms; the Mac then answered none of them.
    */
   private cmdTail: Promise<unknown> = Promise.resolve();
@@ -107,7 +107,7 @@ export class AspSession {
 
   /**
    * Answer server-initiated TReqs on the workstation session socket:
-   * WriteContinue (data pull), Tickle, Attention, CloseSession (OmniTalk serveWSS).
+   * WriteContinue (data pull), Tickle, Attention, CloseSession (ClassicStack serveWSS).
    */
   private ensureWssHandler(): void {
     if (this.wssReady) return;
@@ -146,7 +146,7 @@ export class AspSession {
   }
 
   /**
-   * First Command/Write on a session MUST be sequence 0 (OmniTalk nextSeq).
+   * First Command/Write on a session MUST be sequence 0 (ClassicStack nextSeq).
    * System 7 ASP silently drops any other first sequence.
    */
   private nextSeq(): number {
@@ -196,7 +196,7 @@ export class AspSession {
   }
 
   /**
-   * Two-phase ASP Write (OmniTalk client/asp Write):
+   * Two-phase ASP Write (ClassicStack client/asp Write):
    * 1. XO TReq to SSS with `cmdBlock` only (e.g. 12-byte FPWrite header naming reqCount).
    * 2. Server pulls `writeData` via WriteContinue TReq to our WSS (answered here).
    * 3. Server replies to phase-1 with AFP result + reply body.

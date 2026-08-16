@@ -1,4 +1,4 @@
-/** ASP constants and UserData helpers (OmniTalk core/protocol/asp). */
+/** ASP constants and UserData helpers (ClassicStack core/protocol/asp). */
 
 export const SPFuncCloseSess = 1;
 export const SPFuncCommand = 2;
@@ -58,7 +58,7 @@ export function packClose(sessionId: number): number {
   return packUserData(SPFuncCloseSess, sessionId, 0);
 }
 
-/** AFP attention flags in the SPAttention word (netatalk AFPATTN_* / OmniTalk AspAttn*). */
+/** AFP attention flags in the SPAttention word (netatalk AFPATTN_* / ClassicStack AspAttn*). */
 export const AttnServerGoingDown = 0x8000;
 export const AttnCrash = 0x4000;
 export const AttnMsg = 0x2000;

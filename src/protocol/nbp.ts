@@ -1,4 +1,4 @@
-/** NBP wire codec (OmniTalk core/protocol/nbp). */
+/** NBP wire codec (ClassicStack core/protocol/nbp). */
 
 import { encodeMacRoman, decodeMacRoman, atalkEqual } from './macroman';
 

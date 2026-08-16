@@ -64,7 +64,7 @@ export interface AfpOpenFileInfo {
 
 const MESSAGE_FETCH_GRACE_MS = 1500;
 
-/** In-flight ASP two-phase write (OmniTalk pendingWrite). */
+/** In-flight ASP two-phase write (ClassicStack pendingWrite). */
 interface PendingWrite {
   reply: (userData: number, data: Uint8Array) => Promise<void>;
   sess: Session;
@@ -319,7 +319,7 @@ export class AfpServer {
   }
 
   /**
-   * ASP two-phase write (OmniTalk handleWrite):
+   * ASP two-phase write (ClassicStack handleWrite):
    * phase 1 — client sends FPWrite/FPAddIcon header only
    * phase 2 — we TReq WriteContinue to WSS; client TResp's the data
    * phase 3 — we reply to the original aspWrite with the AFP result
@@ -596,7 +596,7 @@ export class AfpServer {
   private openVol(sess: Session, block: Uint8Array): [Uint8Array, number] {
     const reqBitmap = be16(block, 2);
     sess.volId = 1;
-    // Always include VolumeID so the client has a usable handle (OmniTalk).
+    // Always include VolumeID so the client has a usable handle (ClassicStack).
     const bitmap = reqBitmap | C.VolBitmapID;
     return [this.packVolReply(bitmap), C.NoErr];
   }
@@ -671,7 +671,7 @@ export class AfpServer {
   }
 
   /**
-   * OmniTalk enumEntry: [len:1][type:1][params…] padded to even length.
+   * ClassicStack enumEntry: [len:1][type:1][params…] padded to even length.
    * Params start at entry offset 2 — name offsets are relative to params[0], NOT
    * including a pad byte between type and params.
    */
@@ -688,7 +688,7 @@ export class AfpServer {
   }
 
   /**
-   * Pack file/dir params in ascending bitmap-bit order (OmniTalk parms.go).
+   * Pack file/dir params in ascending bitmap-bit order (ClassicStack parms.go).
    * Long/Short name fields are 2-byte offsets into a trailing Pascal-string area;
    * offsets are measured from the start of this parameter block.
    */
@@ -848,7 +848,7 @@ export class AfpServer {
   }
 
   private async writeFork(sess: Session, block: Uint8Array, _isWrite: boolean): Promise<[Uint8Array, number]> {
-    // cmd(1) flag(1) forkRef(2) offset(4) reqCount(4) data…  (OmniTalk afpWrite)
+    // cmd(1) flag(1) forkRef(2) offset(4) reqCount(4) data…  (ClassicStack afpWrite)
     // Reply: lastWritten(4) — fork offset one past the last byte written.
     if (block.length < 12) return [new Uint8Array(), C.ErrParamErr];
     const fromEnd = (block[1]! & 0x80) !== 0;
@@ -925,7 +925,7 @@ export class AfpServer {
 
   private async setParms(block: Uint8Array): Promise<[Uint8Array, number]> {
     // cmd pad volID(2) dirID(4) bitmap(2) pathType(1) pathname [pad even] <params in bit order>
-    // OmniTalk afpSetFileDirParms / setParamsFinderInfo — FinderInfo is NOT always first.
+    // ClassicStack afpSetFileDirParms / setParamsFinderInfo — FinderInfo is NOT always first.
     if (block.length < 11) return [new Uint8Array(), C.ErrParamErr];
     const dirId = be32(block, 4);
     const bitmap = be16(block, 8);
@@ -972,7 +972,7 @@ export class AfpServer {
 
   private async getParms(block: Uint8Array): Promise<[Uint8Array, number]> {
     // Request: cmd pad volID(2) dirID(4) fileBitmap(2) dirBitmap(2) pathType(1) pathname…
-    // Reply (OmniTalk FPGetFileDirParmsRes): fileBitmap(2) dirBitmap(2) type(1) pad(1) params
+    // Reply (ClassicStack FPGetFileDirParmsRes): fileBitmap(2) dirBitmap(2) type(1) pad(1) params
     const dirId = be32(block, 4);
     const fileBitmap = be16(block, 8);
     const dirBitmap = be16(block, 10);
@@ -1042,7 +1042,7 @@ export class AfpServer {
   }
 
   private readPathName(block: Uint8Array, start: number): string {
-    // OmniTalk: pathType(1) at `start`, then a Pascal string (length byte + bytes).
+    // ClassicStack: pathType(1) at `start`, then a Pascal string (length byte + bytes).
     if (start >= block.length) return '';
     const pathType = block[start]!;
     // pathType 1/2/3 are short/long/UTF8; anything else treat `start` as the Pascal length.
@@ -1050,7 +1050,7 @@ export class AfpServer {
     return this.readPascalName(block, o);
   }
 
-  /** Pascal pathname at `o`: length byte then that many MacRoman bytes (OmniTalk pascalPathAt). */
+  /** Pascal pathname at `o`: length byte then that many MacRoman bytes (ClassicStack pascalPathAt). */
   private readPascalName(block: Uint8Array, o: number): string {
     if (o >= block.length) return '';
     const n = block[o]!;
@@ -1061,7 +1061,7 @@ export class AfpServer {
 
   /**
    * AFP long-name path bodies are often leading-NUL + elements joined by NUL
-   * (OmniTalk afpWirePath). Strip edge NULs; for multi-level under a dirID that
+   * (ClassicStack afpWirePath). Strip edge NULs; for multi-level under a dirID that
    * already names the parent, use the leaf element.
    */
   private normalizeWirePathName(raw: Uint8Array): string {
@@ -1152,7 +1152,7 @@ function shortenMacName(name: string): string {
   return name.slice(0, 12);
 }
 
-/** Bytes to pull in ASP WriteContinue + fixed header length (OmniTalk writeDataCount). */
+/** Bytes to pull in ASP WriteContinue + fixed header length (ClassicStack writeDataCount). */
 function writeDataCount(block: Uint8Array): { want: number; hdrLen: number } {
   if (block.length >= 12 && block[0] === C.CmdWrite) {
     const n = be32(block, 8) | 0;

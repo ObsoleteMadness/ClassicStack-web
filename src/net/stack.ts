@@ -2,7 +2,7 @@
  * LocalTalk node + DDP demux over WebSerial/TashTalk.
  * respondToEnq=false — TashTalk MCU owns ENQ/RTS defence on the physical segment.
  *
- * Claim path mirrors OmniTalk adapter/link/framing/localtalk.go:
+ * Claim path mirrors ClassicStack adapter/link/framing/localtalk.go:
  * arm the hardware node filter (setNodeIds) BEFORE announcing OnClaimed, and treat
  * inbound ENQ/ACK for the candidate as a collision that rerolls the probe burst.
  */
@@ -15,7 +15,7 @@ import { log } from '../util/logger';
 
 export type DdpHandler = (dg: Datagram) => void;
 
-/** Spec default: ~2s of ENQs at 250ms (OmniTalk llap.DefaultProbeCount). */
+/** Spec default: ~2s of ENQs at 250ms (ClassicStack llap.DefaultProbeCount). */
 const DefaultProbeCount = 8;
 const ProbeIntervalMs = 250;
 
@@ -97,7 +97,7 @@ export class LocalTalkStack {
   }
 
   /**
-   * Publish the claimed node: arm TashTalk's receive filter FIRST (OmniTalk gap),
+   * Publish the claimed node: arm TashTalk's receive filter FIRST (ClassicStack gap),
    * then notify listeners. Without the filter the MCU drops every inbound frame.
    */
   private async finishClaim(node: number): Promise<void> {

@@ -1,6 +1,6 @@
 /**
  * Apple-variant Snefru-128 for classic Mac netboot payload authentication.
- * Port of OmniTalk core/hash/snefru (Elliot Nunn snefru_hash.py / Apple Hash.c).
+ * Port of ClassicStack core/hash/snefru (Elliot Nunn snefru_hash.py / Apple Hash.c).
  */
 
 import { be32, writeBe32 } from '../../protocol/binary';

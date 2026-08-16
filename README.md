@@ -42,7 +42,7 @@ npm run build
 
 See the plan: TashTalk → LLAP/DDP → NBP → ATP → ASP → AFP, with a VirtualFS + Desktop DB for the local share. Netboot rides DDP type 10 on sockets 10/11 beside AFP.
 
-Protocol codecs mirror [ClassicStack / OmniTalk](https://github.com/ObsoleteMadness/ClassicStack).
+Protocol codecs mirror [ClassicStack](https://github.com/ObsoleteMadness/ClassicStack).
 
 ## Notes
 

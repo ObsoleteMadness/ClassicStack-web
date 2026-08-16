@@ -20,7 +20,7 @@ import type { VNode } from './virtual-fs';
 import { escapeHostFilename } from '../protocol/host-filename';
 
 export const CUSTOM_FOLDER_ICON_NAME = 'Icon\r';
-/** Host-escaped form of Icon\\r (OmniTalk/ClassicStack reserved-char token). */
+/** Host-escaped form of Icon\\r (ClassicStack reserved-char token). */
 export const CUSTOM_FOLDER_ICON_HOST_NAME = escapeHostFilename(CUSTOM_FOLDER_ICON_NAME);
 
 export function isCustomFolderIconName(name: string): boolean {

@@ -1,6 +1,6 @@
 /**
  * AppleTalk Boot Protocol (ABP) + ChainBoot EBP codecs.
- * Port of OmniTalk core/protocol/abp (Elliot Nunn / Apple SuperMario).
+ * Port of ClassicStack core/protocol/abp (Elliot Nunn / Apple SuperMario).
  */
 
 import { appendBe16, appendBe32, be16, be32 } from './binary';

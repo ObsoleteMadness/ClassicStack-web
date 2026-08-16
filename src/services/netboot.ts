@@ -1,6 +1,6 @@
 /**
  * Classic Mac AppleTalk Netboot server (ABP + ChainBoot EBP).
- * Port of OmniTalk core/service/netboot (Elliot Nunn / Apple SuperMario).
+ * Port of ClassicStack core/service/netboot (Elliot Nunn / Apple SuperMario).
  */
 
 import * as abp from '../protocol/abp';
@@ -112,7 +112,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
   });
 }
 
-/** Escalate EBP reply pace on consecutive chunk retries (OmniTalk chainBackoffPace). */
+/** Escalate EBP reply pace on consecutive chunk retries (ClassicStack chainBackoffPace). */
 export function chainBackoffPace(baseMs: number, retries: number, count: number): number {
   if (retries <= 0) return baseMs;
   let pace = baseMs * (1 << Math.min(retries, 4));
@@ -132,7 +132,7 @@ function wantedBlocks(bitmap: Uint8Array, blocks: number): number[] {
 }
 
 /**
- * Assemble an ABP boot payload with Snefru trailer (OmniTalk loadPayload).
+ * Assemble an ABP boot payload with Snefru trailer (ClassicStack loadPayload).
  * imageBytes: optional RAM-disk contents concatenated onto the stub.
  */
 export function assemblePayload(

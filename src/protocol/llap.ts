@@ -1,4 +1,4 @@
-/** LLAP frame helpers (OmniTalk core/protocol/llap). */
+/** LLAP frame helpers (ClassicStack core/protocol/llap). */
 
 export const HeaderLen = 3;
 export const BroadcastNode = 0xff;

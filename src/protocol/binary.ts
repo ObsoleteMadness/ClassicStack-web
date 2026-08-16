@@ -1,4 +1,4 @@
-/** Big-endian binary helpers (mirrors OmniTalk binaryprimitives). */
+/** Big-endian binary helpers (mirrors ClassicStack binaryprimitives). */
 
 export function be16(b: Uint8Array, o = 0): number {
   return ((b[o]! << 8) | b[o + 1]!) >>> 0;

@@ -1,4 +1,4 @@
-/** Operator UI to push AFP server messages / disconnect Macintosh clients (OmniTalk AFP sessions). */
+/** Operator UI to push AFP server messages / disconnect Macintosh clients (ClassicStack AFP sessions). */
 
 import type { AfpSessionInfo } from '../services/afp-server/server';
 import { log } from '../util/logger';

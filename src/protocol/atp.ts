@@ -1,4 +1,4 @@
-/** ATP wire codec (OmniTalk core/protocol/atp). */
+/** ATP wire codec (ClassicStack core/protocol/atp). */
 
 import { be16, be32, writeBe16, writeBe32 } from './binary';
 
@@ -15,7 +15,7 @@ export const MaxATPData = 578;
 export const DDPType = 3;
 export const HeaderSize = 8;
 
-/** 3-bit TRel timeout in the low bits of an XO TReq control byte (OmniTalk TRel30s). */
+/** 3-bit TRel timeout in the low bits of an XO TReq control byte (ClassicStack TRel30s). */
 export const TRel30s = 0;
 
 export function setTRelTimeout(control: number, timeout: number = TRel30s): number {
@@ -32,7 +32,7 @@ export function maxRespFromBitmap(bitmap: number): number {
 }
 
 /**
- * OmniTalk `haveAll`: complete when the EOM packet and everything before it has
+ * ClassicStack `haveAll`: complete when the EOM packet and everything before it has
  * arrived, or when every packet the request asked for has arrived (System 7 often
  * omits EOM on a one-packet OpenSess/Command TResp).
  */
@@ -64,7 +64,7 @@ export function inferredEomSeq(maxResp: number, got: { has(seq: number): boolean
   return last;
 }
 
-/** Bitmap of still-missing response slots (OmniTalk missingMask). */
+/** Bitmap of still-missing response slots (ClassicStack missingMask). */
 export function missingBitmap(
   maxResp: number,
   got: { has(seq: number): boolean },

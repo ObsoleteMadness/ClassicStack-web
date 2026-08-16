@@ -91,7 +91,7 @@ export class WebSerialPort {
   /**
    * Arm the TashTalk hardware receive filter for these node IDs (1..254).
    * Required for any inbound traffic — the MCU bitmap starts empty after init.
-   * Mirrors OmniTalk SetNodeAddress; must complete before the stack goes live.
+   * Mirrors ClassicStack SetNodeAddress; must complete before the stack goes live.
    */
   async setNodeIds(nodes: number[]): Promise<void> {
     await this.writeRaw(encodeSetNodeIds(nodes));
