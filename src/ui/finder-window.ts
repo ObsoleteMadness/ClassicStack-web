@@ -186,6 +186,8 @@ export class FinderWindow extends HTMLElement {
   private showHiddenFiles = loadPrefs().showHiddenFiles;
   /** Decode dropped BinHex / MacBinary (persisted via prefs). */
   private autoExpandFiles = loadPrefs().autoExpandFiles;
+  /** Probe Icon\\r / resource forks for custom glyphs (persisted via prefs). */
+  private readFinderIcons = loadPrefs().readFinderIcons;
   /** Local item being dragged (null for external file drops). */
   private dragNodeId: number | null = null;
   private dragNode: VNode | null = null;
@@ -269,6 +271,18 @@ export class FinderWindow extends HTMLElement {
     if (this.autoExpandFiles === expand) return;
     this.autoExpandFiles = expand;
     savePrefs({ autoExpandFiles: expand });
+  }
+
+  getReadFinderIcons(): boolean {
+    return this.readFinderIcons;
+  }
+
+  /** Toggle Icon\\r / resource-fork icon reads; persists and refreshes glyphs. */
+  setReadFinderIcons(read: boolean): void {
+    if (this.readFinderIcons === read) return;
+    this.readFinderIcons = read;
+    savePrefs({ readFinderIcons: read });
+    this.invalidateIcons();
   }
 
   bind(vfs: Catalog, host: FinderHost): void {
@@ -1226,6 +1240,7 @@ export class FinderWindow extends HTMLElement {
 
   /** Load 16px folder icons for path crumbs (local share). */
   private prefetchPathIcons(crumbs: { id?: number }[]): void {
+    if (!this.readFinderIcons) return;
     const gen = this.iconLoadGen;
     for (const c of crumbs) {
       if (c.id == null) continue;
@@ -1493,6 +1508,11 @@ export class FinderWindow extends HTMLElement {
   }
 
   private iconLookup(node: VNode): Promise<IconUrls> {
+    if (!this.readFinderIcons) {
+      if (node.isDir) return Promise.resolve(DEFAULT_FOLDER_ICONS);
+      const { type, creator } = readTypeCreator(node.finderInfo);
+      return iconCache.getForTypeCreator(type, creator);
+    }
     // Folders in this view: named lookup of Icon\r (existence), not enumerate.
     return iconCache.getForNode(
       node,

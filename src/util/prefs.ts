@@ -7,6 +7,8 @@ const STORAGE_KEY = 'classicstack.prefs';
 export interface AppPrefs {
   /** When false, Finder hides items with the AppleDouble/Finder kIsInvisible flag (and Icon\\r). */
   showHiddenFiles: boolean;
+  /** When false, skip Icon\\r / resource-fork icon reads and use DIR/FILE system glyphs. */
+  readFinderIcons: boolean;
   /** When true, dropped .hqx / MacBinary .bin / StuffIt .sit / ZIP .zip files are decoded. */
   autoExpandFiles: boolean;
   /** Zip download layout: AppleDouble `._` beside files, or Mac OS X `__MACOSX/` folder. */
@@ -15,6 +17,7 @@ export interface AppPrefs {
 
 const DEFAULTS: AppPrefs = {
   showHiddenFiles: false,
+  readFinderIcons: true,
   autoExpandFiles: true,
   zipExportStyle: 'appledouble',
 };
@@ -29,6 +32,10 @@ export function loadPrefs(): AppPrefs {
         typeof parsed.showHiddenFiles === 'boolean'
           ? parsed.showHiddenFiles
           : DEFAULTS.showHiddenFiles,
+      readFinderIcons:
+        typeof parsed.readFinderIcons === 'boolean'
+          ? parsed.readFinderIcons
+          : DEFAULTS.readFinderIcons,
       autoExpandFiles:
         typeof parsed.autoExpandFiles === 'boolean'
           ? parsed.autoExpandFiles

@@ -78,6 +78,7 @@ export class AppMenuBar extends HTMLElement {
     const activityOpen = this.host ? !this.host.activityWindow.hidden : false;
     const showHidden = this.host?.finder?.getShowHiddenFiles?.() ?? false;
     const autoExpand = this.host?.finder?.getAutoExpandFiles?.() ?? false;
+    const readFinderIcons = this.host?.finder?.getReadFinderIcons?.() ?? true;
     const zipStyle = loadPrefs().zipExportStyle;
     const appOpen = this.openMenu === 'app';
     const advancedOpen = this.openMenu === 'advanced';
@@ -132,6 +133,10 @@ export class AppMenuBar extends HTMLElement {
               <button type="button" role="menuitemcheckbox" aria-checked="${autoExpand}" data-act="toggle-auto-expand" class="app-menu__item">
                 <span class="app-menu__check">${autoExpand ? '✓' : ''}</span>
                 Auto-expand files
+              </button>
+              <button type="button" role="menuitemcheckbox" aria-checked="${readFinderIcons}" data-act="toggle-read-finder-icons" class="app-menu__item">
+                <span class="app-menu__check">${readFinderIcons ? '✓' : ''}</span>
+                Read finder icons
               </button>
               <hr />
               <button type="button" role="menuitemradio" aria-checked="${zipStyle === 'appledouble'}" data-act="zip-appledouble" class="app-menu__item">
@@ -264,6 +269,13 @@ export class AppMenuBar extends HTMLElement {
     if (act === 'toggle-auto-expand') {
       const next = !(this.host.finder?.getAutoExpandFiles?.() ?? false);
       this.host.finder?.setAutoExpandFiles?.(next);
+      this.closeMenus();
+      return;
+    }
+
+    if (act === 'toggle-read-finder-icons') {
+      const next = !(this.host.finder?.getReadFinderIcons?.() ?? true);
+      this.host.finder?.setReadFinderIcons?.(next);
       this.closeMenus();
       return;
     }
