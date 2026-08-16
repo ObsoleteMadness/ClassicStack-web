@@ -3,7 +3,7 @@ import {
   type TransferJob,
 } from '../util/transfer-activity';
 import { formatBytes, formatBytesPerSec } from './format-bytes';
-import { uiIcons } from './lucide-icon';
+import { DEFAULT_FOLDER_ICONS } from '../fs/icon-cache';
 
 const STRUCTURE_ATTR = 'data-transfer-key';
 
@@ -43,7 +43,7 @@ function rowHtml(j: TransferJob, nested = false): string {
   const err = j.error ? `<div class="file-transfer__error">${escapeHtml(j.error)}</div>` : '';
   const icon =
     j.kind === 'folder'
-      ? `<span class="file-transfer__icon">${uiIcons.folder}</span>`
+      ? `<img class="file-transfer__icon" src="${DEFAULT_FOLDER_ICONS.small}" alt="" width="16" height="16" />`
       : `<img class="file-transfer__icon" src="${escapeHtml(j.iconSrc)}" alt="" width="16" height="16" />`;
   const nestClass = nested ? ' file-transfer--sub' : '';
   const statusClass =

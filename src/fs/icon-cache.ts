@@ -190,6 +190,12 @@ function systemIconUrl(name: string): string {
   return `/icons/${name}`;
 }
 
+/** Classic System 7 folder glyphs served from ./icons. */
+export const DEFAULT_FOLDER_ICONS: IconUrls = {
+  small: systemIconUrl('DIR16.png'),
+  large: systemIconUrl('DIR32.png'),
+};
+
 /** True when the cache fell back to the classic DIR16/DIR32 PNGs. */
 export function isDefaultFolderIcon(urls: IconUrls): boolean {
   return isDefaultFolderIconUrl(urls.small) || isDefaultFolderIconUrl(urls.large);
@@ -406,12 +412,7 @@ export class IconCache {
     // Named Icon\\r lookup only when the caller supplies findChild (Finder does
     // this for folders in the current view). Do not enumerate the directory.
     if (!findChild) {
-      return (
-        this.defaultFolder ?? {
-          small: systemIconUrl('DIR16.png'),
-          large: systemIconUrl('DIR32.png'),
-        }
-      );
+      return this.defaultFolder ?? DEFAULT_FOLDER_ICONS;
     }
 
     const pending = this.dirInflight.get(pathKey);
@@ -466,10 +467,7 @@ export class IconCache {
       }
     }
 
-    const urls = this.defaultFolder ?? {
-      small: systemIconUrl('DIR16.png'),
-      large: systemIconUrl('DIR32.png'),
-    };
+    const urls = this.defaultFolder ?? DEFAULT_FOLDER_ICONS;
     this.dirMemory.set(pathKey, urls);
     return urls;
   }

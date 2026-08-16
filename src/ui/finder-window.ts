@@ -11,6 +11,7 @@ import {
   isCustomFolderIconName,
   isFinderInvisible,
   isDefaultFolderIcon,
+  DEFAULT_FOLDER_ICONS,
   type IconUrls,
 } from '../fs/icon-cache';
 import { expandArchiveFile, expandFailureMessage, isExpandableArchive, type ExpandedNode } from '../fs/expand-incoming';
@@ -1441,18 +1442,19 @@ export class FinderWindow extends HTMLElement {
   }
 
   private folderGlyphHtml(size: 'small' | 'large', kind: 'icon' | 'row' | 'col' | 'crumb' | 'preview'): string {
-    const svg = size === 'large' ? uiIcons.folderLarge : uiIcons.folder;
+    const px = size === 'large' ? 32 : 16;
+    const src = size === 'large' ? DEFAULT_FOLDER_ICONS.large : DEFAULT_FOLDER_ICONS.small;
     const cls =
       kind === 'icon'
-        ? 'icon-glyph-svg'
+        ? 'icon-glyph-img'
         : kind === 'col'
-          ? 'col-icon-svg'
+          ? 'col-icon-img'
           : kind === 'row'
-            ? 'row-icon-svg'
+            ? 'row-icon-img'
             : kind === 'crumb'
-              ? 'crumb-icon-svg'
-              : 'preview-glyph-svg';
-    return `<span class="${cls}" aria-hidden="true">${svg}</span>`;
+              ? 'crumb-icon-img'
+              : 'preview-glyph-img';
+    return `<img class="${cls}" src="${src}" alt="" width="${px}" height="${px}" draggable="false" />`;
   }
 
   private listingSpinnerHtml(kind: 'icon' | 'row' | 'col' | 'crumb' | 'preview'): string {
