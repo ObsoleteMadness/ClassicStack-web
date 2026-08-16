@@ -1269,6 +1269,7 @@ export class FinderWindow extends HTMLElement {
     const keepScroll = this.view !== 'column';
     const scrollTop = keepScroll ? content.scrollTop : 0;
     const scrollLeft = keepScroll ? content.scrollLeft : 0;
+    const columnPaneScroll = this.view === 'column' ? this.captureColumnPaneScroll() : null;
 
     let iconItems: ListItem[] = [];
 
@@ -1304,7 +1305,9 @@ export class FinderWindow extends HTMLElement {
     }
 
     if (this.view === 'column') {
+      this.restoreColumnPaneScroll(columnPaneScroll);
       this.scrollColumnsToEnd();
+      requestAnimationFrame(() => this.restoreColumnPaneScroll(columnPaneScroll));
     } else {
       content.scrollTop = scrollTop;
       content.scrollLeft = scrollLeft;
@@ -1335,7 +1338,7 @@ export class FinderWindow extends HTMLElement {
   /** Update only the floating properties card so item DOM (and dblclick) survives. */
   private refreshPropsPanel(): void {
     if (this.view === 'column') {
-      this.renderContent();
+      this.paintColumnSelection();
       return;
     }
     const layer = this.querySelector('.props-layer');
@@ -1375,6 +1378,79 @@ export class FinderWindow extends HTMLElement {
     requestAnimationFrame(() => {
       scroller.scrollLeft = scroller.scrollWidth;
     });
+  }
+
+  /** Per-column vertical offsets, keyed by `data-col-index` or `"preview"`. */
+  private captureColumnPaneScroll(): Map<string, number> {
+    const out = new Map<string, number>();
+    const view = this.querySelector('.column-view');
+    if (!view) return out;
+    view.querySelectorAll('.column-pane').forEach((pane) => {
+      const key = this.columnPaneScrollKey(pane);
+      if (key != null) out.set(key, (pane as HTMLElement).scrollTop);
+    });
+    return out;
+  }
+
+  private restoreColumnPaneScroll(saved: Map<string, number> | null): void {
+    if (!saved || saved.size === 0) return;
+    const view = this.querySelector('.column-view');
+    if (!view) return;
+    view.querySelectorAll('.column-pane').forEach((pane) => {
+      const key = this.columnPaneScrollKey(pane);
+      if (key == null) return;
+      const top = saved.get(key);
+      if (top != null) (pane as HTMLElement).scrollTop = top;
+    });
+  }
+
+  private columnPaneScrollKey(pane: Element): string | null {
+    const col = pane.closest('.column');
+    if (!col) return null;
+    return col.getAttribute('data-col-index') ?? (col.hasAttribute('data-preview') ? 'preview' : null);
+  }
+
+  /** Highlight the selection and swap the info pane without remounting list columns. */
+  private paintColumnSelection(): void {
+    const view = this.querySelector('.column-view');
+    if (!view) {
+      this.renderContent();
+      return;
+    }
+    const listColCount = this.columnChildren.length;
+    for (let i = 0; i < listColCount; i++) {
+      if (!view.querySelector(`[data-col-index="${i}"]`)) {
+        this.renderContent();
+        return;
+      }
+    }
+
+    view.querySelectorAll(':scope > .column[data-col-index]').forEach((col) => {
+      const idx = Number(col.getAttribute('data-col-index'));
+      if (Number.isFinite(idx) && idx >= listColCount) col.remove();
+    });
+    view.querySelector('.column--loading')?.remove();
+
+    for (let colIndex = 0; colIndex < listColCount; colIndex++) {
+      const kids = this.columnChildren[colIndex]!;
+      const selectedInColumn = this.columnSelectionId(colIndex, kids, listColCount);
+      view.querySelectorAll(`[data-col-index="${colIndex}"] .col-item[data-id]`).forEach((el) => {
+        const id = Number(el.getAttribute('data-id'));
+        el.classList.toggle('selected', selectedInColumn != null && id === selectedInColumn);
+      });
+    }
+
+    const preview = this.columnLoading ? null : this.columnPreviewNode();
+    const existing = view.querySelector('[data-preview]') as HTMLElement | null;
+    if (!preview) {
+      existing?.remove();
+    } else if (existing?.getAttribute('data-id') !== String(preview.id)) {
+      existing?.remove();
+      view.insertAdjacentHTML('beforeend', this.itemInfoHtml(preview, { variant: 'column' }));
+    }
+
+    this.syncClipboardButtons();
+    this.scrollColumnsToEnd();
   }
 
   private buildOutlineRows(nodes: VNode[], depth: number): { item: ListItem; depth: number }[] {
@@ -2070,7 +2146,7 @@ export class FinderWindow extends HTMLElement {
         this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
         this.nodes = this.columnChildren[this.columnChildren.length - 1] ?? this.nodes;
         this.renderPath();
-        this.renderContent();
+        this.paintColumnSelection();
       }
       if (beforePath !== this.pathNamesForUrl().join('/')) this.syncHistory();
       return;
