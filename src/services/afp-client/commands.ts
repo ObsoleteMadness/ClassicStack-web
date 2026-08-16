@@ -3,6 +3,7 @@
 import { appendBe16, appendBe32, be16, be32 } from '../../protocol/binary';
 import { encodeMacRoman, decodeMacRoman } from '../../protocol/macroman';
 import * as C from '../../protocol/afp/constants';
+import { throwIfAborted } from '../../util/abort';
 
 function putPString(out: number[], s: string | Uint8Array): void {
   const b = typeof s === 'string' ? encodeMacRoman(s) : s;
@@ -251,12 +252,15 @@ export async function collectEnumeratePages(
   readPage: (startIndex: number) => Promise<DirEntry[] | null>,
   onBatch?: (batch: DirEntry[]) => void | Promise<void>,
   pageSize = ENUMERATE_REQ_COUNT,
+  signal?: AbortSignal,
 ): Promise<DirEntry[]> {
   const all: DirEntry[] = [];
   let start = 1;
   for (;;) {
+    throwIfAborted(signal);
     const batch = await readPage(start);
     if (!batch || batch.length === 0) break;
+    throwIfAborted(signal);
     all.push(...batch);
     await onBatch?.(batch);
     start += batch.length;

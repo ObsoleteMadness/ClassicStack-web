@@ -7,6 +7,7 @@ import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appled
 import { be32 } from '../protocol/binary';
 import { importDataTransferInto, readBlobProgress, type ImportProgress } from './import-transfer';
 import { finderInfoFromName } from './extension-map';
+import { throwIfAborted } from '../util/abort';
 
 export type VfsChange = { parentIds: number[] };
 export type VfsChangeListener = (change: VfsChange) => void;
@@ -37,10 +38,13 @@ export interface Catalog {
   get(id: number): Promise<VNode | undefined>;
   /** Load data/resource forks if the catalog stores them separately (remote AFP). */
   ensureContent(id: number, onBytes?: (n: number) => void): Promise<VNode | undefined>;
-  children(parentId: number, onBatch?: ChildrenBatchListener): Promise<VNode[]>;
-  lookup(parentId: number, name: string): Promise<VNode | undefined>;
+  children(parentId: number, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]>;
+  lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined>;
   /** Enough of the resource fork to decode Finder icons (optional; remote AFP). */
-  loadIconResources?(node: VNode): Promise<import('./resource-fork').ResourceFork | null>;
+  loadIconResources?(
+    node: VNode,
+    signal?: AbortSignal,
+  ): Promise<import('./resource-fork').ResourceFork | null>;
   mkdir(parentId: number, name: string): Promise<VNode>;
   ensureDir(parentId: number, name: string): Promise<VNode>;
   createFile(
@@ -198,14 +202,16 @@ export class VirtualFS implements Catalog {
     await this.db.delete('nodes', id);
   }
 
-  async children(parentId: number, onBatch?: ChildrenBatchListener): Promise<VNode[]> {
+  async children(parentId: number, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]> {
+    throwIfAborted(signal);
     const all = await this.db.getAllFromIndex('nodes', 'parentId', parentId);
     const kids = all.map(revive);
     await onBatch?.(kids);
     return kids;
   }
 
-  async lookup(parentId: number, name: string): Promise<VNode | undefined> {
+  async lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined> {
+    throwIfAborted(signal);
     const lower = name.toLowerCase();
     if (this.nameCache) {
       await this.ensureParentNameCache(parentId);

@@ -26,4 +26,31 @@ describe('AsyncSemaphore', () => {
     await expect(sem.run(async () => { throw new Error('boom'); })).rejects.toThrow('boom');
     await expect(sem.run(async () => 'ok')).resolves.toBe('ok');
   });
+
+  it('skips a queued task when its signal aborts', async () => {
+    const sem = new AsyncSemaphore(1);
+    let started = 0;
+    const ac = new AbortController();
+    let release!: () => void;
+    const held = sem.run(
+      () =>
+        new Promise<void>((resolve) => {
+          started++;
+          release = resolve;
+        }),
+    );
+    const queued = sem.run(async () => {
+      started++;
+    }, ac.signal);
+    await Promise.resolve();
+    ac.abort();
+    await expect(queued).rejects.toMatchObject({ name: 'AbortError' });
+    release();
+    await held;
+    expect(started).toBe(1);
+    await sem.run(async () => {
+      started++;
+    });
+    expect(started).toBe(2);
+  });
 });

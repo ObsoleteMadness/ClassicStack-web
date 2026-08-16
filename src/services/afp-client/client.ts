@@ -10,6 +10,7 @@ import { encodeMacRoman, decodeMacRoman } from '../../protocol/macroman';
 import { be16, be32 } from '../../protocol/binary';
 import { log } from '../../util/logger';
 import { AsyncSemaphore } from '../../util/async-semaphore';
+import { throwIfAborted } from '../../util/abort';
 
 /** Keep OpenFork sessions (and other long AFP tasks) from flooding a classic server. */
 const MAX_PARALLEL_TASKS = 3;
@@ -419,8 +420,9 @@ export class AfpClient {
     path = '',
     volId?: number,
     onBatch?: (batch: cmd.DirEntry[]) => void | Promise<void>,
+    signal?: AbortSignal,
   ): Promise<cmd.DirEntry[]> {
-    return this.tasks.run(() => this.listUnlocked(dirId, path, volId, onBatch));
+    return this.tasks.run(() => this.listUnlocked(dirId, path, volId, onBatch, signal), signal);
   }
 
   private async listUnlocked(
@@ -428,31 +430,42 @@ export class AfpClient {
     path: string,
     volId?: number,
     onBatch?: (batch: cmd.DirEntry[]) => void | Promise<void>,
+    signal?: AbortSignal,
   ): Promise<cmd.DirEntry[]> {
     const vol = this.vid(volId);
     if (!vol) return [];
-    return cmd.collectEnumeratePages(async (start) => {
-      const r = await this.fp(
-        cmd.enumerate(
-          vol,
-          dirId,
-          cmd.DEFAULT_FILE_BITMAP,
-          cmd.DEFAULT_DIR_BITMAP,
-          cmd.ENUMERATE_REQ_COUNT,
-          start,
-          4000,
-          path,
-        ),
-        { bitmap: 0xff },
-      );
-      if (r.result === C.ErrObjectNotFnd) return null;
-      if (r.result !== C.NoErr) throw new Error(`FPEnumerate ${r.result}`);
-      return cmd.parseEnumerate(r.data, cmd.DEFAULT_FILE_BITMAP, cmd.DEFAULT_DIR_BITMAP);
-    }, onBatch);
+    return cmd.collectEnumeratePages(
+      async (start) => {
+        const r = await this.fp(
+          cmd.enumerate(
+            vol,
+            dirId,
+            cmd.DEFAULT_FILE_BITMAP,
+            cmd.DEFAULT_DIR_BITMAP,
+            cmd.ENUMERATE_REQ_COUNT,
+            start,
+            4000,
+            path,
+          ),
+          { bitmap: 0xff },
+        );
+        if (r.result === C.ErrObjectNotFnd) return null;
+        if (r.result !== C.NoErr) throw new Error(`FPEnumerate ${r.result}`);
+        return cmd.parseEnumerate(r.data, cmd.DEFAULT_FILE_BITMAP, cmd.DEFAULT_DIR_BITMAP);
+      },
+      onBatch,
+      cmd.ENUMERATE_REQ_COUNT,
+      signal,
+    );
   }
 
-  async stat(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry | undefined> {
-    return this.tasks.run(() => this.statUnlocked(dirId, path, volId));
+  async stat(
+    dirId: number,
+    path: string,
+    volId?: number,
+    signal?: AbortSignal,
+  ): Promise<cmd.DirEntry | undefined> {
+    return this.tasks.run(() => this.statUnlocked(dirId, path, volId), signal);
   }
 
   private async statUnlocked(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry | undefined> {
@@ -507,8 +520,12 @@ export class AfpClient {
     resource: boolean,
     fn: (read: (offset: number, count: number) => Promise<Uint8Array>) => Promise<T>,
     volId?: number,
+    signal?: AbortSignal,
   ): Promise<T> {
-    return this.tasks.run(() => this.withForkReaderUnlocked(path, dirId, resource, fn, volId));
+    return this.tasks.run(
+      () => this.withForkReaderUnlocked(path, dirId, resource, fn, volId, signal),
+      signal,
+    );
   }
 
   private async withForkReaderUnlocked<T>(
@@ -517,12 +534,15 @@ export class AfpClient {
     resource: boolean,
     fn: (read: (offset: number, count: number) => Promise<Uint8Array>) => Promise<T>,
     volId?: number,
+    signal?: AbortSignal,
   ): Promise<T> {
+    throwIfAborted(signal);
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
     return this.withOpenFork(
       cmd.openFork(this.vid(volId), dirId, 0, C.AccessRead, flag, path),
       async (forkRef) => {
         const read = async (offset: number, count: number): Promise<Uint8Array> => {
+          throwIfAborted(signal);
           const bitmap = count <= 578 ? 0x01 : 0xff;
           const rr = await this.fp(cmd.readFork(forkRef, offset, count), { bitmap });
           if (rr.result === C.ErrEOFErr) return rr.data;

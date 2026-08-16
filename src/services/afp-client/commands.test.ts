@@ -171,6 +171,24 @@ describe('collectEnumeratePages', () => {
     const all = await collectEnumeratePages(async () => null);
     expect(all).toEqual([]);
   });
+
+  it('skips further pages after abort and rejects AbortError', async () => {
+    const ac = new AbortController();
+    const full = Array.from({ length: ENUMERATE_REQ_COUNT }, (_, i) => dirEnt(`p${i}`, 10 + i));
+    let reads = 0;
+    const p = collectEnumeratePages(
+      async () => {
+        reads++;
+        ac.abort();
+        return full;
+      },
+      undefined,
+      ENUMERATE_REQ_COUNT,
+      ac.signal,
+    );
+    await expect(p).rejects.toMatchObject({ name: 'AbortError' });
+    expect(reads).toBe(1);
+  });
 });
 
 describe('AFP client setFileDirParms', () => {

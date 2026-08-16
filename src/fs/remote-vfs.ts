@@ -11,6 +11,7 @@ import { importDataTransferInto, type ImportProgress } from './import-transfer';
 import { finderInfoFromName } from './extension-map';
 import { loadFinderIconFork, ResourceFork } from './resource-fork';
 import { iconForkLoadOptions } from './icon-cache';
+import { isAbortError, throwIfAborted } from '../util/abort';
 
 const EMPTY = new Uint8Array();
 
@@ -66,7 +67,11 @@ export class RemoteVfs implements Catalog {
     return node;
   }
 
-  async children(parentId: number, onBatch?: ChildrenBatchListener): Promise<VNode[]> {
+  async children(
+    parentId: number,
+    onBatch?: ChildrenBatchListener,
+    signal?: AbortSignal,
+  ): Promise<VNode[]> {
     const kids: VNode[] = [];
     const seen = new Set<number>();
     const take = async (batch: DirEntry[]) => {
@@ -79,27 +84,30 @@ export class RemoteVfs implements Catalog {
       }
       if (added) await onBatch?.(kids);
     };
-    const entries = await this.client.list(parentId, '', this.volId, take);
+    const entries = await this.client.list(parentId, '', this.volId, take, signal);
     await take(entries);
     return kids;
   }
 
-  async lookup(parentId: number, name: string): Promise<VNode | undefined> {
+  async lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined> {
+    throwIfAborted(signal);
     const lower = name.toLowerCase();
     for (const n of this.nodes.values()) {
       if (n.parentId === parentId && n.name.toLowerCase() === lower) return n;
     }
     try {
-      const e = await this.client.stat(parentId, name, this.volId);
+      const e = await this.client.stat(parentId, name, this.volId, signal);
       if (!e) return undefined;
       if (!e.name) e.name = name;
       return this.adopt(e, parentId);
-    } catch {
+    } catch (err) {
+      if (isAbortError(err)) throw err;
       return undefined;
     }
   }
 
-  async loadIconResources(node: VNode): Promise<ResourceFork | null> {
+  async loadIconResources(node: VNode, signal?: AbortSignal): Promise<ResourceFork | null> {
+    throwIfAborted(signal);
     if (node.resource.length >= 16) return ResourceFork.fromBytes(node.resource);
     const rsrcLen = node.resourceBytes ?? 0;
     if (rsrcLen < 16) return null;
@@ -110,8 +118,10 @@ export class RemoteVfs implements Catalog {
         true,
         (read) => loadFinderIconFork(read, iconForkLoadOptions(node)),
         this.volId,
+        signal,
       );
-    } catch {
+    } catch (err) {
+      if (isAbortError(err)) throw err;
       return null;
     }
   }

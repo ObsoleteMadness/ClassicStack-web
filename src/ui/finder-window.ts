@@ -19,6 +19,7 @@ import { importExpandedTree, type ImportItemTrack } from '../fs/import-transfer'
 import { filenameExtension } from '../fs/extension-map';
 import { loadPrefs, savePrefs } from '../util/prefs';
 import { log } from '../util/logger';
+import { isAbortError } from '../util/abort';
 import { uiIcons } from './lucide-icon';
 import { enableWindowResize } from './window-resize';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
@@ -195,6 +196,10 @@ export class FinderWindow extends HTMLElement {
   /** Resolved icon URLs keyed by ListItem.key (or type|creator). */
   private iconUrls = new Map<string, IconUrls>();
   private iconLoadGen = 0;
+  /** Cancels the in-flight cwd / column listing when navigating to another folder. */
+  private navListAbort: AbortController | null = null;
+  /** Per-folder list-view disclose listings; aborted on collapse or navigation. */
+  private expandListAbort = new Map<number, AbortController>();
   private networkScanning = false;
   private preview: { id: number; name: string; text: string | null; truncated?: boolean; error?: string } | null =
     null;
@@ -286,6 +291,7 @@ export class FinderWindow extends HTMLElement {
     this.folderOpening = false;
     this.iconUrls.clear();
     this.iconLoadGen++;
+    this.abortAllListings();
   }
 
   private dropRemoteCatalogs(nbp?: string): void {
@@ -345,6 +351,7 @@ export class FinderWindow extends HTMLElement {
       clearTimeout(this.vfsRefreshTimer);
       this.vfsRefreshTimer = null;
     }
+    this.abortAllListings();
   }
 
   /** AFP / local mutations land here; debounce so fork writes don't thrash the UI. */
@@ -786,48 +793,110 @@ export class FinderWindow extends HTMLElement {
     return stack;
   }
 
+  private abortAllExpandListings(): void {
+    for (const ac of this.expandListAbort.values()) ac.abort();
+    this.expandListAbort.clear();
+  }
+
+  private abortAllListings(): void {
+    this.navListAbort?.abort();
+    this.navListAbort = null;
+    this.abortAllExpandListings();
+  }
+
+  /** Abort the previous folder listing (and any list-view expands) and start a new one. */
+  private beginNavListing(): AbortSignal {
+    this.navListAbort?.abort();
+    this.abortAllExpandListings();
+    const ac = new AbortController();
+    this.navListAbort = ac;
+    return ac.signal;
+  }
+
+  private beginExpandListing(id: number): AbortSignal {
+    this.expandListAbort.get(id)?.abort();
+    const ac = new AbortController();
+    this.expandListAbort.set(id, ac);
+    return ac.signal;
+  }
+
+  private abortExpandListing(id: number): void {
+    this.expandListAbort.get(id)?.abort();
+    this.expandListAbort.delete(id);
+  }
+
   private async reload(): Promise<void> {
     if (!this.vfs) return;
     this.discardPendingVfsRefresh();
     this.iconLoadGen++;
-    this.nodes = await this.streamChildren(this.cwd, (kids) => {
-      this.nodes = kids;
-      this.listChildCache.set(this.cwd, kids);
-      this.renderContent();
-    });
-    this.listChildCache.set(this.cwd, this.nodes);
+    const listedId = this.cwd;
+    const signal = this.beginNavListing();
+    const kids = await this.streamChildren(
+      listedId,
+      (partial) => {
+        if (signal.aborted || this.cwd !== listedId) return;
+        this.nodes = partial;
+        this.listChildCache.set(listedId, partial);
+        this.renderContent();
+      },
+      signal,
+    );
+    if (signal.aborted || this.cwd !== listedId) return;
+    this.nodes = kids;
+    this.listChildCache.set(listedId, kids);
     for (const id of [...this.expandedIds]) {
+      if (signal.aborted) return;
       this.listChildCache.set(
         id,
-        await this.streamChildren(id, (kids) => {
-          this.listChildCache.set(id, kids);
-          if (this.view === 'list') this.renderContent();
-        }),
+        await this.streamChildren(
+          id,
+          (partial) => {
+            if (signal.aborted || this.cwd !== listedId) return;
+            this.listChildCache.set(id, partial);
+            if (this.view === 'list') this.renderContent();
+          },
+          signal,
+        ),
       );
     }
-    await this.refreshColumns(this.cwd);
+    if (signal.aborted || this.cwd !== listedId) return;
+    await this.refreshColumns(listedId, signal);
   }
 
   /**
    * List a folder, painting `onUpdate` after each AFP enumerate page.
    * Local catalogs resolve in one shot (onUpdate may still fire once).
    */
-  private async streamChildren(parentId: number, onUpdate?: (kids: VNode[]) => void): Promise<VNode[]> {
-    return this.sortNodes(
-      await this.vfs.children(parentId, (raw) => {
-        onUpdate?.(this.sortNodes(raw));
-      }),
-    );
+  private async streamChildren(
+    parentId: number,
+    onUpdate?: (kids: VNode[]) => void,
+    signal?: AbortSignal,
+  ): Promise<VNode[]> {
+    try {
+      return this.sortNodes(
+        await this.vfs.children(
+          parentId,
+          (raw) => {
+            onUpdate?.(this.sortNodes(raw));
+          },
+          signal,
+        ),
+      );
+    } catch (err) {
+      if (isAbortError(err)) return [];
+      throw err;
+    }
   }
 
-  private async refreshColumns(alreadyListedId?: number): Promise<void> {
+  private async refreshColumns(alreadyListedId?: number, signal?: AbortSignal): Promise<void> {
     this.columnChildren = [];
     for (const step of this.pathStack) {
+      if (signal?.aborted) return;
       if (step.id === alreadyListedId) {
         this.columnChildren.push(this.listChildCache.get(step.id) ?? this.nodes);
         continue;
       }
-      this.columnChildren.push(await this.streamChildren(step.id));
+      this.columnChildren.push(await this.streamChildren(step.id, undefined, signal));
     }
   }
 
@@ -1908,27 +1977,32 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async loadColumnFolder(folderId: number, parentColIndex: number): Promise<void> {
+    const signal = this.beginNavListing();
     this.columnLoadGen++;
     const gen = this.columnLoadGen;
     this.columnLoading = true;
     this.renderPath();
     this.renderContent();
     try {
-      const kids = await this.streamChildren(folderId, (partial) => {
-        if (gen !== this.columnLoadGen) return;
-        this.columnChildren = this.columnChildren.slice(0, parentColIndex + 1);
-        this.columnChildren.push(partial);
-        this.nodes = partial;
-        this.columnLoading = false;
-        this.renderPath();
-        this.renderContent();
-      });
-      if (gen !== this.columnLoadGen) return;
+      const kids = await this.streamChildren(
+        folderId,
+        (partial) => {
+          if (gen !== this.columnLoadGen || signal.aborted) return;
+          this.columnChildren = this.columnChildren.slice(0, parentColIndex + 1);
+          this.columnChildren.push(partial);
+          this.nodes = partial;
+          this.columnLoading = false;
+          this.renderPath();
+          this.renderContent();
+        },
+        signal,
+      );
+      if (gen !== this.columnLoadGen || signal.aborted) return;
       this.columnChildren = this.columnChildren.slice(0, parentColIndex + 1);
       this.columnChildren.push(kids);
       this.nodes = kids;
     } catch (err) {
-      if (gen !== this.columnLoadGen) return;
+      if (gen !== this.columnLoadGen || isAbortError(err)) return;
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus(`Couldn’t open folder: ${msg}`);
       this.pathStack = this.pathStack.slice(0, parentColIndex + 1);
@@ -1951,6 +2025,7 @@ export class FinderWindow extends HTMLElement {
     if (this.expandedIds.has(id)) {
       this.expandedIds.delete(id);
       this.loadingIds.delete(id);
+      this.abortExpandListing(id);
       this.nextFolderLoad(id);
       this.collapseDescendants(id);
       this.setDiscloseState(disclose, 'closed');
@@ -1976,19 +2051,24 @@ export class FinderWindow extends HTMLElement {
     this.loadingIds.add(id);
     this.setDiscloseState(disclose, 'loading');
     if (!row) this.renderContent();
+    const signal = this.beginExpandListing(id);
     try {
-      const kids = await this.streamChildren(id, (partial) => {
-        if (!this.folderLoadIsCurrent(id, gen) || !this.expandedIds.has(id)) return;
-        this.listChildCache.set(id, partial);
-        this.loadingIds.delete(id);
-        const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
-        if (live?.parentElement) this.replaceListChildRows(live, partial, id);
-        else this.renderContent();
-      });
+      const kids = await this.streamChildren(
+        id,
+        (partial) => {
+          if (!this.folderLoadIsCurrent(id, gen) || !this.expandedIds.has(id)) return;
+          this.listChildCache.set(id, partial);
+          this.loadingIds.delete(id);
+          const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
+          if (live?.parentElement) this.replaceListChildRows(live, partial, id);
+          else this.renderContent();
+        },
+        signal,
+      );
       if (!this.folderLoadIsCurrent(id, gen)) return;
       this.listChildCache.set(id, kids);
     } catch (err) {
-      if (!this.folderLoadIsCurrent(id, gen)) return;
+      if (!this.folderLoadIsCurrent(id, gen) || isAbortError(err)) return;
       this.expandedIds.delete(id);
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus(`Couldn’t expand folder: ${msg}`);
@@ -2032,6 +2112,7 @@ export class FinderWindow extends HTMLElement {
     for (const k of kids) {
       if (k.isDir && this.expandedIds.has(k.id)) {
         this.expandedIds.delete(k.id);
+        this.abortExpandListing(k.id);
         this.collapseDescendants(k.id);
       }
     }
@@ -2071,6 +2152,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async openFolder(node: VNode): Promise<void> {
+    const openedId = node.id;
     this.cwd = node.id;
     this.pathStack.push({ id: node.id, name: node.name });
     this.selectedId = null;
@@ -2084,6 +2166,7 @@ export class FinderWindow extends HTMLElement {
     } finally {
       this.folderOpening = false;
     }
+    if (this.cwd !== openedId) return;
     this.renderPath();
     this.renderContent();
     this.syncClipboardButtons();
@@ -2510,19 +2593,24 @@ export class FinderWindow extends HTMLElement {
     } else {
       this.renderContent();
     }
+    const signal = this.beginExpandListing(id);
     try {
-      const kids = await this.streamChildren(id, (partial) => {
-        if (!this.folderLoadIsCurrent(id, gen) || !this.expandedIds.has(id)) return;
-        this.listChildCache.set(id, partial);
-        this.loadingIds.delete(id);
-        const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
-        if (live?.parentElement) this.replaceListChildRows(live, partial, id);
-        else {
-          this.parkDragSource();
-          this.renderContent();
-          this.paintDropTarget(id, false);
-        }
-      });
+      const kids = await this.streamChildren(
+        id,
+        (partial) => {
+          if (!this.folderLoadIsCurrent(id, gen) || !this.expandedIds.has(id)) return;
+          this.listChildCache.set(id, partial);
+          this.loadingIds.delete(id);
+          const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
+          if (live?.parentElement) this.replaceListChildRows(live, partial, id);
+          else {
+            this.parkDragSource();
+            this.renderContent();
+            this.paintDropTarget(id, false);
+          }
+        },
+        signal,
+      );
       if (!this.folderLoadIsCurrent(id, gen)) return;
       this.listChildCache.set(id, kids);
       this.loadingIds.delete(id);
@@ -2535,7 +2623,7 @@ export class FinderWindow extends HTMLElement {
       }
       this.replaceListChildRows(live, kids, id);
     } catch (err) {
-      if (!this.folderLoadIsCurrent(id, gen)) return;
+      if (!this.folderLoadIsCurrent(id, gen) || isAbortError(err)) return;
       this.expandedIds.delete(id);
       this.loadingIds.delete(id);
       const msg = err instanceof Error ? err.message : String(err);
@@ -2604,11 +2692,13 @@ export class FinderWindow extends HTMLElement {
     }
 
     this.parkDragSource();
+    const openedId = node.id;
     this.cwd = node.id;
     this.pathStack.push({ id: node.id, name: node.name });
     this.selectedId = null;
     this.expandedIds.clear();
     await this.reload();
+    if (this.cwd !== openedId) return;
     this.renderPath();
     this.renderContent();
     this.syncClipboardButtons();
@@ -2625,6 +2715,7 @@ export class FinderWindow extends HTMLElement {
     if (this.pathStack[colIndex + 1]?.id === node.id && !this.columnLoading) return;
 
     this.parkDragSource();
+    const signal = this.beginNavListing();
 
     this.pathStack = this.pathStack.slice(0, colIndex + 1);
     this.pathStack.push({ id: node.id, name: node.name });
@@ -2658,23 +2749,27 @@ export class FinderWindow extends HTMLElement {
     this.scrollColumnsToEnd();
 
     try {
-      const kids = await this.streamChildren(node.id, (partial) => {
-        if (gen !== this.columnLoadGen) return;
-        this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
-        this.columnChildren.push(partial);
-        this.nodes = partial;
-        this.columnLoading = false;
-        this.paintColumnKids(view, colIndex, partial);
-        this.scrollColumnsToEnd();
-      });
-      if (gen !== this.columnLoadGen) return;
+      const kids = await this.streamChildren(
+        node.id,
+        (partial) => {
+          if (gen !== this.columnLoadGen || signal.aborted) return;
+          this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
+          this.columnChildren.push(partial);
+          this.nodes = partial;
+          this.columnLoading = false;
+          this.paintColumnKids(view, colIndex, partial);
+          this.scrollColumnsToEnd();
+        },
+        signal,
+      );
+      if (gen !== this.columnLoadGen || signal.aborted) return;
       this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
       this.columnChildren.push(kids);
       this.nodes = kids;
       this.columnLoading = false;
       this.paintColumnKids(view, colIndex, kids);
     } catch (err) {
-      if (gen !== this.columnLoadGen) return;
+      if (gen !== this.columnLoadGen || isAbortError(err)) return;
       this.columnLoading = false;
       view.querySelector('.column--loading')?.remove();
       const msg = err instanceof Error ? err.message : String(err);
@@ -2683,6 +2778,7 @@ export class FinderWindow extends HTMLElement {
       this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
     }
 
+    if (gen !== this.columnLoadGen) return;
     this.renderPath();
     this.scrollColumnsToEnd();
     this.syncHistory();
@@ -3118,9 +3214,11 @@ export class FinderWindow extends HTMLElement {
     if (index < 0 || index >= this.pathStack.length) return;
     if (index === this.pathStack.length - 1) return;
     this.pathStack = this.pathStack.slice(0, index + 1);
-    this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+    const destId = this.pathStack[this.pathStack.length - 1]!.id;
+    this.cwd = destId;
     this.selectedId = null;
     await this.reload();
+    if (this.cwd !== destId) return;
     this.renderPath();
     this.renderContent();
     this.syncClipboardButtons();
