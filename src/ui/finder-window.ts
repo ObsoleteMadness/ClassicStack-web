@@ -1240,7 +1240,8 @@ export class FinderWindow extends HTMLElement {
   }
 
   private ensureFinderLayout(): void {
-    enableWindowMove(this, '.titlebar');
+    enableWindowMove(this, '.titlebar', { raise: false });
+    this.style.zIndex = '';
     if (this.finderLayoutReady) return;
     this.finderLayoutReady = true;
     onWindowGeometryChange(this, () => this.persistFinderLayout());
@@ -1258,6 +1259,7 @@ export class FinderWindow extends HTMLElement {
       this.style.top = '';
       this.style.width = '';
       this.style.height = '';
+      this.style.zIndex = '';
       this.classList.remove('is-maximized');
       return;
     }

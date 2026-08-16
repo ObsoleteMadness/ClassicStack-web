@@ -14,11 +14,12 @@ type MoveDrag = { el: HTMLElement; left: number; top: number; x: number; y: numb
 let resize: ResizeDrag | null = null;
 let move: MoveDrag | null = null;
 let listening = false;
-let floatZ = 63;
+let floatZ = 60;
+const FLOAT_Z_MAX = 69;
 const geometryListeners = new WeakMap<HTMLElement, () => void>();
 
 function raiseFloatingWindow(el: HTMLElement): void {
-  floatZ = Math.min(floatZ + 1, 89);
+  floatZ = Math.min(floatZ + 1, FLOAT_Z_MAX);
   el.style.zIndex = String(floatZ);
 }
 
@@ -103,12 +104,17 @@ export function onWindowGeometryChange(el: HTMLElement, fn: () => void): void {
 }
 
 /** Drag a floating window by its title chrome (ignores buttons and fields). */
-export function enableWindowMove(el: HTMLElement, chromeSelector: string): void {
+export function enableWindowMove(
+  el: HTMLElement,
+  chromeSelector: string,
+  opts: { raise?: boolean } = {},
+): void {
   ensureListeners();
   if (moveBound.has(el)) return;
   moveBound.add(el);
+  const raise = opts.raise !== false;
   el.addEventListener('pointerdown', (e) => {
-    raiseFloatingWindow(el);
+    if (raise) raiseFloatingWindow(el);
     const t = e.target as HTMLElement;
     if (t.closest('.window-resize-handle')) return;
     if (isLocked(el)) return;
