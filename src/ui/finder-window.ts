@@ -1619,8 +1619,7 @@ export class FinderWindow extends HTMLElement {
     const pathSel = this.pathStack[colIndex + 1]?.id ?? null;
     if (pathSel != null) return pathSel;
     if (colIndex === listColCount - 1 && this.selectedId != null) {
-      const leaf = kids.find((k) => k.id === this.selectedId);
-      if (leaf && !leaf.isDir) return this.selectedId;
+      if (kids.some((k) => k.id === this.selectedId)) return this.selectedId;
     }
     return null;
   }
@@ -1958,9 +1957,8 @@ export class FinderWindow extends HTMLElement {
     }
     const viewBtn = t.closest('[data-view]');
     if (viewBtn) {
-      this.view = (viewBtn.getAttribute('data-view') as ViewMode) || 'icon';
-      this.syncHistory();
-      this.render();
+      const next = (viewBtn.getAttribute('data-view') as ViewMode) || 'icon';
+      await this.setView(next);
       return;
     }
     if (t.closest('[data-local]')) {
@@ -3374,6 +3372,123 @@ export class FinderWindow extends HTMLElement {
     this.setStatus(`Found ${list.length} AFP server(s)`);
   }
 
+  /**
+   * Switch icon/list/column view. List clicks do not navigate, so a nested
+   * selection is revealed in the destination view (parent folder for icons,
+   * Miller path for columns, outline expands for list).
+   */
+  private async setView(next: ViewMode, replaceHistory = false): Promise<void> {
+    if (this.view === next) return;
+    this.view = next;
+    const keep = this.selectedId;
+    const node =
+      keep != null ? (this.findNodeAnywhere(keep) ?? (await this.vfs.get(keep))) : null;
+    if (node) {
+      if (next === 'icon') await this.revealSelectionInIconView(node);
+      else if (next === 'column') await this.revealSelectionInColumnView(node);
+      else await this.revealSelectionInListView(node);
+    } else if (next === 'column' && this.columnChildren.length === 0) {
+      await this.refreshColumns(this.cwd);
+    }
+    this.selectedId = keep;
+    this.syncHistory(replaceHistory);
+    this.render();
+    this.scrollSelectedIntoView();
+  }
+
+  private scrollSelectedIntoView(): void {
+    if (this.selectedId == null) return;
+    const el = this.querySelector(`.content [data-id="${this.selectedId}"]`) as HTMLElement | null;
+    el?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+
+  /** Icon view only shows cwd, so open the selected item's parent if needed. */
+  private async revealSelectionInIconView(node: VNode): Promise<void> {
+    if (node.id === this.cwd) return;
+    if (node.parentId === this.cwd || node.parentId === node.id) return;
+    const parent = this.findNodeAnywhere(node.parentId) ?? (await this.vfs.get(node.parentId));
+    if (!parent?.isDir) return;
+    await this.enterFolderKeepingSelection(parent);
+  }
+
+  /** Column view walks the path to the selection (folder contents in the next column). */
+  private async revealSelectionInColumnView(node: VNode): Promise<void> {
+    if (node.isDir) {
+      await this.enterFolderKeepingSelection(node);
+      return;
+    }
+    if (node.parentId === this.cwd || node.parentId === node.id) {
+      if (this.columnChildren.length === 0) await this.refreshColumns(this.cwd);
+      return;
+    }
+    const parent = this.findNodeAnywhere(node.parentId) ?? (await this.vfs.get(node.parentId));
+    if (!parent?.isDir) return;
+    await this.enterFolderKeepingSelection(parent);
+  }
+
+  /** Re-expand outline ancestors so a nested list selection stays visible. */
+  private async revealSelectionInListView(node: VNode): Promise<void> {
+    if (this.nodes.some((n) => n.id === node.id)) return;
+    const expand: number[] = [];
+    let pid = node.parentId;
+    const seen = new Set<number>();
+    while (pid && pid !== this.cwd && !seen.has(pid)) {
+      seen.add(pid);
+      expand.push(pid);
+      const parent = this.findNodeAnywhere(pid) ?? (await this.vfs.get(pid));
+      if (!parent) return;
+      pid = parent.parentId;
+    }
+    if (pid !== this.cwd) return;
+    expand.reverse();
+    for (const id of expand) {
+      this.expandedIds.add(id);
+      if (!this.listChildCache.has(id)) {
+        this.listChildCache.set(id, await this.streamChildren(id));
+      }
+    }
+  }
+
+  private async enterFolderKeepingSelection(folder: VNode): Promise<void> {
+    const keep = this.selectedId;
+    if (this.cwd === folder.id && this.pathStack[this.pathStack.length - 1]?.id === folder.id) {
+      if (this.view === 'column' && this.columnChildren.length === 0) {
+        await this.refreshColumns(this.cwd);
+      }
+      this.selectedId = keep;
+      return;
+    }
+    this.pathStack = await this.pathStackToFolder(folder.id);
+    this.cwd = folder.id;
+    this.expandedIds.clear();
+    await this.reload();
+    this.selectedId = keep;
+  }
+
+  private async pathStackToFolder(folderId: number): Promise<{ id: number; name: string }[]> {
+    const hit = this.pathStack.findIndex((p) => p.id === folderId);
+    if (hit >= 0) return this.pathStack.slice(0, hit + 1);
+
+    const suffix: { id: number; name: string }[] = [];
+    let id: number | null = folderId;
+    const seen = new Set<number>();
+    while (id != null && !seen.has(id)) {
+      seen.add(id);
+      const inPath = this.pathStack.findIndex((p) => p.id === id);
+      if (inPath >= 0) return [...this.pathStack.slice(0, inPath + 1), ...suffix.reverse()];
+      const n: VNode | null | undefined =
+        this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+      if (!n) break;
+      suffix.push({ id: n.id, name: n.name });
+      if (n.id === this.vfs.rootId()) break;
+      id = n.parentId;
+    }
+    const root = this.pathStack[0] ?? { id: this.vfs.rootId(), name: 'Browser Share' };
+    const rest = suffix.reverse();
+    if (rest[0]?.id === root.id) return rest;
+    return [root, ...rest.filter((s) => s.id !== root.id)];
+  }
+
   private async navigateToPathIndex(index: number): Promise<void> {
     if (index < 0 || index >= this.pathStack.length) return;
     if (index === this.pathStack.length - 1) return;
@@ -3732,18 +3847,9 @@ export class FinderWindow extends HTMLElement {
   private applyCompactView(): void {
     const compact = isCompactUi();
     if (compact) {
-      if (this.desktopView == null) {
-        this.desktopView = this.view;
-        if (this.view !== 'icon') {
-          this.view = 'icon';
-          this.syncHistory(true);
-          this.render();
-          return;
-        }
-      } else if (this.view === 'list') {
-        this.view = 'icon';
-        this.syncHistory(true);
-        this.render();
+      if (this.desktopView == null) this.desktopView = this.view;
+      if (this.view !== 'icon') {
+        void this.setView('icon', true);
         return;
       }
     } else {
@@ -3753,10 +3859,8 @@ export class FinderWindow extends HTMLElement {
         const restore = this.desktopView;
         this.desktopView = null;
         if (this.view !== restore) {
-          this.view = restore;
           this.openCallout = null;
-          this.syncHistory(true);
-          this.render();
+          void this.setView(restore, true);
           return;
         }
       }
