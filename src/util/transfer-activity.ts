@@ -309,6 +309,8 @@ class TransferActivity {
       j.status = 'error';
       j.error = error;
       j.rate = 0;
+      j.dests = undefined;
+      j.partial = undefined;
       any = true;
     }
     if (any) this.emit();

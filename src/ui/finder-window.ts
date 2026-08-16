@@ -4637,17 +4637,19 @@ export class FinderWindow extends HTMLElement {
 
   private syncWriteOverlays(): void {
     const sig = this.writingSignature();
-    const missingOverlay = !!sig && !this.querySelector('[data-write-job]');
-    if (sig !== this.writeSig || missingOverlay) {
-      const had = this.writeSig;
+    const overlays = [...this.querySelectorAll<HTMLElement>('[data-write-job]')];
+    const jobs = new Map(transferActivity.list().map((j) => [j.id, j]));
+    const missingOverlay = !!sig && overlays.length === 0;
+    const staleOverlay = overlays.some((el) => {
+      const job = jobs.get(el.getAttribute('data-write-job') ?? '');
+      return !job || (job.status !== 'running' && job.status !== 'queued');
+    });
+    if (sig !== this.writeSig || missingOverlay || staleOverlay) {
       this.writeSig = sig;
-      // Keep dest icons until the catalog refresh remounts; don't flash an empty folder.
-      if (!sig && had) return;
       this.renderContent();
       return;
     }
-    const jobs = new Map(transferActivity.list().map((j) => [j.id, j]));
-    for (const el of this.querySelectorAll<HTMLElement>('[data-write-job]')) {
+    for (const el of overlays) {
       const job = jobs.get(el.getAttribute('data-write-job') ?? '');
       if (!job || (job.status !== 'running' && job.status !== 'queued')) continue;
       const pct =

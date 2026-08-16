@@ -220,6 +220,29 @@ describe('transferActivity', () => {
     transferActivity.clearFinished();
   });
 
+  it('drops Finder dest overlays when queued extract children fail', () => {
+    const dest = {
+      async lookup() {
+        return undefined;
+      },
+      async remove() {},
+    };
+    const parent = transferActivity.start({ name: 'Pack.sit', kind: 'file', bytesTotal: 80 });
+    const child = transferActivity.start({
+      name: 'ReadMe',
+      kind: 'file',
+      bytesTotal: 40,
+      parentId: parent,
+      queued: true,
+    });
+    transferActivity.setDest(child, dest, 2, 'ReadMe', 'file');
+    expect(transferActivity.writesIn(dest, 2).map((w) => w.name)).toEqual(['ReadMe']);
+    transferActivity.fail(parent, 'stopped');
+    transferActivity.failQueued(parent, 'stopped');
+    expect(transferActivity.writesIn(dest, 2)).toEqual([]);
+    transferActivity.clearFinished();
+  });
+
   it('runs queued copy jobs one at a time and begins them in order', async () => {
     const dest = {
       async lookup() {
