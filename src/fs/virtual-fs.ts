@@ -9,6 +9,7 @@ import { importDataTransferInto, readBlobProgress, type ImportProgress } from '.
 import { finderInfoFromName } from './extension-map';
 import { throwIfAborted } from '../util/abort';
 import { bufferRangeReader, type ByteRangeReader } from './byte-range';
+import { loadFinderIconFork, ResourceFork, type ResourceForkLoadOpts } from './resource-fork';
 
 export type VfsChange = { parentIds: number[] };
 export type VfsChangeListener = (change: VfsChange) => void;
@@ -28,6 +29,8 @@ export interface VNode {
   /** Enumerated fork sizes when `data`/`resource` are not loaded (remote AFP). */
   dataBytes?: number;
   resourceBytes?: number;
+  /** AFP file/dir attribute bits (locked / inhibit flags), when known. */
+  attributes?: number;
 }
 
 /** Finder catalog: local IndexedDB share and remote AFP volumes both implement this. */
@@ -41,11 +44,10 @@ export interface Catalog {
   ensureContent(id: number, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined>;
   children(parentId: number, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]>;
   lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined>;
-  /** Enough of the resource fork to decode Finder icons (optional; remote volumes). */
-  loadIconResources?(
-    node: VNode,
-    signal?: AbortSignal,
-  ): Promise<import('./resource-fork').ResourceFork | null>;
+  /** Parse a resource fork via ranged reads (header, map, selected payloads). */
+  loadResourceFork(node: VNode, opts?: ResourceForkLoadOpts): Promise<import('./resource-fork').ResourceFork | null>;
+  /** Enough of the resource fork to decode Finder icons. */
+  loadIconResources(node: VNode, signal?: AbortSignal): Promise<import('./resource-fork').ResourceFork | null>;
   /**
    * Ranged reads of a file’s data or resource bytes. The catalog may keep a
    * backend handle open until `fn` returns.
@@ -420,6 +422,24 @@ export class VirtualFS implements Catalog {
     return fn(bufferRangeReader(bytes));
   }
 
+  async loadResourceFork(node: VNode, opts?: ResourceForkLoadOpts): Promise<ResourceFork | null> {
+    throwIfAborted(opts?.signal);
+    const resource = opts?.fork !== 'data';
+    const loaded = resource ? node.resource.length : node.data.length;
+    const hinted = resource ? (node.resourceBytes ?? loaded) : (node.dataBytes ?? loaded);
+    if (Math.max(loaded, hinted) < 16) return null;
+    return this.withRangeReader(
+      node,
+      (read) =>
+        opts?.finderIcons ? loadFinderIconFork(read) : ResourceFork.fromReader(read, opts?.want),
+      { resource, signal: opts?.signal },
+    );
+  }
+
+  async loadIconResources(node: VNode, signal?: AbortSignal): Promise<ResourceFork | null> {
+    return this.loadResourceFork(node, { finderIcons: true, signal });
+  }
+
   /**
    * Import files and folders from a drag-and-drop DataTransfer.
    * Uses FileSystemEntry (directory trees) when available; falls back to FileList
@@ -488,6 +508,7 @@ function serialize(n: VNode): Record<string, unknown> {
     finderInfo: n.finderInfo,
     createDate: n.createDate,
     modDate: n.modDate,
+    ...(n.attributes ? { attributes: n.attributes } : {}),
   };
 }
 
@@ -529,5 +550,6 @@ function revive(raw: Record<string, unknown>): VNode {
     finderInfo: toUint8(raw.finderInfo, 32),
     createDate: raw.createDate as number,
     modDate: raw.modDate as number,
+    ...(typeof raw.attributes === 'number' ? { attributes: raw.attributes } : {}),
   };
 }

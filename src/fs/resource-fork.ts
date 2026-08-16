@@ -75,6 +75,20 @@ export class ResourceFork {
     return rf;
   }
 
+  /**
+   * Parse a resource fork through ranged reads: header, map, then payloads
+   * accepted by `want` (all under the size cap when `want` is omitted).
+   */
+  static async fromReader(
+    read: ByteRangeReader,
+    want?: (type: string, id: number) => boolean,
+  ): Promise<ResourceFork | null> {
+    const map = await readForkMap(read);
+    if (!map) return null;
+    const entries = await loadMappedPayloads(read, map.dataOffset, map.mapped, want ?? (() => true));
+    return want ? forkFromSparse(map, entries) : forkFromMap(map, entries);
+  }
+
   /** Resource fork that only holds the given payloads (no full fork image). */
   static fromEntries(entries: ResourceEntry[]): ResourceFork {
     const rf = new ResourceFork(new Uint8Array());
@@ -249,6 +263,14 @@ export interface FinderIconForkOpts {
   includeAllIcons?: boolean;
 }
 
+/** Options for Catalog.loadResourceFork (ranged header/map/payload reads). */
+export type ResourceForkLoadOpts = {
+  fork?: 'resource' | 'data';
+  want?: (type: string, id: number) => boolean;
+  finderIcons?: boolean;
+  signal?: AbortSignal;
+};
+
 interface ForkMap {
   dataOffset: number;
   mapOffset: number;
@@ -289,8 +311,19 @@ async function loadMappedPayloads(
     const lenBuf = await read(pos, 4);
     if (lenBuf.length < 4) continue;
     const dataLen = be32(lenBuf, 0);
+    if (dataLen <= 0) continue;
     const cap = PAYLOAD_MAX[item.type] ?? MAX_RESOURCE_BYTES;
-    if (dataLen <= 0 || dataLen > cap) continue;
+    if (dataLen > cap) {
+      entries.push({
+        name: item.name,
+        type: item.type,
+        id: item.id,
+        length: dataLen,
+        attributes: item.attributes,
+        dataOffset: pos + 4,
+      });
+      continue;
+    }
     const payload = await read(pos + 4, dataLen);
     entries.push({
       name: item.name,
@@ -305,8 +338,7 @@ async function loadMappedPayloads(
   return entries;
 }
 
-function forkFromSparse(map: ForkMap, entries: ResourceEntry[]): ResourceFork | null {
-  if (!entries.length) return null;
+function forkFromMap(map: ForkMap, entries: ResourceEntry[]): ResourceFork {
   const rf = ResourceFork.fromEntries(entries);
   rf.fileHeader = {
     dataOffset: map.dataOffset,
@@ -315,6 +347,11 @@ function forkFromSparse(map: ForkMap, entries: ResourceEntry[]): ResourceFork | 
     mapLength: map.mapLength,
   };
   return rf;
+}
+
+function forkFromSparse(map: ForkMap, entries: ResourceEntry[]): ResourceFork | null {
+  if (!entries.length) return null;
+  return forkFromMap(map, entries);
 }
 
 /**
@@ -326,10 +363,7 @@ export async function loadResourceForkPartial(
   read: ForkByteReader,
   want: (type: string, id: number) => boolean,
 ): Promise<ResourceFork | null> {
-  const map = await readForkMap(read);
-  if (!map) return null;
-  const entries = await loadMappedPayloads(read, map.dataOffset, map.mapped, want);
-  return forkFromSparse(map, entries);
+  return ResourceFork.fromReader(read, want);
 }
 
 /**

@@ -241,4 +241,17 @@ describe('resource fork + icon decode', () => {
     expect(payloadReads).toEqual([]);
     expect(reads.reduce((n, r) => n + r.count, 0)).toBeLessThan(fork.length);
   });
+
+  it('parses the same map through fromReader as fromBytes without a full-fork read', async () => {
+    const fork = buildForkWithICN();
+    const fromBuf = ResourceFork.fromBytes(fork);
+    const reads: { offset: number; count: number }[] = [];
+    const fromRead = await ResourceFork.fromReader(async (offset, count) => {
+      reads.push({ offset, count });
+      return fork.subarray(offset, Math.min(fork.length, offset + count));
+    });
+    expect(fromRead?.findById('ICN#', 128)?.length).toBe(fromBuf.findById('ICN#', 128)?.length);
+    expect(reads.some((r) => r.offset === 0 && r.count === fork.length)).toBe(false);
+    expect(reads[0]).toEqual({ offset: 0, count: 16 });
+  });
 });

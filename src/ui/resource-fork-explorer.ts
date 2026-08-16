@@ -8,11 +8,10 @@ import { ResourceFork } from '../fs/resource-fork';
 import {
   decodeFref,
   describeBndl,
-  forkBytesFromNode,
   formatOsType,
   hexDump,
   ICON_RELATED_TYPES,
-  inspectResourceFork,
+  inspectLoadedFork,
   preferredInspectType,
   resourceIdHint,
   resourceTypeLabel,
@@ -147,18 +146,28 @@ export class ResourceForkExplorer extends HTMLElement {
     this.paint();
 
     try {
-      let n = node;
-      const rsrcHint = n.resourceBytes ?? n.resource.length;
-      const dataHint = n.dataBytes ?? n.data.length;
-      if (catalog && n.resource.length < 16 && (rsrcHint >= 16 || dataHint >= 16)) {
-        n = (await catalog.ensureContent(n.id)) ?? n;
+      this.node = node;
+      this.source = 'empty';
+      this.rf = null;
+      this.inspect = null;
+      if (catalog) {
+        const rsrcHint = node.resourceBytes ?? node.resource.length;
+        const dataHint = node.dataBytes ?? node.data.length;
+        if (rsrcHint >= 16) {
+          this.rf = await catalog.loadResourceFork(node, { fork: 'resource' });
+          if (this.rf) this.source = 'resource';
+        }
+        if (!this.rf?.allEntries.length && dataHint >= 16) {
+          this.rf = await catalog.loadResourceFork(node, { fork: 'data' });
+          if (this.rf?.allEntries.length) this.source = 'data';
+        }
       }
       if (gen !== this.loadGen) return;
-      this.node = n;
-      const picked = forkBytesFromNode(n);
-      this.source = picked.source;
-      this.inspect = inspectResourceFork(picked.bytes);
-      this.rf = picked.bytes.length >= 16 ? ResourceFork.fromBytes(picked.bytes) : null;
+      const forkBytes =
+        this.source === 'data' ? (node.dataBytes ?? node.data.length) : (node.resourceBytes ?? node.resource.length);
+      this.inspect = this.rf
+        ? inspectLoadedFork(this.rf, forkBytes)
+        : { header: null, forkBytes, entries: [], types: [], parsed: false };
       const types = this.inspect.types.map((g) => g.type);
       if (!this.selectedType || !types.includes(this.selectedType)) {
         this.selectedType = preferredInspectType(types);

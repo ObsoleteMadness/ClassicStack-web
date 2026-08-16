@@ -152,11 +152,14 @@ export function inspectResourceFork(bytes: Uint8Array): ForkInspect {
   if (bytes.length < 16) {
     return { header: null, forkBytes: bytes.length, entries: [], types: [], parsed: false };
   }
-  const rf = ResourceFork.fromBytes(bytes);
+  return inspectLoadedFork(ResourceFork.fromBytes(bytes), bytes.length);
+}
+
+export function inspectLoadedFork(rf: ResourceFork, forkBytes: number): ForkInspect {
   const entries = rf.allEntries;
   return {
     header: rf.fileHeader,
-    forkBytes: bytes.length,
+    forkBytes,
     entries,
     types: groupResourceTypes(entries),
     parsed: entries.length > 0,

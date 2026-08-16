@@ -100,7 +100,7 @@ export function shouldReadIconFork(
   return (flags & HAS_BUNDLE) !== 0 || t === 'APPL' || isCdevStyleType(t);
 }
 
-/** Ids / extract rules for a ranged AFP resource-fork read. */
+/** Ids / extract rules for a ranged resource-fork read. */
 export function iconForkLoadOptions(node: VNode): FinderIconForkOpts {
   const { type } = readTypeCreator(node.finderInfo);
   const flags = finderFlags(node.finderInfo);
@@ -364,7 +364,8 @@ export class IconCache {
     loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
   ): Promise<IconUrls> {
     let fork: ResourceFork | null = null;
-    if (node.resource.length < 16 && loadIconFork && shouldReadIconFork(node.finderInfo, type, cached)) {
+    const rsrcHint = node.resourceBytes ?? node.resource.length;
+    if (loadIconFork && (shouldReadIconFork(node.finderInfo, type, cached) || rsrcHint >= 16)) {
       try {
         fork = await loadIconFork(node);
       } catch {
@@ -446,12 +447,11 @@ export class IconCache {
     const flags = finderFlags(node.finderInfo);
     if ((flags & HAS_CUSTOM_ICON) !== 0) {
       try {
-        const rf =
-          node.resource.length > 16
+        const rf = loadIconFork
+          ? await loadIconFork(node)
+          : node.resource.length > 16
             ? ResourceFork.fromBytes(node.resource)
-            : loadIconFork
-              ? await loadIconFork(node)
-              : null;
+            : null;
         if (rf) {
           const set = IconSet.fromResourceFork(CUSTOM_ICON_ID, rf);
           if (set) {
@@ -485,12 +485,11 @@ export class IconCache {
       if (!iconFile || iconFile.isDir) return null;
       const rsrcLen = iconFile.resourceBytes ?? iconFile.resource.length;
       if (iconFile.resource.length < 16 && rsrcLen < 16) return null;
-      const rf =
-        iconFile.resource.length >= 16
+      const rf = loadIconFork
+        ? await loadIconFork(iconFile)
+        : iconFile.resource.length >= 16
           ? ResourceFork.fromBytes(iconFile.resource)
-          : loadIconFork
-            ? await loadIconFork(iconFile)
-            : null;
+          : null;
       if (!rf) return null;
       const set =
         IconSet.fromFork(rf) ??

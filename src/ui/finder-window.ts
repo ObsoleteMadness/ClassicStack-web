@@ -19,9 +19,13 @@ import { expandSitInPlace } from '../fs/expand-inplace';
 import type { WelcomePackProgress } from '../fs/welcome-pack';
 import { importExpandedTree, type ImportItemTrack } from '../fs/import-transfer';
 import { filenameExtension } from '../fs/extension-map';
-import { ResourceFork, loadResourceForkPartial } from '../fs/resource-fork';
-import { forkBytesFromNode } from '../fs/resource-inspect';
 import { decodeVers1, versInfoForGetInfo, type VersGetInfo, type VersRec } from '../fs/resource-types/vers';
+import {
+  finderCommentFromFork,
+  finderCommentId,
+  finderFlagLabels,
+  finderGetInfoDetails,
+} from '../fs/finder-info';
 import { loadPrefs, savePrefs } from '../util/prefs';
 import { log } from '../util/logger';
 import { isAbortError, throwIfAborted } from '../util/abort';
@@ -211,6 +215,8 @@ export class FinderWindow extends HTMLElement {
   private iconLoadGen = 0;
   /** Cached `vers` 1 Get Info strings, keyed by node id. */
   private versInfo = new Map<number, { stamp: string; info: VersGetInfo | null }>();
+  /** Cached Finder comment from `FCMT` in the resource fork. */
+  private commentInfo = new Map<number, { stamp: string; comment: string | null }>();
   private versPending = new Set<number>();
   /** Cancels the in-flight cwd / column listing when navigating to another folder. */
   private navListAbort: AbortController | null = null;
@@ -1624,7 +1630,7 @@ export class FinderWindow extends HTMLElement {
     return iconCache.getForNode(
       node,
       node.isDir ? (id, name) => this.vfs.lookup(id, name) : undefined,
-      (n) => this.vfs.loadIconResources?.(n) ?? Promise.resolve(null),
+      (n) => this.vfs.loadIconResources(n),
     );
   }
 
@@ -1811,7 +1817,9 @@ export class FinderWindow extends HTMLElement {
         ${node.isDir ? '' : `<div class="preview-row"><span>Resource</span><span>${formatBytes(node.resourceBytes ?? node.resource.length)}</span></div>`}
         <div class="preview-row"><span>Created</span><span>${fromMacTime(node.createDate).toLocaleString()}</span></div>
         <div class="preview-row"><span>Modified</span><span>${fromMacTime(node.modDate).toLocaleString()}</span></div>
-        ${this.versRowsHtml(node)}
+        ${this.finderFlagRowsHtml(node)}
+        <div data-role="vers-slot">${this.versRowsHtml(node)}</div>
+        <div data-role="comment-slot">${this.commentRowHtml(node)}</div>
       </div>
       ${typeCreatorFields}
       ${folderActions}
@@ -1828,6 +1836,36 @@ export class FinderWindow extends HTMLElement {
     const hit = this.versInfo.get(node.id);
     if (!hit || hit.stamp !== this.versStamp(node)) return undefined;
     return hit.info;
+  }
+
+  private finderFlagRowsHtml(node: VNode): string {
+    const { type } = readTypeCreator(node.finderInfo);
+    const details = finderGetInfoDetails(node.finderInfo, { attributes: node.attributes, type });
+    const tags = finderFlagLabels(details);
+    const rows: string[] = [];
+    if (tags.length) {
+      rows.push(
+        `<div class="preview-row" data-finder="flags"><span>Flags</span><span>${this.escape(tags.join(' · '))}</span></div>`,
+      );
+    }
+    if (details.label) {
+      rows.push(
+        `<div class="preview-row" data-finder="label"><span>Label</span><span class="preview-label"><span class="preview-label-swatch" style="background:${this.escape(details.label.color)}"></span>${this.escape(details.label.name)}</span></div>`,
+      );
+    }
+    return rows.join('');
+  }
+
+  private commentRowHtml(node: VNode): string {
+    const comment = this.cachedComment(node);
+    if (!comment) return '';
+    return `<div class="preview-row preview-row--block" data-finder="comment"><span>Comments</span><span>${this.escape(comment)}</span></div>`;
+  }
+
+  private cachedComment(node: VNode): string | null | undefined {
+    const hit = this.commentInfo.get(node.id);
+    if (!hit || hit.stamp !== this.versStamp(node)) return undefined;
+    return hit.comment;
   }
 
   private versRowsHtml(node: VNode): string {
@@ -1853,7 +1891,7 @@ export class FinderWindow extends HTMLElement {
 
   private ensureVersInfo(node: VNode): void {
     if (node.isDir) return;
-    if (this.cachedVersInfo(node) !== undefined) return;
+    if (this.cachedVersInfo(node) !== undefined && this.cachedComment(node) !== undefined) return;
     if (this.versPending.has(node.id)) return;
     const rsrcHint = node.resourceBytes ?? node.resource.length;
     if (rsrcHint < 16 && node.resource.length < 16 && node.data.length < 16) return;
@@ -1864,37 +1902,47 @@ export class FinderWindow extends HTMLElement {
   private async loadVersInfo(node: VNode): Promise<void> {
     const stamp = this.versStamp(node);
     try {
-      const rec = await this.readVers1(node);
-      this.versInfo.set(node.id, { stamp, info: rec ? versInfoForGetInfo(rec) : null });
+      const extra = await this.readGetInfoExtras(node);
+      this.versInfo.set(node.id, { stamp, info: extra.vers ? versInfoForGetInfo(extra.vers) : null });
+      this.commentInfo.set(node.id, { stamp, comment: extra.comment });
       this.patchVersInDom(node.id);
+      this.patchCommentInDom(node.id);
     } catch {
       this.versInfo.set(node.id, { stamp, info: null });
+      this.commentInfo.set(node.id, { stamp, comment: null });
     } finally {
       this.versPending.delete(node.id);
     }
   }
 
-  private async readVers1(node: VNode): Promise<VersRec | null> {
-    if (node.resource.length >= 16 || node.data.length >= 16) {
-      const picked = forkBytesFromNode(node);
-      if (picked.bytes.length >= 16) return decodeVers1(ResourceFork.fromBytes(picked.bytes));
-    }
-    const rsrcHint = node.resourceBytes ?? 0;
-    if (rsrcHint < 16 || node.resource.length >= 16) return null;
-    const rf = await this.vfs.withRangeReader(
-      node,
-      (read) => loadResourceForkPartial(read, (type, id) => type === 'vers' && id === 1),
-      { resource: true },
-    );
-    return rf ? decodeVers1(rf) : null;
+  private async readGetInfoExtras(node: VNode): Promise<{ vers: VersRec | null; comment: string | null }> {
+    const cid = finderCommentId(node.finderInfo);
+    const want = (type: string, id: number): boolean => {
+      if (type === 'vers' && id === 1) return true;
+      if (type !== 'FCMT') return false;
+      return id === 1 || (cid !== 0 && id === cid);
+    };
+    let rf = await this.vfs.loadResourceFork(node, { want });
+    if (!rf) rf = await this.vfs.loadResourceFork(node, { fork: 'data', want });
+    if (!rf) return { vers: null, comment: null };
+    return { vers: decodeVers1(rf), comment: finderCommentFromFork(rf, node.finderInfo) };
   }
 
   private patchVersInDom(id: number): void {
     const hit = this.versInfo.get(id);
     const markup = hit?.info ? this.versRowsMarkup(hit.info) : '';
-    this.querySelectorAll(`[data-preview][data-id="${id}"] .preview-meta`).forEach((meta) => {
-      meta.querySelectorAll('[data-vers]').forEach((el) => el.remove());
-      if (markup) meta.insertAdjacentHTML('beforeend', markup);
+    this.querySelectorAll(`[data-preview][data-id="${id}"] [data-role="vers-slot"]`).forEach((el) => {
+      el.innerHTML = markup;
+    });
+  }
+
+  private patchCommentInDom(id: number): void {
+    const hit = this.commentInfo.get(id);
+    const markup = hit?.comment
+      ? `<div class="preview-row preview-row--block" data-finder="comment"><span>Comments</span><span>${this.escape(hit.comment)}</span></div>`
+      : '';
+    this.querySelectorAll(`[data-preview][data-id="${id}"] [data-role="comment-slot"]`).forEach((el) => {
+      el.innerHTML = markup;
     });
   }
 

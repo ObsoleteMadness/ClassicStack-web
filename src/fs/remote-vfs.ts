@@ -10,7 +10,7 @@ import type { Catalog, VNode, VfsChangeListener, ChildrenBatchListener } from '.
 import { importDataTransferInto, type ImportProgress } from './import-transfer';
 import { finderInfoFromName } from './extension-map';
 import { bufferRangeReader, type ByteRangeReader } from './byte-range';
-import { loadFinderIconFork, ResourceFork } from './resource-fork';
+import { loadFinderIconFork, ResourceFork, type ResourceForkLoadOpts } from './resource-fork';
 import { iconForkLoadOptions } from './icon-cache';
 import { isAbortError, throwIfAborted } from '../util/abort';
 
@@ -107,21 +107,29 @@ export class RemoteVfs implements Catalog {
     }
   }
 
-  async loadIconResources(node: VNode, signal?: AbortSignal): Promise<ResourceFork | null> {
-    throwIfAborted(signal);
-    if (node.resource.length >= 16) return ResourceFork.fromBytes(node.resource);
-    const rsrcLen = node.resourceBytes ?? 0;
-    if (rsrcLen < 16) return null;
+  async loadResourceFork(node: VNode, opts?: ResourceForkLoadOpts): Promise<ResourceFork | null> {
+    throwIfAborted(opts?.signal);
+    const resource = opts?.fork !== 'data';
+    const loaded = resource ? node.resource.length : node.data.length;
+    const hinted = resource ? (node.resourceBytes ?? loaded) : (node.dataBytes ?? loaded);
+    if (Math.max(loaded, hinted) < 16) return null;
     try {
       return await this.withRangeReader(
         node,
-        (read) => loadFinderIconFork(read, iconForkLoadOptions(node)),
-        { resource: true, signal },
+        (read) =>
+          opts?.finderIcons
+            ? loadFinderIconFork(read, iconForkLoadOptions(node))
+            : ResourceFork.fromReader(read, opts?.want),
+        { resource, signal: opts?.signal },
       );
     } catch (err) {
       if (isAbortError(err)) throw err;
       return null;
     }
+  }
+
+  async loadIconResources(node: VNode, signal?: AbortSignal): Promise<ResourceFork | null> {
+    return this.loadResourceFork(node, { finderIcons: true, signal });
   }
 
   async withRangeReader<T>(
@@ -311,6 +319,7 @@ export class RemoteVfs implements Catalog {
       createDate: number;
       modDate: number;
       finderInfo: Uint8Array;
+      attributes?: number;
     },
     parentId: number,
   ): VNode {
@@ -327,6 +336,7 @@ export class RemoteVfs implements Catalog {
       modDate: e.modDate,
       dataBytes: e.isDir ? 0 : e.dataLen,
       resourceBytes: e.isDir ? 0 : e.rsrcLen,
+      ...(e.attributes ? { attributes: e.attributes } : {}),
     };
     if (!e.isDir && this.forksLoaded.has(e.cnid) && prev) {
       node.dataBytes = prev.data.length;
