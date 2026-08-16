@@ -2,7 +2,7 @@ import {
   transferActivity,
   type TransferJob,
 } from '../util/transfer-activity';
-import { formatBytes, formatBytesPerSec } from './format-bytes';
+import { formatBytes, formatBytesPerSec, formatRemainingTime } from './format-bytes';
 import { DEFAULT_FOLDER_ICONS } from '../fs/icon-cache';
 
 const STRUCTURE_ATTR = 'data-transfer-key';
@@ -33,6 +33,21 @@ function jobSize(j: TransferJob): string {
   if (j.bytesTotal > 0) return `${formatBytes(j.bytesDone)} of ${formatBytes(j.bytesTotal)}`;
   if (j.bytesDone > 0) return formatBytes(j.bytesDone);
   return '0 bytes';
+}
+
+/** ETA for a running job with a known rate and remaining bytes. */
+export function jobRemainingTime(j: TransferJob): string | null {
+  if (j.status !== 'running' || j.rate <= 0 || j.bytesTotal <= 0) return null;
+  const left = j.bytesTotal - j.bytesDone;
+  if (left <= 0) return null;
+  return formatRemainingTime(left / j.rate);
+}
+
+function jobMeta(j: TransferJob, nested: boolean): string {
+  const size = jobSize(j);
+  if (nested) return size;
+  const eta = jobRemainingTime(j);
+  return eta ? `${size} · ${eta}` : size;
 }
 
 function structureKey(jobs: TransferJob[]): string {
@@ -75,7 +90,7 @@ function rowHtml(j: TransferJob, nested = false): string {
         <div class="file-transfer__bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}">
           <div class="file-transfer__bar-fill" style="width:${pct}%"></div>
         </div>
-        <div class="file-transfer__meta">${escapeHtml(jobSize(j))}</div>
+        <div class="file-transfer__meta">${escapeHtml(jobMeta(j, nested))}</div>
         ${err}
       </div>
     </div>`;
@@ -90,7 +105,7 @@ function paintRow(row: HTMLElement, j: TransferJob): void {
   const rate = row.querySelector('.file-transfer__rate');
   if (rate) rate.textContent = jobRate(j);
   const meta = row.querySelector('.file-transfer__meta');
-  if (meta) meta.textContent = jobSize(j);
+  if (meta) meta.textContent = jobMeta(j, row.classList.contains('file-transfer--sub'));
   row.classList.toggle('file-transfer--error', j.status === 'error');
   row.classList.toggle('file-transfer--queued', j.status === 'queued');
   row.classList.toggle('file-transfer--cancelled', j.status === 'cancelled');

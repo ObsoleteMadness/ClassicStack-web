@@ -114,7 +114,7 @@ export class RemoteVfs implements Catalog {
     const hinted = resource ? (node.resourceBytes ?? loaded) : (node.dataBytes ?? loaded);
     if (Math.max(loaded, hinted) < 16) return null;
     try {
-      const rangeOpts = { resource, signal: opts?.signal };
+      const rangeOpts = { resource, signal: opts?.signal, priority: opts?.finderIcons ? 0 : 1 };
       const rf = await this.withRangeReader(
         node,
         (read) =>
@@ -151,7 +151,7 @@ export class RemoteVfs implements Catalog {
   async withRangeReader<T>(
     node: VNode,
     fn: (read: ByteRangeReader) => Promise<T>,
-    opts?: { resource?: boolean; signal?: AbortSignal },
+    opts?: { resource?: boolean; signal?: AbortSignal; priority?: number },
   ): Promise<T> {
     throwIfAborted(opts?.signal);
     if (this.forksLoaded.has(node.id)) {
@@ -242,7 +242,7 @@ export class RemoteVfs implements Catalog {
     if (!n) throw new Error('not found');
     if (n.id === this.rootId()) throw new Error('cannot move volume root');
     if (n.parentId === newParent) return;
-    await this.client.moveAndRename(n.parentId, n.name, newParent, n.name, this.volId);
+    await this.client.moveAndRename(n.parentId, n.name, newParent, '', this.volId);
     const oldParent = n.parentId;
     n.parentId = newParent;
     n.modDate = macTime();

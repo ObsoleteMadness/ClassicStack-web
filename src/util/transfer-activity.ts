@@ -1,6 +1,7 @@
 /** In-flight file copy/import/download jobs for the Finder transfer window. */
 
-import { isAbortError } from './abort';
+import { isAbortError, throwIfAborted } from './abort';
+import { AsyncSemaphore } from './async-semaphore';
 
 export type TransferKind = 'file' | 'folder';
 
@@ -51,14 +52,14 @@ type Listener = () => void;
 
 const FILE_ICON = '/icons/FILE16.png';
 
-type WriteLoc = { dest: TransferDest; parentId: number; name: string };
+type WriteLoc = { dest: TransferDest; parentId: number; name: string; kind?: TransferKind };
 
 type JobRec = TransferJob & {
   lastBytes: number;
   lastTick: number;
   abort: AbortController;
-  /** Top-level dest shown in Finder while this job is still writing. */
-  dest?: WriteLoc;
+  /** Dest items shown in Finder while this job is still writing. */
+  dests?: WriteLoc[];
   partial?: WriteLoc;
 };
 
@@ -67,6 +68,9 @@ class TransferActivity {
   private order: string[] = [];
   private listeners = new Set<Listener>();
   private seq = 1;
+  /** One Finder copy/import at a time so AFP Writes do not interleave. */
+  private readonly copySlot = new AsyncSemaphore(1);
+  private copyOwner: string | null = null;
 
   subscribe(fn: Listener): () => void {
     this.listeners.add(fn);
@@ -82,6 +86,35 @@ class TransferActivity {
       if (j.status === 'running' || j.status === 'queued') return true;
     }
     return false;
+  }
+
+  /** True when a running/queued job is writing into `dest`. */
+  busyOn(dest: TransferDest): boolean {
+    for (const j of this.jobs.values()) {
+      if (j.status !== 'running' && j.status !== 'queued') continue;
+      if (j.partial?.dest === dest) return true;
+      if (j.dests?.some((d) => d.dest === dest)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Run `fn` when no other copy holds the slot. Re-enters for the same job
+   * (archive expand inside an import). Begins a queued job as it starts.
+   */
+  async withCopySlot<T>(id: string, fn: () => Promise<T>): Promise<T> {
+    if (this.copyOwner === id) return fn();
+    const signal = this.signal(id);
+    return this.copySlot.run(async () => {
+      throwIfAborted(signal);
+      this.copyOwner = id;
+      try {
+        this.begin(id);
+        return await fn();
+      } finally {
+        if (this.copyOwner === id) this.copyOwner = null;
+      }
+    }, signal);
   }
 
   /** Combined progress of running root jobs (nested expand tasks are skipped). */
@@ -120,7 +153,7 @@ class TransferActivity {
     if (!j || j.status !== 'queued') return false;
     j.status = 'running';
     j.lastTick = performance.now();
-    if (detail !== undefined) j.detail = detail;
+    j.detail = detail;
     this.emit();
     return true;
   }
@@ -141,7 +174,7 @@ class TransferActivity {
     j.status = 'cancelled';
     j.rate = 0;
     j.detail = undefined;
-    j.dest = undefined;
+    j.dests = undefined;
     if (!j.abort.signal.aborted) j.abort.abort();
     for (const child of this.jobs.values()) {
       if (child.parentId === id) this.cancel(child.id);
@@ -153,10 +186,28 @@ class TransferActivity {
    * Dest folder + name for Finder overlay (the copy target, including folders).
    * Call as soon as the dest name is known so the item can appear before the write.
    */
-  setDest(id: string, dest: TransferDest, parentId: number, name: string): void {
+  setDest(id: string, dest: TransferDest, parentId: number, name: string, kind?: TransferKind): void {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
-    j.dest = { dest, parentId, name };
+    j.dests = [{ dest, parentId, name, kind }];
+    this.emit();
+  }
+
+  /** Extra dest overlay (e.g. several top-level items from one archive). */
+  addDest(id: string, dest: TransferDest, parentId: number, name: string, kind?: TransferKind): void {
+    const j = this.jobs.get(id);
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    const dests = j.dests ?? (j.dests = []);
+    const key = `${parentId}\0${name.toLowerCase()}`;
+    if (dests.some((d) => d.dest === dest && `${d.parentId}\0${d.name.toLowerCase()}` === key)) return;
+    dests.push({ dest, parentId, name, kind });
+    this.emit();
+  }
+
+  clearDest(id: string): void {
+    const j = this.jobs.get(id);
+    if (!j || !j.dests?.length) return;
+    j.dests = undefined;
     this.emit();
   }
 
@@ -165,9 +216,21 @@ class TransferActivity {
    * partial copy. Folder jobs should point this at the file in flight, not the folder.
    */
   watchPartial(id: string, dest: TransferDest, parentId: number, name: string): void {
+    this.setWriteFile(id, dest, parentId, name);
+  }
+
+  /**
+   * Overlay the dest file currently being written. Folder dest overlays on the
+   * same job are kept so a parent listing still shows progress after enumerate.
+   */
+  setWriteFile(id: string, dest: TransferDest, parentId: number, name: string): void {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    const folders = (j.dests ?? []).filter((d) => (d.kind ?? j.kind) === 'folder');
+    const fileLoc: WriteLoc = { dest, parentId, name, kind: 'file' };
+    j.dests = [...folders, fileLoc];
     j.partial = { dest, parentId, name };
+    this.emit();
   }
 
   /** Running/queued writes targeting `parentId` in `dest` (top-level dest or in-flight file). */
@@ -177,8 +240,10 @@ class TransferActivity {
     for (const j of this.jobs.values()) {
       if (j.status !== 'running' && j.status !== 'queued') continue;
       const hits: { name: string; kind: TransferKind }[] = [];
-      if (j.dest && j.dest.dest === dest && j.dest.parentId === parentId) {
-        hits.push({ name: j.dest.name, kind: j.kind });
+      for (const loc of j.dests ?? []) {
+        if (loc.dest === dest && loc.parentId === parentId) {
+          hits.push({ name: loc.name, kind: loc.kind ?? j.kind });
+        }
       }
       if (j.partial && j.partial.dest === dest && j.partial.parentId === parentId) {
         hits.push({ name: j.partial.name, kind: 'file' });
@@ -307,7 +372,7 @@ class TransferActivity {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
     this.clearPartial(id);
-    j.dest = undefined;
+    j.dests = undefined;
     j.status = 'done';
     if (j.bytesTotal <= 0) j.bytesTotal = j.bytesDone;
     j.rate = 0;
@@ -318,7 +383,7 @@ class TransferActivity {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
     this.clearPartial(id);
-    j.dest = undefined;
+    j.dests = undefined;
     j.status = 'error';
     j.error = error;
     j.rate = 0;

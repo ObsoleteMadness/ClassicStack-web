@@ -7,6 +7,7 @@ import { log } from '../util/logger';
 import { expandIncoming, isExpandableArchive, type ExpandedDir, type ExpandedFile, type ExpandedNode } from './expand-incoming';
 import type { Catalog, VNode } from './virtual-fs';
 import { throwIfAborted, isAbortError, abortError } from '../util/abort';
+import { iconCache } from './icon-cache';
 import {
   planItemPlacement,
   TransferCancelled,
@@ -32,9 +33,22 @@ export type ImportItemTrack = {
   /** Nested job while a dropped wrapper is decoded (BinHex / MacBinary / later StuffIt). */
   onExpand?: (item: ExpandTrackFile) => ImportItemTrack | undefined;
   signal?: AbortSignal;
+  /** Called just before a dest file is created (Finder overlay + cancel partial). */
+  onWrite?: (parentId: number, name: string) => void;
+  /** Called when an extracted folder is created (Finder overlay in that parent). */
+  onDir?: (parentId: number, name: string, dirId: number, path: string) => void;
   /** Delete a dest file left behind if this write is cancelled mid-flight. */
   removePartial?: (parentId: number, name: string) => Promise<void>;
+  /**
+   * Serialize this item behind other Finder copies (AFP Writes on LocalTalk).
+   * Re-enters for the same job when an archive expands inside the import.
+   */
+  runInCopySlot?: <T>(fn: () => Promise<T>) => Promise<T>;
 };
+
+async function runInCopySlot<T>(track: ImportItemTrack | undefined, fn: () => Promise<T>): Promise<T> {
+  return track?.runInCopySlot ? track.runInCopySlot(fn) : fn();
+}
 
 export type ImportProgress = {
   onScan?: (total: number) => void;
@@ -101,11 +115,13 @@ export async function importDataTransferInto(
           bytesTotal,
         });
         try {
-          throwIfAborted(track?.signal);
-          for (const entry of group.entries) {
-            const asName = mappedIncomingName(unescapeHostFilename(entry.name), group.name, plan.destName);
-            await importFsEntry(fs, parentId, entry, importBlob, tick, track, asName);
-          }
+          await runInCopySlot(track, async () => {
+            throwIfAborted(track?.signal);
+            for (const entry of group.entries) {
+              const asName = mappedIncomingName(unescapeHostFilename(entry.name), group.name, plan.destName);
+              await importFsEntry(fs, parentId, entry, importBlob, tick, track, asName);
+            }
+          });
           track?.onDone?.();
           imported++;
         } catch (err) {
@@ -140,20 +156,22 @@ export async function importDataTransferInto(
         isDir: group.isDir,
         bytesTotal,
       });
-      try {
-        throwIfAborted(track?.signal);
-        for (const file of group.files) {
-          const destTop = mappedIncomingName(
-            topFileName(file),
-            group.name,
-            plan.destName,
-          );
-          await importFileWithRelativePath(fs, parentId, file, importBlob, track, destTop);
-          tick();
-        }
-        track?.onDone?.();
-        imported++;
-      } catch (err) {
+        try {
+          await runInCopySlot(track, async () => {
+            throwIfAborted(track?.signal);
+            for (const file of group.files) {
+              const destTop = mappedIncomingName(
+                topFileName(file),
+                group.name,
+                plan.destName,
+              );
+              await importFileWithRelativePath(fs, parentId, file, importBlob, track, destTop);
+              tick();
+            }
+          });
+          track?.onDone?.();
+          imported++;
+        } catch (err) {
         track?.onDone?.(err instanceof Error ? err : new Error(String(err)));
         if (isAbortError(err)) {
           cancelled = true;
@@ -325,6 +343,7 @@ async function writeTrackedBlob(
 ): Promise<void> {
   throwIfAborted(track?.signal);
   try {
+    track?.onWrite?.(parentId, name);
     await write();
     throwIfAborted(track?.signal);
   } catch (err) {
@@ -371,7 +390,7 @@ export async function importExpandedTree(
     const files = expandedFiles(nodes, prefix);
     track?.onExpandBegin?.(expandedByteTotal(files), files);
   }
-  await writeExpandedNodes(fs, parentId, nodes, track, prefix);
+  await runInCopySlot(track, () => writeExpandedNodes(fs, parentId, nodes, track, prefix));
 }
 
 async function writeExpandedNodes(
@@ -386,6 +405,7 @@ async function writeExpandedNodes(
     const path = prefix ? `${prefix}/${node.name}` : node.name;
     if (node.kind === 'dir') {
       const dir = await fs.ensureDir(parentId, node.name);
+      track?.onDir?.(parentId, node.name, dir.id, path);
       await stampExpandedMeta(fs, dir, node, true);
       await writeExpandedNodes(fs, dir.id, node.children, track, path);
       continue;
@@ -421,6 +441,7 @@ async function importExpandedFile(
   const removePartial = child?.removePartial ?? track?.removePartial;
   try {
     throwIfAborted(signal);
+    child?.onWrite?.(parentId, node.name) ?? track?.onWrite?.(parentId, node.name);
     const vnode = await fs.createFile(parentId, node.name, node.data, node.resource, node.finderInfo, (n) => {
       throwIfAborted(signal);
       wrote += n;
@@ -429,6 +450,16 @@ async function importExpandedFile(
     throwIfAborted(signal);
     if (wrote === 0 && bytesTotal > 0) credit(bytesTotal);
     await stampExpandedMeta(fs, vnode, node, false);
+    try {
+      await iconCache.ingestExtracted({
+        name: node.name,
+        finderInfo: node.finderInfo,
+        resource: node.resource,
+        data: node.data,
+      });
+    } catch {
+      /* listing can still fall back to AFP / system glyphs */
+    }
     child?.onDone?.();
   } catch (err) {
     if (isAbortError(err)) await removePartial?.(parentId, node.name);

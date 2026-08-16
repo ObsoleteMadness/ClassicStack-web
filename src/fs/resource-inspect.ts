@@ -85,11 +85,12 @@ const ICON_DEBUG_ORDER = [
   'cicn',
   'ICON',
   'icns',
+  'PICT',
   'icl4',
   'ics4',
 ];
 
-export const ICON_RELATED_TYPES = new Set<string>([...SUPPORTED_ICON_TYPES, 'BNDL', 'FREF', 'icns']);
+export const ICON_RELATED_TYPES = new Set<string>([...SUPPORTED_ICON_TYPES, 'BNDL', 'FREF', 'icns', 'PICT']);
 
 function be16s(b: Uint8Array, o: number): number {
   return (be16(b, o) << 16) >> 16;

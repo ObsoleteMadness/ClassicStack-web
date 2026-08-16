@@ -44,6 +44,16 @@ See the plan: TashTalk → LLAP/DDP → NBP → ATP → ASP → AFP, with a Virt
 
 Protocol codecs mirror [ClassicStack](https://github.com/ObsoleteMadness/ClassicStack).
 
+## Credits
+
+ClassicStack is indebted to the following source code and authors:
+
+- [Tashtari](https://github.com/lampmerchant) for [TashTalk](https://github.com/lampmerchant/tashtalk) (host framing also follows [TashRouter](https://github.com/lampmerchant/tashrouter); GPLv3)
+- [Elliot Nunn](https://github.com/elliotnunn) for [NetBoot](https://github.com/elliotnunn/NetBoot) (ChainLoader / AppleTalk Boot Protocol; MIT)
+- [XADMaster](https://github.com/MacPaw/XADMaster) / The Unarchiver — [Dag Ågren](https://github.com/DagAgren), [Dirk Stöcker](https://www.dstoecker.eu/xadmaster.html), and the xadmaster library — StuffIt archive formats (also via [stuffit-rs](https://github.com/benletchford/stuffit-rs))
+- [Matthias Wiesmann](https://github.com/wiesmann) for [QuickDrawViewer](https://github.com/wiesmann/QuickDrawViewer) (PICT / QuickDraw opcode layout and PackBits; Apache 2.0)
+- [Harald Kuhr](https://github.com/haraldk) for [TwelveMonkeys](https://github.com/haraldk/TwelveMonkeys) [imageio-pict](https://github.com/haraldk/TwelveMonkeys/tree/master/imageio/imageio-pict) (PICT bitmap packing; BSD-3-Clause)
+
 ## Notes
 
 - Guest login (`No User Authent`) plus `Cleartxt Passwrd` and Randnum UAMs when connecting as a client

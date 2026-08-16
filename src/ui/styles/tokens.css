@@ -413,17 +413,6 @@ finder-window.is-dragging .titlebar {
   flex-direction: column;
 }
 
-.props-layer {
-  position: absolute;
-  inset: 0;
-  z-index: 5;
-  pointer-events: none;
-}
-
-.props-layer .item-info--dialog {
-  pointer-events: auto;
-}
-
 .pathbar {
   display: flex;
   align-items: center;
@@ -1126,14 +1115,13 @@ finder-window.is-dragging .titlebar {
 }
 
 .item-info--dialog {
-  position: absolute;
-  right: 16px;
-  top: 16px;
-  z-index: 5;
-  padding: 16px 14px;
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  animation: rise 280ms ease;
+  width: auto;
+  min-width: 0;
+  flex: none;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
 }
 
 .preview-hero {
@@ -1468,6 +1456,24 @@ finder-window.is-dragging .titlebar {
   flex-shrink: 0;
 }
 
+.quicklook__body--media {
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: #12161b;
+}
+
+.quicklook__image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  background: #fff;
+}
+
+.quicklook__audio {
+  width: min(100%, 480px);
+}
+
 /* —— Screen menu bar (outside Finder window) —— */
 
 .app-menubar {
@@ -1596,7 +1602,7 @@ finder-window.is-dragging .titlebar {
   margin: 4px 6px;
 }
 
-/* —— Floating log panel —— */
+/* —— Floating log panel (same z band as activity / resource; Finder stays at 20) —— */
 
 log-panel,
 .log-panel {
@@ -1635,7 +1641,8 @@ log-panel[hidden],
 
 .log-panel.is-dragging .log-panel__chrome,
 .activity-window.is-dragging .activity-window__chrome,
-.rsrc-explorer.is-dragging .rsrc-explorer__chrome {
+.rsrc-explorer.is-dragging .rsrc-explorer__chrome,
+.get-info-window.is-dragging .get-info-window__chrome {
   cursor: grabbing;
 }
 
@@ -1735,11 +1742,12 @@ log-panel[hidden],
 activity-window,
 .activity-window {
   position: fixed;
-  z-index: 61;
+  z-index: 60;
   width: min(480px, calc(100vw - 24px));
   height: min(460px, calc(100vh - 48px));
+  max-height: calc(100vh - 16px);
   min-width: min(320px, calc(100vw - 24px));
-  min-height: 240px;
+  min-height: 160px;
   display: flex;
   flex-direction: column;
   background: var(--bg-elevated);
@@ -1765,6 +1773,13 @@ activity-window[hidden],
   cursor: grab;
   user-select: none;
   touch-action: none;
+  flex-shrink: 0;
+}
+
+.activity-window__panel {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
 }
 
 .activity-window__title {
@@ -1798,9 +1813,6 @@ activity-window[hidden],
 }
 
 .activity-window__body {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
   padding: 8px 10px 12px;
 }
 
@@ -1851,7 +1863,7 @@ activity-window[hidden],
 file-activity-window,
 .file-activity-window {
   position: fixed;
-  z-index: 62;
+  z-index: 60;
   width: min(360px, calc(100vw - 24px));
   height: min(240px, calc(100vh - 56px));
   min-width: min(240px, calc(100vw - 24px));
@@ -1904,12 +1916,77 @@ file-activity-window[hidden],
   color: var(--text-muted);
 }
 
+/* —— Get Info tool window (icon / list views) —— */
+
+get-info-window,
+.get-info-window {
+  position: fixed;
+  z-index: 60;
+  width: min(320px, calc(100vw - 24px));
+  height: min(560px, calc(100vh - 48px));
+  max-height: calc(100vh - 16px);
+  min-width: min(260px, calc(100vw - 24px));
+  min-height: 160px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  animation: rise 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+get-info-window[hidden],
+.get-info-window[hidden] {
+  display: none !important;
+}
+
+.get-info-window__chrome {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #2c333b, #262c33);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  flex-shrink: 0;
+}
+
+.get-info-window__title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-right: 4px;
+}
+
+.get-info-window__chrome .log-panel__btn:last-child {
+  margin-left: auto;
+}
+
+.get-info-window__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 14px;
+  background: #252b33;
+}
+
+.get-info-window__empty {
+  margin: 0;
+  padding: 24px 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
 /* —— Resource fork explorer —— */
 
 resource-fork-explorer,
 .rsrc-explorer {
   position: fixed;
-  z-index: 63;
+  z-index: 60;
   width: min(640px, calc(100vw - 24px));
   height: min(480px, calc(100vh - 48px));
   min-width: min(420px, calc(100vw - 24px));
@@ -2133,6 +2210,20 @@ resource-fork-explorer[hidden],
   background-size: 8px 8px;
   background-position: 0 0, 0 4px, 4px -4px, -4px 0;
   border-radius: 4px;
+}
+
+.rsrc-explorer__preview--pict {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.rsrc-explorer__preview--pict img {
+  image-rendering: auto;
+  max-width: min(100%, 480px);
+  max-height: 280px;
+  height: auto;
+  width: auto;
+  background: #fff;
 }
 
 .rsrc-explorer__decoded {
@@ -3151,10 +3242,10 @@ html.compact-ui .column .col-item {
 }
 
 html.compact-ui .item-info--dialog {
-  left: 8px;
-  right: 8px;
+  left: auto;
+  right: auto;
   top: auto;
-  bottom: 8px;
+  bottom: auto;
   max-width: none;
   min-width: 0;
   width: auto;
@@ -3174,7 +3265,9 @@ html.compact-ui log-panel,
 html.compact-ui .log-panel,
 html.compact-ui activity-window,
 html.compact-ui .activity-window,
-html.compact-ui .rsrc-explorer {
+html.compact-ui .rsrc-explorer,
+html.compact-ui get-info-window,
+html.compact-ui .get-info-window {
   width: calc(100vw - 16px);
   max-width: none;
   height: min(70vh, calc(100dvh - 56px));

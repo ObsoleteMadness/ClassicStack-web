@@ -192,6 +192,82 @@ describe('transferActivity', () => {
     transferActivity.clearFinished();
   });
 
+  it('overlays several extracted dest names from one expand job', () => {
+    const dest = {
+      async lookup() {
+        return undefined;
+      },
+      async remove() {},
+    };
+    const id = transferActivity.start({ name: 'Pack.sit', kind: 'file', bytesTotal: 200 });
+    transferActivity.setDest(id, dest, 2, 'Pack.sit');
+    transferActivity.clearDest(id);
+    transferActivity.addDest(id, dest, 2, 'Utilities', 'folder');
+    transferActivity.addBytes(id, 50);
+    const child = transferActivity.start({
+      name: 'ReadMe',
+      kind: 'file',
+      bytesTotal: 40,
+      queued: true,
+    });
+    transferActivity.setDest(child, dest, 2, 'ReadMe', 'file');
+    expect(transferActivity.writesIn(dest, 2)).toEqual([
+      { jobId: id, name: 'Utilities', kind: 'folder', pct: 25, indeterminate: false },
+      { jobId: child, name: 'ReadMe', kind: 'file', pct: 0, indeterminate: false },
+    ]);
+    transferActivity.finish(child);
+    transferActivity.finish(id);
+    transferActivity.clearFinished();
+  });
+
+  it('runs queued copy jobs one at a time and begins them in order', async () => {
+    const dest = {
+      async lookup() {
+        return undefined;
+      },
+      async remove() {},
+    };
+    const first = transferActivity.start({ name: 'A', kind: 'file', bytesTotal: 10 });
+    transferActivity.setDest(first, dest, 2, 'A');
+    const second = transferActivity.start({ name: 'B', kind: 'file', bytesTotal: 10, queued: true });
+    transferActivity.setDest(second, dest, 2, 'B');
+    expect(transferActivity.busyOn(dest)).toBe(true);
+    expect(transferActivity.list().find((j) => j.id === second)?.status).toBe('queued');
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const a = transferActivity.withCopySlot(first, () =>
+      new Promise<void>((resolve) => {
+        order.push('A');
+        releaseFirst = resolve;
+      }),
+    );
+    const b = transferActivity.withCopySlot(second, async () => {
+      order.push('B');
+    });
+    await Promise.resolve();
+    expect(order).toEqual(['A']);
+    expect(transferActivity.list().find((j) => j.id === second)?.status).toBe('queued');
+    releaseFirst();
+    await Promise.all([a, b]);
+    expect(order).toEqual(['A', 'B']);
+    expect(transferActivity.list().find((j) => j.id === second)?.status).toBe('running');
+    transferActivity.finish(first);
+    transferActivity.finish(second);
+    transferActivity.clearFinished();
+  });
+
+  it('reenters withCopySlot for the same job', async () => {
+    const id = transferActivity.start({ name: 'Pack', kind: 'file', bytesTotal: 8 });
+    await transferActivity.withCopySlot(id, async () => {
+      await transferActivity.withCopySlot(id, async () => {
+        transferActivity.addBytes(id, 1);
+      });
+    });
+    expect(transferActivity.list().find((j) => j.id === id)?.bytesDone).toBe(1);
+    transferActivity.finish(id);
+    transferActivity.clearFinished();
+  });
+
   it('does not delete a dest folder registered as the partial', async () => {
     const removed: number[] = [];
     const dest = {
@@ -207,6 +283,28 @@ describe('transferActivity', () => {
     transferActivity.cancel(id);
     await transferActivity.discardPartial(id);
     expect(removed).toEqual([]);
+    transferActivity.clearFinished();
+  });
+
+  it('keeps a folder dest overlay when the in-flight file moves into a nested folder', () => {
+    const dest = {
+      async lookup() {
+        return undefined;
+      },
+      async remove() {},
+    };
+    const id = transferActivity.start({ name: 'Docs', kind: 'folder', bytesTotal: 200 });
+    transferActivity.setDest(id, dest, 2, 'Docs', 'folder');
+    transferActivity.setWriteFile(id, dest, 9, 'inner');
+    expect(transferActivity.writesIn(dest, 2)).toEqual([
+      { jobId: id, name: 'Docs', kind: 'folder', pct: 0, indeterminate: false },
+    ]);
+    expect(transferActivity.writesIn(dest, 9)).toEqual([
+      { jobId: id, name: 'inner', kind: 'file', pct: 0, indeterminate: false },
+    ]);
+    transferActivity.setWriteFile(id, dest, 9, 'other');
+    expect(transferActivity.writesIn(dest, 9).map((w) => w.name)).toEqual(['other']);
+    transferActivity.finish(id);
     transferActivity.clearFinished();
   });
 });

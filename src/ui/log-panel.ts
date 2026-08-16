@@ -1,6 +1,6 @@
 import { log, meetsLevel, type LogEntry, type LogLevel } from '../util/logger';
-import { enableWindowMove, enableWindowResize, onWindowGeometryChange } from './window-resize';
 import { defaultLogFrame, persistWindow, restoreWindow } from './window-layout';
+import { enableWindowMove, enableWindowResize, onWindowGeometryChange, raiseFloatingWindow } from './window-resize';
 
 const LEVELS: LogLevel[] = ['trace', 'info', 'warn', 'error'];
 
@@ -33,6 +33,7 @@ export class LogPanel extends HTMLElement {
     this.hidden = false;
     this.reload();
     this.scrollToBottom();
+    raiseFloatingWindow(this);
     persistWindow('log', this);
   }
 

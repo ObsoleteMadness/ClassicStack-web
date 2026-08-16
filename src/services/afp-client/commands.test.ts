@@ -24,6 +24,7 @@ import {
   pickCleartextUam,
   getFileDirParms,
   afpRequestDetail,
+  parseOpenForkRequest,
   createDir,
   deletePath,
   logout,
@@ -64,6 +65,37 @@ describe('AFP client wirePath + Pascal framing', () => {
     expect(of[12]).toBe(C.PathTypeLongNames);
     expect(of[13]).toBe(body.length);
     expect([...of.subarray(14, 14 + body.length)]).toEqual([...body]);
+  });
+
+  it('MoveAndRename uses null dest and NewName like a Mac Finder move', () => {
+    const b = moveAndRename(1, 2, 'X', 13, '');
+    expect(b[0]).toBe(C.CmdMoveAndRename);
+    expect(be32(b, 4)).toBe(2);
+    expect(be32(b, 8)).toBe(13);
+    expect(b[12]).toBe(C.PathTypeLongNames);
+    const src = wirePath('X');
+    expect(b[13]).toBe(src.length);
+    let o = 14 + src.length;
+    if (o % 2) o++;
+    expect(b[o]).toBe(C.PathTypeLongNames);
+    expect(b[o + 1]).toBe(0);
+    o += 2;
+    if (o % 2) o++;
+    expect(b[o]).toBe(C.PathTypeLongNames);
+    expect(b[o + 1]).toBe(0);
+    expect(b.length).toBe(o + 2);
+  });
+
+  it('MoveAndRename NewName is a CNode name, not a wire path', () => {
+    const b = moveAndRename(1, 2, 'Old', 3, 'New');
+    const src = wirePath('Old');
+    let o = 14 + src.length;
+    if (o % 2) o++;
+    o += 2; // null dest
+    if (o % 2) o++;
+    expect(b[o]).toBe(C.PathTypeLongNames);
+    expect(b[o + 1]).toBe(3);
+    expect([...b.subarray(o + 2, o + 5)]).toEqual([...encodeMacRoman('New')]);
   });
 });
 
@@ -349,6 +381,10 @@ describe('AFP client request traces', () => {
     expect(afpRequestDetail(openFork(1, 2, 0, C.AccessRead, C.ForkFlagData, 'Pack.sit'))).toContain(
       'Pack.sit',
     );
+    expect(parseOpenForkRequest(openFork(1, 2, 0, C.AccessRead, C.ForkFlagResource, 'App'))).toEqual({
+      path: 'App',
+      resource: true,
+    });
     expect(afpRequestDetail(readFork(7, 100, 50))).toMatch(/fork=7 off=100 n=50/);
     expect(afpRequestDetail(writeFork(7, 0, 4096))).toMatch(/fork=7 off=0 n=4096/);
     expect(afpRequestDetail(closeFork(7))).toContain('fork=7');

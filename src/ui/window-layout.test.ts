@@ -5,9 +5,10 @@ describe('window layout', () => {
   it('parses stored frames and ignores junk', () => {
     expect(parseWindowLayouts(null)).toEqual({});
     expect(parseWindowLayouts({ finder: { left: 10, top: 20, width: 400, height: 300, maximized: true } })).toEqual({
-      finder: { left: 10, top: 20, width: 400, height: 300, maximized: true, open: false },
+      finder: { left: 10, top: 20, width: 400, height: 300, maximized: true, open: false, userSized: false },
     });
     expect(parseFrame({ left: 'x', top: 1, width: 2, height: 3 })).toBeNull();
+    expect(parseFrame({ left: 1, top: 2, width: 3, height: 4, userSized: true })?.userSized).toBe(true);
   });
 
   it('clamps frames onto the viewport', () => {

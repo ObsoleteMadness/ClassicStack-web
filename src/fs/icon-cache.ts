@@ -5,7 +5,7 @@
  */
 
 import { openDB, type IDBPDatabase } from './idb-shim';
-import { ResourceFork, type FinderIconForkOpts } from './resource-fork';
+import { loadFinderIconFork, ResourceFork, type FinderIconForkOpts } from './resource-fork';
 import { forkBytesFromNode } from './resource-inspect';
 import { parseBndl } from './resource-types/bndl';
 import { decodedIconToDataUrl, decodeDesktopIcon } from './resource-types/icon-decoder';
@@ -40,7 +40,7 @@ export function isCustomFolderIconName(name: string): boolean {
 
 const ICON_CACHE_DB = 'classicstack-icon-cache';
 /** Bump when decoded-icon preference or extract rules change so stale BW PNGs are dropped. */
-const ICON_CACHE_DB_VERSION = 4;
+const ICON_CACHE_DB_VERSION = 5;
 
 export interface IconUrls {
   small: string;
@@ -107,7 +107,7 @@ export function shouldReadIconFork(
 }
 
 /** Ids / extract rules for a ranged resource-fork read. */
-export function iconForkLoadOptions(node: VNode): FinderIconForkOpts {
+export function iconForkLoadOptions(node: { name: string; finderInfo: Uint8Array }): FinderIconForkOpts {
   const { type } = readTypeCreator(node.finderInfo);
   const flags = finderFlags(node.finderInfo);
   const extraIds: number[] = [];
@@ -250,8 +250,11 @@ async function iconSetToUrls(set: IconSet): Promise<IconUrls | null> {
   };
 }
 
-function iconSetHasColor(set: IconSet): boolean {
-  return set.icons.some((icon) => icon.isColor);
+function iconSetHasPreferredColor(set: IconSet): boolean {
+  return set.icons.some((icon) => {
+    const t = icon.typeCode.trim();
+    return t === 'icl8' || t === 'ics8' || t === 'cicn';
+  });
 }
 
 export class IconCache {
@@ -264,6 +267,12 @@ export class IconCache {
   private desktopInflight = new Map<string, Promise<IconUrls | null>>();
   /** Type/creator keys whose cached glyph came from an 8-bit/cicn family (not ICN# / AFP B&W). */
   private colorKeys = new Set<string>();
+  /** Type/creator keys whose resource fork was already opened for icons. */
+  private iconForkTried = new Set<string>();
+  /** Type/creator keys that resolved to a /icons fallback; do not probe again. */
+  private defaultKeys = new Set<string>();
+  /** Desktop DB GetIcon already returned nothing for this type/creator. */
+  private desktopMiss = new Set<string>();
   private db: IDBPDatabase | null = null;
   private initPromise: Promise<void> | null = null;
   private systemReady: Promise<void> | null = null;
@@ -303,6 +312,9 @@ export class IconCache {
     this.dirMemory.clear();
     this.desktopMemory.clear();
     this.colorKeys.clear();
+    this.iconForkTried.clear();
+    this.defaultKeys.clear();
+    this.desktopMiss.clear();
     this.typeInflight.clear();
     this.dirInflight.clear();
     this.desktopInflight.clear();
@@ -377,14 +389,14 @@ export class IconCache {
     if (cached) this.memory.set(key, cached);
     const custom = (finderFlags(node.finderInfo) & HAS_CUSTOM_ICON) !== 0;
     if (cached && !custom && this.colorKeys.has(key)) return cached;
+    if (cached && !custom && this.defaultKeys.has(key)) return cached;
+    if (cached && !custom && this.iconForkTried.has(key)) return cached;
 
     throwIfAborted(extras?.signal);
 
-    const rsrcHint = node.resourceBytes ?? node.resource.length;
     const needFork =
       !!loadIconFork &&
-      (shouldReadIconFork(node.finderInfo, type, this.colorKeys.has(key) ? cached : null) ||
-        rsrcHint >= 16);
+      shouldReadIconFork(node.finderInfo, type, this.colorKeys.has(key) ? cached : null);
 
     if (!custom && !needFork) {
       const pending = this.typeInflight.get(key);
@@ -421,19 +433,20 @@ export class IconCache {
   ): Promise<IconUrls> {
     throwIfAborted(extras?.signal);
     let fork: ResourceFork | null = null;
-    const rsrcHint = node.resourceBytes ?? node.resource.length;
-    if (
-      loadIconFork &&
-      (shouldReadIconFork(node.finderInfo, type, this.colorKeys.has(cacheKey(creator, type)) ? cached : null) ||
-        rsrcHint >= 16)
-    ) {
+    const key = cacheKey(creator, type);
+    const custom = (finderFlags(node.finderInfo) & HAS_CUSTOM_ICON) !== 0;
+    const needFork =
+      !!loadIconFork &&
+      shouldReadIconFork(node.finderInfo, type, this.colorKeys.has(key) ? cached : null);
+    if (needFork) {
       try {
         throwIfAborted(extras?.signal);
-        fork = await loadIconFork(node);
+        fork = await loadIconFork!(node);
       } catch (err) {
         if (isAbortError(err)) throw err;
         fork = null;
       }
+      if (!custom && fork) this.iconForkTried.add(key);
     }
     const urls = await this.getForFile({
       type,
@@ -445,9 +458,19 @@ export class IconCache {
     });
     if (!isSystemIconUrls(urls)) return urls;
     if (fork && iconSetForFile(fork, type, node.finderInfo)) return urls;
-    const desktop = await this.desktopFallback(type, creator, extras);
-    if (desktop) return desktop;
+    const probeDesktop = !!extras?.loadDesktopIcons && (custom || needFork);
+    if (probeDesktop) {
+      const desktop = await this.desktopFallback(type, creator, extras);
+      if (desktop) return desktop;
+      if (!this.desktopMiss.has(key)) return urls;
+    }
+    this.rememberDefault(key, urls);
     return urls;
+  }
+
+  private rememberDefault(key: string, urls: IconUrls): void {
+    this.memory.set(key, urls);
+    this.defaultKeys.add(key);
   }
 
   private async desktopFallback(
@@ -458,6 +481,7 @@ export class IconCache {
     if (!extras?.loadDesktopIcons) return null;
     throwIfAborted(extras.signal);
     const key = cacheKey(creator, type);
+    if (this.desktopMiss.has(key)) return null;
     const hit = this.desktopMemory.get(key);
     if (hit) return hit;
 
@@ -467,11 +491,17 @@ export class IconCache {
         try {
           const blobs = await extras.loadDesktopIcons!(type, creator, extras.signal);
           throwIfAborted(extras.signal);
-          if (!blobs?.length) return null;
+          if (!blobs?.length) {
+            this.desktopMiss.add(key);
+            return null;
+          }
           const icons = blobs
             .map((b) => decodeDesktopIcon(b.iconType, b.data))
             .filter((i): i is NonNullable<typeof i> => i != null);
-          if (!icons.length) return null;
+          if (!icons.length) {
+            this.desktopMiss.add(key);
+            return null;
+          }
           const urls = await iconSetToUrls(new IconSet(icons));
           if (urls) this.desktopMemory.set(key, urls);
           return urls;
@@ -500,6 +530,52 @@ export class IconCache {
         throw err;
       }
     }
+  }
+
+  /**
+   * Decode Finder icons from an already-extracted fork (StuffIt / BinHex / …)
+   * so later listings do not reopen that fork over AFP.
+   */
+  async ingestExtracted(args: {
+    name: string;
+    finderInfo: Uint8Array;
+    resource: Uint8Array;
+    data?: Uint8Array;
+    fork?: ResourceFork | null;
+  }): Promise<void> {
+    const { type, creator } = readTypeCreator(args.finderInfo);
+    if (isVolumeDesktopFile(args.name, type, creator)) return;
+    if (!shouldReadIconFork(args.finderInfo, type) && !isCustomFolderIconName(args.name)) return;
+    await this.ensureDefaults();
+    const key = cacheKey(creator, type);
+    this.defaultKeys.delete(key);
+    let fork = args.fork ?? null;
+    if (!fork || fork.allEntries.length === 0) {
+      const picked = forkBytesFromNode({
+        resource: args.resource,
+        data: args.data ?? new Uint8Array(),
+      });
+      if (picked.source === 'empty' || picked.bytes.length < 16) return;
+      const bytes = picked.bytes;
+      try {
+        fork = await loadFinderIconFork(
+          async (offset, count) => bytes.subarray(offset, Math.min(bytes.length, offset + count)),
+          iconForkLoadOptions(args),
+        );
+      } catch {
+        fork = ResourceFork.fromBytes(bytes);
+      }
+    }
+    if (!fork || fork.allEntries.length === 0) return;
+    this.iconForkTried.add(key);
+    await this.getForFile({
+      type,
+      creator,
+      resource: args.resource,
+      data: args.data,
+      finderInfo: args.finderInfo,
+      fork,
+    });
   }
 
   /** Resolve icons when only Finder info is known (remote listings). */
@@ -666,7 +742,7 @@ export class IconCache {
         if (urls) {
           if (!custom) {
             this.memory.set(key, urls);
-            if (iconSetHasColor(set)) {
+            if (iconSetHasPreferredColor(set)) {
               this.colorKeys.add(key);
               await this.persist(key, urls);
             }
@@ -717,7 +793,9 @@ export class IconCache {
       const urls = await iconSetToUrls(set);
       if (!urls) return;
       this.memory.set(k, urls);
-      if (iconSetHasColor(set)) {
+      this.iconForkTried.add(k);
+      this.defaultKeys.delete(k);
+      if (iconSetHasPreferredColor(set)) {
         this.colorKeys.add(k);
         await this.persist(k, urls);
       }

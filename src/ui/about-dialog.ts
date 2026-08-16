@@ -12,6 +12,12 @@ const XADMASTER = 'https://github.com/MacPaw/XADMaster';
 const DAG = 'https://github.com/DagAgren';
 const DIRK = 'https://www.dstoecker.eu/xadmaster.html';
 const STUFFIT_RS = 'https://github.com/benletchford/stuffit-rs';
+const WIESMANN = 'https://github.com/wiesmann';
+const QUICKDRAW_VIEWER = 'https://github.com/wiesmann/QuickDrawViewer';
+const HARALD_KUHR = 'https://github.com/haraldk';
+const TWELVE_MONKEYS = 'https://github.com/haraldk/TwelveMonkeys';
+const TWELVE_MONKEYS_PICT =
+  'https://github.com/haraldk/TwelveMonkeys/tree/master/imageio/imageio-pict';
 const GPL = 'https://www.gnu.org/licenses/gpl-3.0.html';
 
 function extLink(href: string, label: string): string {
@@ -53,7 +59,7 @@ export class AboutDialog extends HTMLElement {
       <div class="netboot-dialog__backdrop" data-act="close"></div>
       <div class="netboot-dialog__card about-dialog__card" role="dialog" aria-labelledby="about-title" aria-modal="true">
         <header class="netboot-dialog__header">
-          <h2 id="about-title">About ClassicStack</h2>
+          <h2 id="about-title">About ClassicStack Web</h2>
           <button type="button" class="btn" data-act="close" aria-label="Close">✕</button>
         </header>
         <div class="about-dialog__body">
@@ -63,12 +69,12 @@ export class AboutDialog extends HTMLElement {
           <p>${extLink(REPO, 'GitHub')}</p>
           <h3>License</h3>
           <p>
-            ClassicStack is free software under the
+            ClassicStack Webis free software under the
             ${extLink(GPL, 'GNU General Public License v3.0')}.
           </p>
 
           <h3>Credits</h3>
-          <p>ClassicStack is indebted to the following source code and authors:</p>
+          <p>ClassicStack Web is indebted to the following source code and authors:</p>
           <ul>
             <li>
               ${extLink(TASHTARI, 'Tashtari')} for
@@ -88,6 +94,17 @@ export class AboutDialog extends HTMLElement {
               ${extLink(DIRK, 'Dirk Stöcker')},
               and the xadmaster library — StuffIt archive formats
               (also via ${extLink(STUFFIT_RS, 'stuffit-rs')})
+            </li>
+            <li>
+              ${extLink(WIESMANN, 'Matthias Wiesmann')} for
+              ${extLink(QUICKDRAW_VIEWER, 'QuickDrawViewer')}
+              (PICT / QuickDraw opcode layout and PackBits; Apache 2.0)
+            </li>
+            <li>
+              ${extLink(HARALD_KUHR, 'Harald Kuhr')} for
+              ${extLink(TWELVE_MONKEYS, 'TwelveMonkeys')}
+              ${extLink(TWELVE_MONKEYS_PICT, 'imageio-pict')}
+              (PICT bitmap packing; BSD-3-Clause)
             </li>
           </ul>
         </div>

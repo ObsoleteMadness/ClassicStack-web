@@ -19,9 +19,10 @@ import {
   type ResourceTypeGroup,
 } from '../fs/resource-inspect';
 import { decodeIcon, SUPPORTED_ICON_TYPES, decodedIconToDataUrl } from '../fs/resource-types/icon-decoder';
+import { pictToSvgDataUrl } from '../fs/pict/pict';
 import { readTypeCreator } from '../fs/icon-cache';
 import { formatBytes } from './format-bytes';
-import { enableWindowMove, enableWindowResize, onWindowGeometryChange } from './window-resize';
+import { enableWindowMove, enableWindowResize, onWindowGeometryChange, raiseFloatingWindow } from './window-resize';
 import { defaultResourceFrame, persistWindow, restoreWindow } from './window-layout';
 
 const ICON_TYPE_SET = new Set<string>(SUPPORTED_ICON_TYPES);
@@ -70,6 +71,7 @@ export class ResourceForkExplorer extends HTMLElement {
 
   show(): void {
     this.hidden = false;
+    raiseFloatingWindow(this);
     persistWindow('resource', this);
   }
 
@@ -212,6 +214,9 @@ export class ResourceForkExplorer extends HTMLElement {
       const decoded = decodeIcon(sel.entry.type, bytes);
       this.previewUrl = decoded ? await decodedIconToDataUrl(decoded) : null;
       if (gen !== this.loadGen) return;
+    } else if (sel.entry.type === 'PICT') {
+      this.previewUrl = await pictToSvgDataUrl(bytes);
+      if (gen !== this.loadGen) return;
     }
     this.paintEntries();
     this.paintDetail();
@@ -350,11 +355,14 @@ export class ResourceForkExplorer extends HTMLElement {
     const parts: string[] = [];
 
     if (this.previewUrl) {
+      const isPict = sel.entry.type === 'PICT';
       parts.push(
-        `<div class="rsrc-explorer__preview"><img alt="" width="32" height="32" src="${escapeHtml(this.previewUrl)}" /><span>Decoded ${escapeHtml(formatOsType(sel.entry.type))} ${sel.entry.id}</span></div>`,
+        `<div class="rsrc-explorer__preview${isPict ? ' rsrc-explorer__preview--pict' : ''}"><img alt="" ${isPict ? '' : 'width="32" height="32" '}src="${escapeHtml(this.previewUrl)}" /><span>Decoded ${escapeHtml(formatOsType(sel.entry.type))} ${sel.entry.id}</span></div>`,
       );
     } else if (ICON_TYPE_SET.has(sel.entry.type)) {
       parts.push(`<p class="rsrc-explorer__empty">Icon type present but decode failed (${sel.entry.length} bytes).</p>`);
+    } else if (sel.entry.type === 'PICT') {
+      parts.push(`<p class="rsrc-explorer__empty">PICT present but decode failed (${sel.entry.length} bytes). Bitmap and QuickDraw opcodes are supported; QuickTime-compressed pictures are not.</p>`);
     }
 
     if (sel.entry.type === 'FREF') {

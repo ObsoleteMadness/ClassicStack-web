@@ -18,7 +18,6 @@ import { expandArchiveFile, expandFailureMessage, isExpandableArchive, type Expa
 import { expandSitInPlace } from '../fs/expand-inplace';
 import type { WelcomePackProgress } from '../fs/welcome-pack';
 import { importExpandedTree, type ImportItemTrack } from '../fs/import-transfer';
-import { filenameExtension } from '../fs/extension-map';
 import { decodeVers1, versInfoForGetInfo, type VersGetInfo, type VersRec } from '../fs/resource-types/vers';
 import {
   finderCommentFromFork,
@@ -29,6 +28,7 @@ import {
 import { loadPrefs, savePrefs } from '../util/prefs';
 import { log } from '../util/logger';
 import { isAbortError, throwIfAborted } from '../util/abort';
+import { VisibleIconQueue } from './icon-prefetch';
 import { uiIcons } from './lucide-icon';
 import { enableWindowMove, enableWindowResize, onWindowGeometryChange } from './window-resize';
 import {
@@ -39,6 +39,7 @@ import {
   restoreWindow,
 } from './window-layout';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
+import type { GetInfoWindow } from './get-info-window';
 import { isCompactUi, onLayoutModeChange } from './layout-mode';
 import { positionCallout } from './callout';
 import { paintTransferList } from './transfer-list';
@@ -55,13 +56,14 @@ import {
   type NameConflictChoice,
   type PlacementPlan,
 } from '../fs/name-conflict';
+import { decodePict, pictToSvg } from '../fs/pict/pict';
+import { previewKindFor, previewMime, type FilePreviewKind } from './file-preview';
 
 export type ViewMode = 'icon' | 'list' | 'column';
 export type SortKey = 'name' | 'modified' | 'size';
 
 /** Finder file types that open in the Quick Look overlay. */
-const PREVIEW_TEXT_TYPES = new Set(['TEXT', 'ttro']);
-const PREVIEW_MAX_BYTES = 512 * 1024;
+const PREVIEW_TEXT_MAX_BYTES = 512 * 1024;
 
 export interface FinderHost {
   connectSerial(): Promise<void>;
@@ -225,6 +227,15 @@ export class FinderWindow extends HTMLElement {
   private iconLoadGen = 0;
   /** Cancels queued FPGetIcon / icon-fork AFP work when leaving a folder. */
   private iconAbort: AbortController | null = null;
+  /** Finder items waiting for a visible-icon load slot. */
+  private iconPrefetchItems = new Map<string, ListItem>();
+  private iconObserver: IntersectionObserver | null = null;
+  /** Finder item elements currently intersecting the visible Finder pane. */
+  private iconIntersectingEls = new Set<Element>();
+  private iconQueue = new VisibleIconQueue<ListItem>(
+    (it) => this.resolveVisibleIcon(it),
+    (it) => this.isFinderIconVisible(it.key),
+  );
   /** Cached `vers` 1 Get Info strings, keyed by node id. */
   private versInfo = new Map<number, { stamp: string; info: VersGetInfo | null }>();
   /** Cached Finder comment from `FCMT` in the resource fork. */
@@ -235,8 +246,15 @@ export class FinderWindow extends HTMLElement {
   /** Per-folder list-view disclose listings; aborted on collapse or navigation. */
   private expandListAbort = new Map<number, AbortController>();
   private networkScanning = false;
-  private preview: { id: number; name: string; text: string | null; truncated?: boolean; error?: string } | null =
-    null;
+  private preview: {
+    id: number;
+    name: string;
+    kind: FilePreviewKind;
+    text: string | null;
+    url?: string | null;
+    truncated?: boolean;
+    error?: string;
+  } | null = null;
   private previewGen = 0;
   /** Desktop view to restore when leaving compact layout. */
   private desktopView: ViewMode | null = null;
@@ -250,10 +268,20 @@ export class FinderWindow extends HTMLElement {
   private transferBtnVisible = false;
   private writeSig = '';
   private resourceExplorer: ResourceForkExplorer | null = null;
+  private getInfoWindow: GetInfoWindow | null = null;
   private finderLayoutReady = false;
 
   bindResourceExplorer(panel: ResourceForkExplorer): void {
     this.resourceExplorer = panel;
+  }
+
+  bindGetInfoWindow(win: GetInfoWindow): void {
+    this.getInfoWindow = win;
+    win.onAction = (act) => void this.handleAction(act);
+    win.onClose = () => {
+      this.showProps = false;
+      this.syncPropsButton();
+    };
   }
 
   /** Open the resource-fork explorer on the current (or given) item. */
@@ -401,6 +429,7 @@ export class FinderWindow extends HTMLElement {
       this.vfsRefreshTimer = null;
     }
     this.abortAllListings();
+    this.teardownIconObserver();
   }
 
   /** AFP / local mutations land here; debounce so fork writes don't thrash the UI. */
@@ -446,12 +475,22 @@ export class FinderWindow extends HTMLElement {
     return parentIds.some((id) => visible.has(id));
   }
 
+  /** Folders whose children are painted in the current Finder view. */
   private visibleFolderIds(): Set<number> {
     const ids = new Set<number>();
     ids.add(this.cwd);
-    for (const p of this.pathStack) ids.add(p.id);
+    if (this.view === 'column') {
+      for (const p of this.pathStack) ids.add(p.id);
+    }
     for (const id of this.expandedIds) ids.add(id);
     return ids;
+  }
+
+  /** Reload the listing only when `dest` is the open catalog and a parent is on screen. */
+  private async refreshIfDestVisible(dest: Catalog, ...parentIds: number[]): Promise<void> {
+    if (this.vfs !== dest) return;
+    if (!this.changeImpactsVisibleFolders(parentIds)) return;
+    await this.refreshAfterMutation();
   }
 
   private async bootstrapFromLocation(): Promise<void> {
@@ -483,13 +522,15 @@ export class FinderWindow extends HTMLElement {
     parentId?: string,
     detail?: string,
   ): string {
+    const queued = parentId == null && transferActivity.hasRunning();
     const id = transferActivity.start({
       name,
       kind: isDir ? 'folder' : 'file',
       bytesTotal,
       iconSrc: isDir ? undefined : TRANSFER_FILE_ICON,
       parentId,
-      detail,
+      detail: queued ? 'Queued' : detail,
+      queued,
     });
     if (!isDir && finderInfo && finderInfo.length >= 8) {
       const { type, creator } = readTypeCreator(finderInfo);
@@ -542,15 +583,20 @@ export class FinderWindow extends HTMLElement {
         }
       },
       onWrite: (parentId, name) => {
-        transferActivity.setDest(jobId, dest, parentId, name, 'file');
-        transferActivity.watchPartial(jobId, dest, parentId, name);
+        transferActivity.setWriteFile(jobId, dest, parentId, name);
       },
-      onDir: (parentId, name) => {
+      onDir: (parentId, name, dirId, path) => {
         transferActivity.addDest(id, dest, parentId, name, 'folder');
+        for (const [filePath, childId] of queuedByPath) {
+          const slash = filePath.lastIndexOf('/');
+          if (slash < 0 || filePath.slice(0, slash) !== path) continue;
+          transferActivity.setDest(childId, dest, dirId, filePath.slice(slash + 1), 'file');
+        }
       },
     });
     return {
       ...bind(id),
+      runInCopySlot: (fn) => transferActivity.withCopySlot(id, fn),
       onStatus: (detail) => {
         transferActivity.setDetail(id, detail);
       },
@@ -917,6 +963,9 @@ export class FinderWindow extends HTMLElement {
     const ac = new AbortController();
     this.iconAbort = ac;
     this.iconLoadGen++;
+    this.iconQueue.reset();
+    this.iconPrefetchItems.clear();
+    this.iconIntersectingEls.clear();
     return ac.signal;
   }
 
@@ -1067,12 +1116,14 @@ export class FinderWindow extends HTMLElement {
 
   private currentItems(): ListItem[] {
     const items = this.mergeWritingItems(this.cwd, this.nodes.map((n) => this.listItemFromNode(n)));
-    if (items.length === 0 && this.folderOpening) return [this.listingPlaceholderItem()];
+    if (this.folderOpening && this.nodes.length === 0) {
+      return items.length ? [...items, this.listingPlaceholderItem()] : [this.listingPlaceholderItem()];
+    }
     return items;
   }
 
   private listItemFromNode(n: VNode): ListItem {
-    return {
+    const item: ListItem = {
       key: String(n.id),
       name: n.name,
       isDir: n.isDir,
@@ -1081,6 +1132,11 @@ export class FinderWindow extends HTMLElement {
       node: n,
       finderInfo: n.finderInfo,
     };
+    const w = transferActivity
+      .writesIn(this.vfs, n.parentId)
+      .find((x) => x.name.toLowerCase() === n.name.toLowerCase());
+    if (w) item.writing = w;
+    return item;
   }
 
   private mergeWritingItems(parentId: number, items: ListItem[]): ListItem[] {
@@ -1212,7 +1268,6 @@ export class FinderWindow extends HTMLElement {
           <div class="pathbar"></div>
           <div class="file-plane">
             <div class="content" tabindex="0"></div>
-            <div class="props-layer"></div>
           </div>
         </section>
       </div>
@@ -1514,7 +1569,7 @@ export class FinderWindow extends HTMLElement {
       this.refreshPropsPanel();
     }
     this.focusRenameInput();
-    if (iconItems.length) this.prefetchIcons(iconItems);
+    if (iconItems.length) this.prefetchIcons(iconItems, 'replace');
     this.writeSig = this.writingSignature();
   }
 
@@ -1527,18 +1582,26 @@ export class FinderWindow extends HTMLElement {
     return out;
   }
 
-  /** Update only the floating properties card so item DOM (and dblclick) survives. */
+  /** Update the column preview pane, or the floating Get Info window in icon/list. */
   private refreshPropsPanel(): void {
     if (this.view === 'column') {
+      this.getInfoWindow?.hide();
       this.paintColumnSelection();
       return;
     }
-    const layer = this.querySelector('.props-layer');
-    if (!layer) return;
-    layer.innerHTML = '';
-    if (!this.showProps) return;
+    if (!this.showProps) {
+      this.getInfoWindow?.hide();
+      return;
+    }
+    const win = this.getInfoWindow;
+    if (!win) return;
     const sel = this.selectedNode();
-    if (sel) layer.insertAdjacentHTML('beforeend', this.itemInfoHtml(sel, { variant: 'dialog' }));
+    win.setBody(
+      sel
+        ? this.itemInfoHtml(sel, { variant: 'dialog' })
+        : `<p class="get-info-window__empty">Select an item in the Finder.</p>`,
+    );
+    win.show();
   }
 
   private focusRenameInput(): void {
@@ -1814,49 +1877,129 @@ export class FinderWindow extends HTMLElement {
     );
   }
 
-  /** Kick off icon resolution for visible items; patches DOM when ready. */
-  private prefetchIcons(items: ListItem[]): void {
+  /** Observe Finder glyphs and load at most four on-screen icons at a time. */
+  private prefetchIcons(items: ListItem[], mode: 'replace' | 'add'): void {
+    if (mode === 'replace') {
+      this.iconQueue.reset();
+      this.iconPrefetchItems.clear();
+      this.iconIntersectingEls.clear();
+      this.iconObserver?.disconnect();
+      this.iconObserver = null;
+    }
+    for (const it of items) {
+      if (it.placeholder || this.iconUrls.has(it.key)) continue;
+      this.iconPrefetchItems.set(it.key, it);
+    }
+    this.ensureIconObserver();
+    this.observeIconElements(items);
+  }
+
+  private ensureIconObserver(): void {
+    if (typeof IntersectionObserver === 'undefined') return;
+    if (this.iconObserver) return;
+    // Viewport root so overflow:auto clipping (Finder pane / column panes) is
+    // applied. A flex child as root often never reports intersections.
+    this.iconObserver = new IntersectionObserver((entries) => this.onIconIntersect(entries), {
+      root: null,
+      threshold: 0,
+    });
+  }
+
+  private teardownIconObserver(): void {
+    this.iconObserver?.disconnect();
+    this.iconObserver = null;
+    this.iconIntersectingEls.clear();
+    this.iconQueue.reset();
+    this.iconPrefetchItems.clear();
+  }
+
+  private observeIconElements(items: ListItem[]): void {
+    const observer = this.iconObserver;
+    if (!observer) {
+      for (const it of items) {
+        if (it.placeholder || this.iconUrls.has(it.key)) continue;
+        this.iconQueue.enqueue(it);
+      }
+      return;
+    }
+    for (const it of items) {
+      if (it.placeholder || this.iconUrls.has(it.key)) continue;
+      for (const el of this.finderIconElements(it.key)) observer.observe(el);
+    }
+  }
+
+  private onIconIntersect(entries: IntersectionObserverEntry[]): void {
+    const changed = new Set<string>();
+    for (const entry of entries) {
+      const key = (entry.target as HTMLElement).getAttribute('data-id');
+      if (!key) continue;
+      if (entry.isIntersecting) {
+        this.iconIntersectingEls.add(entry.target);
+      } else {
+        this.iconIntersectingEls.delete(entry.target);
+      }
+      changed.add(key);
+    }
+    for (const key of changed) {
+      if (this.isFinderIconVisible(key)) {
+        const it = this.iconPrefetchItems.get(key);
+        if (!it || this.iconUrls.has(key)) continue;
+        this.iconQueue.enqueue(it);
+      } else {
+        this.iconQueue.hide(key);
+      }
+    }
+  }
+
+  private finderIconElements(key: string): Element[] {
+    return [...this.querySelectorAll(`.content [data-id="${key}"]`)];
+  }
+
+  private isFinderIconVisible(key: string): boolean {
+    if (!this.iconObserver) return true;
+    for (const el of this.iconIntersectingEls) {
+      if (el.getAttribute('data-id') === key) return true;
+    }
+    return false;
+  }
+
+  private async resolveVisibleIcon(it: ListItem): Promise<void> {
     const gen = this.iconLoadGen;
     const signal = this.iconAbort?.signal;
-    void (async () => {
+    if (it.placeholder || this.iconUrls.has(it.key)) return;
+    if (gen !== this.iconLoadGen || signal?.aborted) return;
+    if (!this.isFinderIconVisible(it.key)) return;
+    try {
       await iconCache.init();
-      let changed = false;
-      await Promise.all(
-        items.map(async (it) => {
-          if (it.placeholder || this.iconUrls.has(it.key)) return;
-          if (gen !== this.iconLoadGen || signal?.aborted) return;
-          try {
-            let urls: IconUrls;
-            if (it.node) {
-              urls = await this.iconLookup(it.node);
-            } else if (it.isDir) {
-              return;
-            } else {
-              const fi = it.finderInfo ?? new Uint8Array(32);
-              const { type, creator } = readTypeCreator(fi);
-              urls = await iconCache.getForTypeCreator(type, creator);
-            }
-            if (gen !== this.iconLoadGen || signal?.aborted) return;
-            if (it.isDir && isDefaultFolderIcon(urls)) return;
-            this.iconUrls.set(it.key, urls);
-            changed = true;
-            this.patchIconInDom(it.key, urls);
-          } catch (err) {
-            if (isAbortError(err)) return;
-            /* keep placeholder */
-          }
-        }),
-      );
-      if (changed && gen === this.iconLoadGen) {
-        /* patches already applied */
+      if (gen !== this.iconLoadGen || signal?.aborted) return;
+      if (!this.isFinderIconVisible(it.key)) return;
+      let urls: IconUrls;
+      if (it.node) {
+        urls = await this.iconLookup(it.node);
+      } else if (it.isDir) {
+        return;
+      } else {
+        const fi = it.finderInfo ?? new Uint8Array(32);
+        const { type, creator } = readTypeCreator(fi);
+        urls = await iconCache.getForTypeCreator(type, creator);
       }
-    })();
+      if (gen !== this.iconLoadGen || signal?.aborted) return;
+      if (it.isDir && isDefaultFolderIcon(urls)) return;
+      this.iconUrls.set(it.key, urls);
+      this.patchIconInDom(it.key, urls);
+      this.iconObserver && this.finderIconElements(it.key).forEach((el) => this.iconObserver?.unobserve(el));
+    } catch (err) {
+      if (isAbortError(err)) return;
+    }
   }
 
   private patchIconInDom(key: string, urls: IconUrls): void {
     const id = Number(key);
     if (Number.isFinite(id) && this.isFolderEnumerating(id)) return;
-    const nodes = this.querySelectorAll(`[data-id="${key}"], [data-path-id="${key}"]`);
+    const nodes = [
+      ...this.querySelectorAll(`[data-id="${key}"], [data-path-id="${key}"]`),
+      ...(this.getInfoWindow?.querySelectorAll(`[data-id="${key}"]`) ?? []),
+    ];
     for (const el of nodes) {
       const large = el.querySelector('.icon-glyph, .icon-glyph-img, .icon-glyph-svg');
       if (large) {
@@ -1951,10 +2094,6 @@ export class FinderWindow extends HTMLElement {
           : node.isDir
             ? this.folderGlyphHtml('large', 'preview')
             : `<div class="preview-glyph ${glyphClass}"></div>`;
-    const closeBtn =
-      opts.variant === 'dialog'
-        ? `<button type="button" class="btn item-info-close" data-act="close-props">Close</button>`
-        : '';
     const shellClass =
       opts.variant === 'column'
         ? 'column column-preview item-info'
@@ -1974,12 +2113,8 @@ export class FinderWindow extends HTMLElement {
           ${expandBtn}
           <button type="button" class="btn primary" data-act="apply-props">Apply</button>
           <button type="button" class="btn" data-act="resources">Resources…</button>
-          ${closeBtn}
         </div>
       </div>`;
-    const folderActions = node.isDir && closeBtn
-      ? `<div class="preview-actions">${closeBtn}</div>`
-      : '';
     const colAttrs =
       opts.variant === 'column'
         ? ` style="${this.colWidthStyle('preview')}"`
@@ -2005,7 +2140,6 @@ export class FinderWindow extends HTMLElement {
         <div data-role="comment-slot">${this.commentRowHtml(node)}</div>
       </div>
       ${typeCreatorFields}
-      ${folderActions}
       ${paneClose}
       ${resizer}
     </div>`;
@@ -2121,6 +2255,12 @@ export class FinderWindow extends HTMLElement {
     this.querySelectorAll(`[data-preview][data-id="${id}"] [data-role="vers-slot"]`).forEach((el) => {
       el.innerHTML = markup;
     });
+    this.getInfoWindow
+      ?.querySelectorAll(`[data-preview][data-id="${id}"] [data-role="vers-slot"]`)
+      .forEach((el) => {
+        el.innerHTML = markup;
+      });
+    if (markup) this.getInfoWindow?.fitToContents();
   }
 
   private patchCommentInDom(id: number): void {
@@ -2131,6 +2271,12 @@ export class FinderWindow extends HTMLElement {
     this.querySelectorAll(`[data-preview][data-id="${id}"] [data-role="comment-slot"]`).forEach((el) => {
       el.innerHTML = markup;
     });
+    this.getInfoWindow
+      ?.querySelectorAll(`[data-preview][data-id="${id}"] [data-role="comment-slot"]`)
+      .forEach((el) => {
+        el.innerHTML = markup;
+      });
+    if (markup) this.getInfoWindow?.fitToContents();
   }
 
   /** Resolve icon for a single node and patch list + properties glyphs. */
@@ -2285,7 +2431,12 @@ export class FinderWindow extends HTMLElement {
   }
 
   private columnLoadingHtml(colIndex: number): string {
-    return this.columnHtml(colIndex, this.colItemHtml(this.listingPlaceholderItem(), colIndex, null), 'column--loading');
+    const parentId = this.pathStack[colIndex]?.id ?? this.enumeratingFolderId ?? this.cwd;
+    const items = this.mergeWritingItems(parentId, []);
+    const body = [...items, this.listingPlaceholderItem()]
+      .map((it) => this.colItemHtml(it, colIndex, null))
+      .join('');
+    return this.columnHtml(colIndex, body, 'column--loading');
   }
 
   private nextFolderLoad(id: number): number {
@@ -3241,7 +3392,7 @@ export class FinderWindow extends HTMLElement {
         finderInfo: folder.finderInfo,
       });
     }
-    this.prefetchIcons(items);
+    this.prefetchIcons(items, 'add');
   }
 
   /** Navigate into a folder in icon view; park drag source so the gesture survives. */
@@ -3437,33 +3588,35 @@ export class FinderWindow extends HTMLElement {
     await this.withOwnVfsMutation(async () => {
       dest.beginBatch();
       try {
-        throwIfAborted(signal);
-        if (plan.replaceId != null) await dest.remove(plan.replaceId);
-        const creditRead = !!src.reportsChunkedBytes && !dest.reportsChunkedBytes;
-        const creditWrite = !!dest.reportsChunkedBytes || !creditRead;
-        const snap = await this.snapshotNode(
-          src,
-          node,
-          creditRead ? (n) => {
-            throwIfAborted(signal);
-            transferActivity.addBytes(jobId, n);
-          } : undefined,
-          signal,
-        );
-        throwIfAborted(signal);
-        transferActivity.setTotal(jobId, clipByteSize(snap));
-        await this.writeClipNode(
-          dest,
-          destParent,
-          snap,
-          creditWrite ? (n) => {
-            throwIfAborted(signal);
-            transferActivity.addBytes(jobId, n);
-          } : undefined,
-          plan.destName,
-          jobId,
-        );
-        throwIfAborted(signal);
+        await transferActivity.withCopySlot(jobId, async () => {
+          throwIfAborted(signal);
+          if (plan.replaceId != null) await dest.remove(plan.replaceId);
+          const creditRead = !!src.reportsChunkedBytes && !dest.reportsChunkedBytes;
+          const creditWrite = !!dest.reportsChunkedBytes || !creditRead;
+          const snap = await this.snapshotNode(
+            src,
+            node,
+            creditRead ? (n) => {
+              throwIfAborted(signal);
+              transferActivity.addBytes(jobId, n);
+            } : undefined,
+            signal,
+          );
+          throwIfAborted(signal);
+          transferActivity.setTotal(jobId, clipByteSize(snap));
+          await this.writeClipNode(
+            dest,
+            destParent,
+            snap,
+            creditWrite ? (n) => {
+              throwIfAborted(signal);
+              transferActivity.addBytes(jobId, n);
+            } : undefined,
+            plan.destName,
+            jobId,
+          );
+          throwIfAborted(signal);
+        });
         await transferActivity.settle(jobId);
       } catch (err) {
         await transferActivity.settle(jobId, err);
@@ -3524,14 +3677,22 @@ export class FinderWindow extends HTMLElement {
 
       if (internalId != null) {
         if (!srcCat) return;
+        const srcNode =
+          (this.dragCatalog === srcCat ? this.dragNode : null) ?? (await srcCat.get(internalId));
+        const srcParent = srcNode?.parentId;
         if (srcCat === destCat) {
           await this.moveNodeTo(internalId, destParent, destCat);
           this.setStatus('Moved 1 item');
+          await this.refreshIfDestVisible(
+            destCat,
+            destParent,
+            ...(srcParent != null ? [srcParent] : []),
+          );
         } else {
           await this.copyNodeAcross(srcCat, internalId, destCat, destParent);
           this.setStatus(`Copied 1 item to ${destInfo.label}`);
+          await this.refreshIfDestVisible(destCat, destParent);
         }
-        if (this.vfs === destCat) await this.refreshAfterMutation();
         return;
       }
 
@@ -3570,10 +3731,7 @@ export class FinderWindow extends HTMLElement {
         return;
       }
       this.setStatus(`Imported ${count} item(s) into ${destInfo.label}`);
-      if (this.vfs === destCat && this.view === 'list' && destParent !== this.cwd && !this.expandedIds.has(destParent)) {
-        this.expandedIds.add(destParent);
-      }
-      if (this.vfs !== destCat) return;
+      if (this.vfs !== destCat || !this.changeImpactsVisibleFolders([destParent])) return;
       iconCache.clearDirectoryCache();
       this.iconUrls.clear();
       this.bumpIconLoadGen();
@@ -3581,7 +3739,8 @@ export class FinderWindow extends HTMLElement {
     } catch (err) {
       if (isTransferCancelled(err)) {
         this.setStatus('Transfer cancelled');
-        await this.refreshAfterMutation();
+        const cat = destInfo.catalog;
+        if (cat) await this.refreshIfDestVisible(cat, destInfo.parentId || cat.rootId());
         return;
       }
       console.error(err);
@@ -3672,9 +3831,14 @@ export class FinderWindow extends HTMLElement {
   private async applyProps(): Promise<void> {
     const sel = this.selectedNode();
     if (!sel || sel.isDir) return;
-    const type = (this.querySelector('[data-prop="type"]') as HTMLInputElement)?.value.padEnd(4).slice(0, 4) ?? '????';
-    const creator =
-      (this.querySelector('[data-prop="creator"]') as HTMLInputElement)?.value.padEnd(4).slice(0, 4) ?? '????';
+    const typeEl =
+      (this.getInfoWindow?.querySelector('[data-prop="type"]') as HTMLInputElement | null) ??
+      (this.querySelector('[data-prop="type"]') as HTMLInputElement | null);
+    const creatorEl =
+      (this.getInfoWindow?.querySelector('[data-prop="creator"]') as HTMLInputElement | null) ??
+      (this.querySelector('[data-prop="creator"]') as HTMLInputElement | null);
+    const type = typeEl?.value.padEnd(4).slice(0, 4) ?? '????';
+    const creator = creatorEl?.value.padEnd(4).slice(0, 4) ?? '????';
     for (let i = 0; i < 4; i++) {
       sel.finderInfo[i] = type.charCodeAt(i);
       sel.finderInfo[4 + i] = creator.charCodeAt(i);
@@ -3966,8 +4130,7 @@ export class FinderWindow extends HTMLElement {
 
   private isPreviewable(node: VNode | null | undefined): node is VNode {
     if (!node || node.isDir) return false;
-    if (PREVIEW_TEXT_TYPES.has(readTypeCreator(node.finderInfo).type)) return true;
-    return filenameExtension(node.name) === 'ttro';
+    return previewKindFor(node) != null;
   }
 
   private isExpandableArchive(node: VNode | null | undefined): node is VNode {
@@ -4070,31 +4233,76 @@ export class FinderWindow extends HTMLElement {
     if (id == null) return;
     const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
     if (!this.isPreviewable(node)) return;
+    const kind = previewKindFor(node)!;
     const gen = ++this.previewGen;
-    this.preview = { id: node.id, name: node.name, text: null };
+    this.revokePreviewUrl();
+    this.preview = { id: node.id, name: node.name, kind, text: null };
     this.renderPreview();
     try {
       const full = (await this.vfs.ensureContent(node.id)) ?? node;
       if (gen !== this.previewGen) return;
       if (!full.data.length) {
-        this.preview = { id: full.id, name: full.name, text: '' };
+        this.preview = { id: full.id, name: full.name, kind, text: '' };
         this.renderPreview();
         return;
       }
-      const truncated = full.data.length > PREVIEW_MAX_BYTES;
-      const slice = truncated ? full.data.subarray(0, PREVIEW_MAX_BYTES) : full.data;
-      this.preview = {
-        id: full.id,
-        name: full.name,
-        text: decodePreviewText(slice),
-        truncated,
-      };
+      if (kind === 'text') {
+        const truncated = full.data.length > PREVIEW_TEXT_MAX_BYTES;
+        const slice = truncated ? full.data.subarray(0, PREVIEW_TEXT_MAX_BYTES) : full.data;
+        this.preview = {
+          id: full.id,
+          name: full.name,
+          kind,
+          text: decodePreviewText(slice),
+          truncated,
+        };
+        this.renderPreview();
+        return;
+      }
+      if (kind === 'pict') {
+        const picture = decodePict(full.data);
+        const svg = picture ? await pictToSvg(picture) : null;
+        if (gen !== this.previewGen) return;
+        if (!svg) {
+          this.preview = {
+            id: full.id,
+            name: full.name,
+            kind,
+            text: '',
+            error: 'Could not decode this PICT (bitmap and QuickDraw opcodes only).',
+          };
+          this.renderPreview();
+          return;
+        }
+        const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+        if (gen !== this.previewGen) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        this.preview = { id: full.id, name: full.name, kind, text: 'ok', url };
+        this.renderPreview();
+        return;
+      }
+      const type = readTypeCreator(full.finderInfo).type;
+      const mime = previewMime(kind, full.name, type);
+      const copy = full.data.slice();
+      const url = URL.createObjectURL(
+        new Blob([copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength) as ArrayBuffer], {
+          type: mime,
+        }),
+      );
+      if (gen !== this.previewGen) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+      this.preview = { id: full.id, name: full.name, kind, text: 'ok', url };
       this.renderPreview();
     } catch (err) {
       if (gen !== this.previewGen) return;
       this.preview = {
         id: node.id,
         name: node.name,
+        kind,
         text: null,
         error: err instanceof Error ? err.message : String(err),
       };
@@ -4102,9 +4310,14 @@ export class FinderWindow extends HTMLElement {
     }
   }
 
+  private revokePreviewUrl(): void {
+    if (this.preview?.url?.startsWith('blob:')) URL.revokeObjectURL(this.preview.url);
+  }
+
   private closePreview(): void {
     if (!this.preview) return;
     this.previewGen++;
+    this.revokePreviewUrl();
     this.preview = null;
     this.renderPreview();
   }
@@ -4118,15 +4331,25 @@ export class FinderWindow extends HTMLElement {
       return;
     }
     let body: string;
+    let bodyClass = 'quicklook__body';
     if (preview.error) {
       body = `<p class="quicklook__empty">${this.escape(preview.error)}</p>`;
     } else if (preview.text == null) {
       body = `<div class="quicklook__loading">${this.spinnerHtml()}<span>Loading</span></div>`;
+    } else if (preview.kind === 'image' && preview.url) {
+      bodyClass += ' quicklook__body--media';
+      body = `<img class="quicklook__image" alt="${this.escape(preview.name)}" src="${this.escape(preview.url)}" />`;
+    } else if (preview.kind === 'audio' && preview.url) {
+      bodyClass += ' quicklook__body--media';
+      body = `<audio class="quicklook__audio" controls src="${this.escape(preview.url)}"></audio>`;
+    } else if (preview.kind === 'pict' && preview.url) {
+      bodyClass += ' quicklook__body--media';
+      body = `<img class="quicklook__image" alt="${this.escape(preview.name)}" src="${this.escape(preview.url)}" />`;
     } else if (!preview.text) {
       body = `<p class="quicklook__empty">This file is empty</p>`;
     } else {
       const note = preview.truncated
-        ? `<p class="quicklook__note">Showing the first ${formatBytes(PREVIEW_MAX_BYTES)}</p>`
+        ? `<p class="quicklook__note">Showing the first ${formatBytes(PREVIEW_TEXT_MAX_BYTES)}</p>`
         : '';
       body = `${note}<pre class="quicklook__text">${this.escape(preview.text)}</pre>`;
     }
@@ -4138,7 +4361,7 @@ export class FinderWindow extends HTMLElement {
             <h2 id="quicklook-title" aria-label="${this.escape(preview.name)}">${this.escape(preview.name)}</h2>
             <button type="button" class="btn" data-act="close-preview" aria-label="Close">✕</button>
           </header>
-          <div class="quicklook__body">${body}          </div>
+          <div class="${bodyClass}">${body}          </div>
         </div>
       </div>
     `;
@@ -4170,16 +4393,18 @@ export class FinderWindow extends HTMLElement {
     const jobId = this.startTransfer(node.name, node.isDir, nodeByteSize(node), node.finderInfo);
     const signal = transferActivity.signal(jobId);
     try {
-      const item = await this.snapshotNode(
-        this.vfs,
-        node,
-        this.vfs.reportsChunkedBytes
-          ? (n) => {
-              throwIfAborted(signal);
-              transferActivity.addBytes(jobId, n);
-            }
-          : undefined,
-        signal,
+      const item = await transferActivity.withCopySlot(jobId, () =>
+        this.snapshotNode(
+          this.vfs,
+          node,
+          this.vfs.reportsChunkedBytes
+            ? (n) => {
+                throwIfAborted(signal);
+                transferActivity.addBytes(jobId, n);
+              }
+            : undefined,
+          signal,
+        ),
       );
       await transferActivity.settle(jobId);
       this.clipboard = {
@@ -4284,22 +4509,24 @@ export class FinderWindow extends HTMLElement {
     const signal = transferActivity.signal(jobId);
     try {
       let listed = node.isDir ? 0 : nodeByteSize(node);
-      const entries = await collectFsZipEntries(
-        this.vfs,
-        node,
-        '',
-        (n) => {
-          throwIfAborted(signal);
-          transferActivity.addBytes(jobId, n);
-        },
-        node.isDir
-          ? (n) => {
-              listed += n;
-              transferActivity.setTotal(jobId, listed);
-            }
-          : undefined,
-        loadPrefs().zipExportStyle,
-        signal,
+      const entries = await transferActivity.withCopySlot(jobId, () =>
+        collectFsZipEntries(
+          this.vfs,
+          node,
+          '',
+          (n) => {
+            throwIfAborted(signal);
+            transferActivity.addBytes(jobId, n);
+          },
+          node.isDir
+            ? (n) => {
+                listed += n;
+                transferActivity.setTotal(jobId, listed);
+              }
+            : undefined,
+          loadPrefs().zipExportStyle,
+          signal,
+        ),
       );
       throwIfAborted(signal);
       downloadZipEntries(zipName, entries);
@@ -4410,7 +4637,8 @@ export class FinderWindow extends HTMLElement {
 
   private syncWriteOverlays(): void {
     const sig = this.writingSignature();
-    if (sig !== this.writeSig) {
+    const missingOverlay = !!sig && !this.querySelector('[data-write-job]');
+    if (sig !== this.writeSig || missingOverlay) {
       const had = this.writeSig;
       this.writeSig = sig;
       // Keep dest icons until the catalog refresh remounts; don't flash an empty folder.
@@ -4771,6 +4999,7 @@ export class FinderWindow extends HTMLElement {
     if (!this.clipboard?.items.length) return;
     const clip = this.clipboard;
     this.setStatus('Pasting…', { busy: true });
+    const srcParents: number[] = [];
     try {
       const sameShare = clip.source === this.vfs;
       const reserved = new Set<string>();
@@ -4783,6 +5012,7 @@ export class FinderWindow extends HTMLElement {
             this.setStatus('Can’t move an item into itself');
             return;
           }
+          srcParents.push(src.parentId);
           const plan = await this.planPlacement(this.vfs, destParent, src.name, src.isDir, id, reserved);
           moves.push({ id, name: src.name, plan });
         }
@@ -4810,18 +5040,20 @@ export class FinderWindow extends HTMLElement {
               transferActivity.setDest(jobId, this.vfs, destParent, plan.destName);
               const signal = transferActivity.signal(jobId);
               try {
-                await this.writeClipNode(
-                  this.vfs,
-                  destParent,
-                  item,
-                  (n) => {
-                    throwIfAborted(signal);
-                    transferActivity.addBytes(jobId, n);
-                  },
-                  plan.destName,
-                  jobId,
-                );
-                throwIfAborted(signal);
+                await transferActivity.withCopySlot(jobId, async () => {
+                  await this.writeClipNode(
+                    this.vfs,
+                    destParent,
+                    item,
+                    (n) => {
+                      throwIfAborted(signal);
+                      transferActivity.addBytes(jobId, n);
+                    },
+                    plan.destName,
+                    jobId,
+                  );
+                  throwIfAborted(signal);
+                });
                 await transferActivity.settle(jobId);
               } catch (err) {
                 await transferActivity.settle(jobId, err);
@@ -4841,13 +5073,12 @@ export class FinderWindow extends HTMLElement {
       }
       if (clip.mode === 'cut') this.clipboard = null;
       this.syncClipboardButtons();
-      await this.reload();
-      this.renderContent();
+      await this.refreshIfDestVisible(this.vfs, destParent, ...srcParents);
       this.setStatus('Paste complete');
     } catch (err) {
       if (isTransferCancelled(err)) {
         this.setStatus('Transfer cancelled');
-        await this.refreshAfterMutation();
+        await this.refreshIfDestVisible(this.vfs, destParent, ...srcParents);
         return;
       }
       this.setStatus(`Paste failed: ${(err as Error).message}`);
@@ -4868,13 +5099,14 @@ export class FinderWindow extends HTMLElement {
     const name = clash ? await uniqueCopyName(fs, parentId, destName) : destName;
     if (item.isDir) {
       const dir = await fs.mkdir(parentId, name);
+      if (jobId) transferActivity.addDest(jobId, fs, parentId, name, 'folder');
       for (const kid of item.kids ?? []) {
         throwIfAborted(signal);
         await this.writeClipNode(fs, dir.id, kid, onBytes, kid.name, jobId);
       }
       return;
     }
-    if (jobId) transferActivity.watchPartial(jobId, fs, parentId, name);
+    if (jobId) transferActivity.setWriteFile(jobId, fs, parentId, name);
     try {
       await fs.createFile(
         parentId,

@@ -10,6 +10,7 @@ import { finderInfoFromName } from './extension-map';
 import { throwIfAborted } from '../util/abort';
 import { bufferRangeReader, type ByteRangeReader } from './byte-range';
 import { loadFinderIconFork, ResourceFork, type ResourceForkLoadOpts } from './resource-fork';
+import { iconForkLoadOptions } from './icon-cache';
 
 export type VfsChange = { parentIds: number[] };
 export type VfsChangeListener = (change: VfsChange) => void;
@@ -63,7 +64,7 @@ export interface Catalog {
   withRangeReader<T>(
     node: VNode,
     fn: (read: ByteRangeReader) => Promise<T>,
-    opts?: { resource?: boolean; signal?: AbortSignal },
+    opts?: { resource?: boolean; signal?: AbortSignal; priority?: number },
   ): Promise<T>;
   mkdir(parentId: number, name: string): Promise<VNode>;
   ensureDir(parentId: number, name: string): Promise<VNode>;
@@ -456,10 +457,12 @@ export class VirtualFS implements Catalog {
     const rf = await this.withRangeReader(
       node,
       (read) =>
-        opts?.finderIcons ? loadFinderIconFork(read) : ResourceFork.fromReader(read, opts?.want),
+        opts?.finderIcons
+          ? loadFinderIconFork(read, iconForkLoadOptions(node))
+          : ResourceFork.fromReader(read, opts?.want),
       rangeOpts,
     );
-    rf?.bindFill((fn) => this.withRangeReader(node, fn, rangeOpts));
+    rf?.bindFill((fn) => this.withRangeReader(node, fn, rangeOpts), true);
     return rf;
   }
 

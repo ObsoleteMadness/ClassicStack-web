@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,7 @@ import {
   shouldProbeNamedResourceFork,
 } from './import-transfer';
 import { makeFinderInfo } from './mac-file';
+import { iconCache } from './icon-cache';
 import type { Catalog, VNode } from './virtual-fs';
 
 function ascii(s: string): Uint8Array {
@@ -89,6 +90,29 @@ describe('importExpandedTree', () => {
     expect(stamped.modDate).toBe(hfsTimeToAfp(0xb3d2b000));
     expect(fromMacTime(stamped.createDate).getUTCFullYear()).toBe(1999);
     expect(fromMacTime(stamped.modDate).getUTCFullYear()).toBe(1999);
+  });
+
+  it('caches icons from the extracted resource fork', async () => {
+    const { fs } = mockCatalog();
+    const spy = vi.spyOn(iconCache, 'ingestExtracted').mockResolvedValue();
+    const finderInfo = makeFinderInfo('APPL', 'CARO', 0x0400);
+    await importExpandedTree(fs, 2, [
+      {
+        kind: 'file',
+        name: 'App',
+        data: Uint8Array.of(1, 2, 3),
+        resource: Uint8Array.of(0xca, 0xfe),
+        finderInfo,
+      },
+    ]);
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'App',
+        resource: expect.any(Uint8Array),
+        finderInfo,
+      }),
+    );
+    spy.mockRestore();
   });
 
   it('applies folder Finder flags after ensureDir', async () => {

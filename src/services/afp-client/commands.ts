@@ -394,13 +394,27 @@ export function deletePath(volId: number, dirId: number, path: string): Uint8Arr
   return new Uint8Array(out);
 }
 
+/** PathType + zero-length Pascal string (“no pathname supplied”). */
+function putNullPath(out: number[]): void {
+  out.push(C.PathTypeLongNames, 0);
+}
+
+/**
+ * CNode name (FPRename NewName / FPMoveAndRename NewName): PathType + Pascal
+ * MacRoman, not a wire pathname. A leading NUL here is ParamErr on AppleShare.
+ */
+function putCNodeName(out: number[], name: string): void {
+  out.push(C.PathTypeLongNames);
+  putPString(out, name);
+}
+
 export function rename(volId: number, dirId: number, path: string, newName: string): Uint8Array {
   const out: number[] = [C.CmdRename, 0];
   appendBe16(out, volId);
   appendBe32(out, dirId);
   putPath(out, path);
   even(out);
-  putPath(out, newName);
+  putCNodeName(out, newName);
   return new Uint8Array(out);
 }
 
@@ -417,9 +431,11 @@ export function moveAndRename(
   appendBe32(out, dstDir);
   putPath(out, srcPath);
   even(out);
-  putPath(out, ''); // dest path empty = dest dir
+  putNullPath(out);
   even(out);
-  putPath(out, newName);
+  // Null NewName keeps the original name (Inside Macintosh AFP).
+  if (!newName || newName === srcPath) putNullPath(out);
+  else putCNodeName(out, newName);
   return new Uint8Array(out);
 }
 
@@ -438,6 +454,11 @@ export function openFork(
   appendBe16(out, access);
   putPath(out, path);
   return new Uint8Array(out);
+}
+
+export function parseOpenForkRequest(b: Uint8Array): { path: string; resource: boolean } | null {
+  if ((b[0] ?? 0) !== C.CmdOpenFork || b.length < 14) return null;
+  return { resource: (b[1]! & 0x80) !== 0, path: cmdPathAt(b, 12) };
 }
 
 export function parseOpenFork(b: Uint8Array): { forkRef: number; forkLen: number } {

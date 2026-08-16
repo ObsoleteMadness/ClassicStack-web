@@ -8,6 +8,7 @@ import type { NetbootDialog } from './netboot-dialog';
 import type { AfpSessionsDialog } from './afp-sessions-dialog';
 import type { ExtensionEditorDialog } from './extension-editor-dialog';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
+import type { GetInfoWindow } from './get-info-window';
 import type { FinderWindow } from './finder-window';
 import type { AboutDialog } from './about-dialog';
 import type { AlertDialog } from './alert-dialog';
@@ -25,6 +26,7 @@ export interface AdvancedMenuHost {
   afpSessions: AfpSessionsDialog;
   extensionEditor: ExtensionEditorDialog;
   resourceExplorer: ResourceForkExplorer;
+  getInfoWindow: GetInfoWindow;
   about: AboutDialog;
   alertDialog?: AlertDialog;
   finder?: FinderWindow;
@@ -354,6 +356,7 @@ export class AppMenuBar extends HTMLElement {
     persistWindow('log', host.logPanel);
     persistWindow('activity', host.activityWindow);
     persistWindow('resource', host.resourceExplorer);
+    persistWindow('info', host.getInfoWindow);
   }
 
   private exportPreferences(): void {

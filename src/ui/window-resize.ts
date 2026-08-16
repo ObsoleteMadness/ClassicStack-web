@@ -18,7 +18,8 @@ let floatZ = 60;
 const FLOAT_Z_MAX = 69;
 const geometryListeners = new WeakMap<HTMLElement, () => void>();
 
-function raiseFloatingWindow(el: HTMLElement): void {
+/** Bring a floating window above siblings. Finder uses `raise: false` and stays at z-index 20. */
+export function raiseFloatingWindow(el: HTMLElement): void {
   floatZ = Math.min(floatZ + 1, FLOAT_Z_MAX);
   el.style.zIndex = String(floatZ);
 }
@@ -93,6 +94,7 @@ export function enableWindowResize(el: HTMLElement, opts: ResizeOpts = {}): void
     e.preventDefault();
     e.stopPropagation();
     const r = el.getBoundingClientRect();
+    el.dataset.userSized = '1';
     resize = { el, w: r.width, h: r.height, x: e.clientX, y: e.clientY };
     t.setPointerCapture?.(e.pointerId);
   });

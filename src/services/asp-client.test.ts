@@ -7,6 +7,7 @@ import {
   unpackUserData,
   SPFuncOpenSess,
   SPFuncCommand,
+  SPFuncTickle,
 } from '../protocol/asp';
 
 class FakeAtp {
@@ -14,6 +15,8 @@ class FakeAtp {
   maxInflight = 0;
   seqs: number[] = [];
   srcSockets: number[] = [];
+  destSockets: number[] = [];
+  funcs: number[] = [];
   openSess: { wss: number; src: number } | null = null;
   wssHandler: ((req: AtpInboundTReq) => void | Promise<void>) | null = null;
   wssSocket = 0;
@@ -23,7 +26,9 @@ class FakeAtp {
     this.inflight++;
     this.maxInflight = Math.max(this.maxInflight, this.inflight);
     this.srcSockets.push(req.srcSocket);
+    this.destSockets.push(req.destSocket);
     const parsed = unpackUserData(req.userData);
+    this.funcs.push(parsed.spFunc);
     if (parsed.spFunc === SPFuncOpenSess) {
       this.openSess = { wss: parsed.b1, src: req.srcSocket };
     }
@@ -106,6 +111,19 @@ describe('ASP sockets vs ClassicStack client/asp', () => {
     const cmdSrc = atp.srcSockets[atp.srcSockets.length - 1];
     expect(cmdSrc).toBe(atp.openSess!.src);
     expect(cmdSrc).not.toBe(atp.openSess!.wss);
+    expect(atp.destSockets[atp.destSockets.length - 1]).toBe(249);
+  });
+
+  it('sends workstation tickles to the SLS, not the SSS', async () => {
+    const atp = new FakeAtp();
+    const sess = new AspSession(atp as unknown as AtpClient, 0, 1, 251);
+    await sess.open();
+    await sess.command(new Uint8Array([9]));
+    const tickleAt = atp.funcs.indexOf(SPFuncTickle);
+    expect(tickleAt).toBeGreaterThanOrEqual(0);
+    expect(atp.destSockets[tickleAt]).toBe(251);
+    expect(atp.destSockets[atp.funcs.indexOf(SPFuncCommand)]).toBe(249);
+    await sess.close();
   });
 });
 

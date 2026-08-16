@@ -53,4 +53,46 @@ describe('AsyncSemaphore', () => {
     });
     expect(started).toBe(2);
   });
+
+  it('reports busy when a task is running or queued', async () => {
+    const sem = new AsyncSemaphore(1);
+    expect(sem.busy).toBe(false);
+    let release!: () => void;
+    const held = sem.run(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await Promise.resolve();
+    expect(sem.busy).toBe(true);
+    const queued = sem.run(async () => undefined);
+    expect(sem.busy).toBe(true);
+    release();
+    await Promise.all([held, queued]);
+    expect(sem.busy).toBe(false);
+  });
+
+  it('runs a higher-priority waiter before earlier low-priority ones', async () => {
+    const sem = new AsyncSemaphore(1);
+    const order: string[] = [];
+    let release!: () => void;
+    const held = sem.run(
+      () =>
+        new Promise<void>((resolve) => {
+          order.push('hold');
+          release = resolve;
+        }),
+    );
+    const low = sem.run(async () => {
+      order.push('low');
+    }, undefined, 0);
+    const high = sem.run(async () => {
+      order.push('high');
+    }, undefined, 1);
+    await Promise.resolve();
+    release();
+    await Promise.all([held, low, high]);
+    expect(order).toEqual(['hold', 'high', 'low']);
+  });
 });

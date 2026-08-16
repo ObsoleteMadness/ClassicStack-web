@@ -27,6 +27,15 @@ function afpResultName(result: number): string {
   return String(s);
 }
 
+interface OpenFork {
+  nodeId: number;
+  resource: boolean;
+  offset: number;
+  name: string;
+  /** Fork bytes at open (and after our writes); avoids reloading the node on every FPRead. */
+  bytes: Uint8Array;
+}
+
 interface Session {
   id: number;
   wss: number;
@@ -36,7 +45,7 @@ interface Session {
   loggedIn: boolean;
   userName: string;
   volId: number;
-  forks: Map<number, { nodeId: number; resource: boolean; offset: number; name: string }>;
+  forks: Map<number, OpenFork>;
   nextFork: number;
   dtRef: number;
   atp: AtpServer;
@@ -247,6 +256,12 @@ export class AfpServer {
 
   private async onSls(req: AtpIncoming): Promise<void> {
     const { spFunc, b1, word } = asp.unpackUserData(req.header.userData);
+    if (spFunc === asp.SPFuncTickle) {
+      const sess = this.sessionTable.get(b1);
+      if (sess && !sess.closed) sess.lastRx = Date.now();
+      await req.reply(0, new Uint8Array());
+      return;
+    }
     if (spFunc === asp.SPFuncGetStatus) {
       await req.reply(0, this.serverInfoBlock());
       return;
@@ -417,7 +432,7 @@ export class AfpServer {
 
   private async dispatch(sess: Session, block: Uint8Array, isWrite: boolean): Promise<[Uint8Array, number]> {
     const cmd = block[0]!;
-    const detail = this.traceDetail(cmd, block);
+    const detail = this.traceDetail(sess, cmd, block);
     try {
       let reply: [Uint8Array, number];
       switch (cmd) {
@@ -534,7 +549,13 @@ export class AfpServer {
     }
   }
 
-  private traceDetail(cmd: number, block: Uint8Array): string {
+  private forkFile(sess: Session, ref: number): string {
+    const fork = sess.forks.get(ref);
+    if (!fork) return '';
+    return ` “${fork.name}”${fork.resource ? ' rsrc' : ' data'}`;
+  }
+
+  private traceDetail(sess: Session, cmd: number, block: Uint8Array): string {
     try {
       if (cmd === C.CmdOpenVol && block.length >= 5) {
         const nameLen = block[4]!;
@@ -547,8 +568,17 @@ export class AfpServer {
       if (cmd === C.CmdOpenFork && block.length >= 13) {
         return ` did=${be32(block, 4)} name=${JSON.stringify(this.readPathName(block, 12))} bm=0x${be16(block, 8).toString(16)}`;
       }
+      if (cmd === C.CmdRead && block.length >= 12) {
+        const ref = be16(block, 2);
+        return ` ref=${ref} off=${be32(block, 4)} count=${be32(block, 8)}${this.forkFile(sess, ref)}`;
+      }
       if (cmd === C.CmdWrite && block.length >= 12) {
-        return ` ref=${be16(block, 2)} off=${be32(block, 4)} count=${be32(block, 8)} data=${Math.max(0, block.length - 12)}b`;
+        const ref = be16(block, 2);
+        return ` ref=${ref} off=${be32(block, 4)} count=${be32(block, 8)} data=${Math.max(0, block.length - 12)}b${this.forkFile(sess, ref)}`;
+      }
+      if (cmd === C.CmdCloseFork && block.length >= 4) {
+        const ref = be16(block, 2);
+        return ` ref=${ref}${this.forkFile(sess, ref)}`;
       }
       if (cmd === C.CmdGetFileDirParms && block.length >= 12) {
         return ` vol=${be16(block, 2)} did=${be32(block, 4)} fbm=0x${be16(block, 8).toString(16)} dbm=0x${be16(block, 10).toString(16)}`;
@@ -820,11 +850,13 @@ export class AfpServer {
     }
     const ref = sess.nextFork++ & 0xffff;
     if (ref === 0) sess.nextFork = 1;
+    const resource = (forkFlag & C.ForkFlagResource) !== 0;
     sess.forks.set(ref, {
       nodeId: n.id,
-      resource: (forkFlag & C.ForkFlagResource) !== 0,
+      resource,
       offset: 0,
       name: n.name,
+      bytes: resource ? n.resource : n.data,
     });
     const params = this.packParms(n, bitmap, n.name);
     const out = new Uint8Array(4 + params.length);
@@ -840,9 +872,7 @@ export class AfpServer {
     const count = be32(block, 8);
     const fork = sess.forks.get(ref);
     if (!fork) return [new Uint8Array(), C.ErrParamErr];
-    const n = await this.fs.get(fork.nodeId);
-    if (!n) return [new Uint8Array(), C.ErrObjectNotFnd];
-    const src = fork.resource ? n.resource : n.data;
+    const src = fork.bytes;
     if (offset >= src.length) return [new Uint8Array(), C.ErrEOFErr];
     const want = Math.min(count, asp.QuantumSize);
     const end = Math.min(offset + want, src.length);
@@ -865,12 +895,13 @@ export class AfpServer {
     if (!n) return [new Uint8Array(), C.ErrObjectNotFnd];
     let data = block.length > 12 ? block.subarray(12) : new Uint8Array();
     if (data.length > reqCount) data = data.subarray(0, reqCount);
-    const cur = fork.resource ? n.resource : n.data;
+    const cur = fork.bytes;
     if (fromEnd) offset = cur.length + offset;
     const need = offset + data.length;
     const next = new Uint8Array(Math.max(cur.length, need));
     next.set(cur);
     next.set(data, offset);
+    fork.bytes = next;
     if (fork.resource) n.resource = next;
     else n.data = next;
     n.modDate = C.macTime();
@@ -900,9 +931,10 @@ export class AfpServer {
     const n = await this.fs.get(fork.nodeId);
     if (!n) return [new Uint8Array(), C.ErrObjectNotFnd];
     // Truncate the fork that was opened; bitmap only names which length field is set.
-    const cur = fork.resource ? n.resource : n.data;
+    const cur = fork.bytes;
     const next = new Uint8Array(forkLen);
     next.set(cur.subarray(0, Math.min(cur.length, forkLen)));
+    fork.bytes = next;
     if (fork.resource) n.resource = next;
     else n.data = next;
     n.modDate = C.macTime();

@@ -1,5 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ResourceFork, type ResourceEntry } from './resource-fork';
+
+vi.mock('./resource-types/icon-decoder', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('./resource-types/icon-decoder')>();
+  return {
+    ...mod,
+    decodedIconToDataUrl: async (icon: { typeCode: string; pixels: Uint8ClampedArray }) =>
+      `data:image/png,${icon.typeCode}-${icon.pixels[0]}`,
+  };
+});
 import {
   HAS_BUNDLE,
   HAS_CUSTOM_ICON,
@@ -30,6 +39,67 @@ function icn(): Uint8Array {
   data.fill(0xaa, 0, 128);
   data.fill(0xff, 128, 256);
   return data;
+}
+
+function fref(type: string, localId: number): Uint8Array {
+  const data = new Uint8Array(6);
+  for (let i = 0; i < 4; i++) data[i] = type.charCodeAt(i) ?? 0x20;
+  data[4] = (localId >> 8) & 0xff;
+  data[5] = localId & 0xff;
+  return data;
+}
+
+function bndlFrefAndIcn(pairs: { local: number; frefId: number; icnId: number }[]): Uint8Array {
+  const n = pairs.length;
+  const bndl = new Uint8Array(8 + 2 * (6 + n * 4));
+  bndl.set([0x41, 0x50, 0x50, 0x4c], 0);
+  bndl[5] = 128;
+  bndl[7] = 1;
+  let p = 8;
+  bndl.set([0x46, 0x52, 0x45, 0x46], p);
+  p += 4;
+  const nM1 = n - 1;
+  bndl[p++] = (nM1 >> 8) & 0xff;
+  bndl[p++] = nM1 & 0xff;
+  for (const row of pairs) {
+    bndl[p++] = (row.local >> 8) & 0xff;
+    bndl[p++] = row.local & 0xff;
+    bndl[p++] = (row.frefId >> 8) & 0xff;
+    bndl[p++] = row.frefId & 0xff;
+  }
+  bndl.set([0x49, 0x43, 0x4e, 0x23], p);
+  p += 4;
+  bndl[p++] = (nM1 >> 8) & 0xff;
+  bndl[p++] = nM1 & 0xff;
+  for (const row of pairs) {
+    bndl[p++] = (row.local >> 8) & 0xff;
+    bndl[p++] = row.local & 0xff;
+    bndl[p++] = (row.icnId >> 8) & 0xff;
+    bndl[p++] = row.icnId & 0xff;
+  }
+  return bndl;
+}
+
+function icnFill(fill: number): Uint8Array {
+  const data = new Uint8Array(256);
+  data.fill(fill, 0, 128);
+  data.fill(0xff, 128, 256);
+  return data;
+}
+
+function fileNode(id: number, name: string, type: string, creator: string, flags = 0): VNode {
+  return {
+    id,
+    parentId: 2,
+    name,
+    isDir: false,
+    data: new Uint8Array(),
+    resource: new Uint8Array(),
+    finderInfo: finder(type, creator, flags),
+    createDate: 0,
+    modDate: 0,
+    resourceBytes: type === 'APPL' ? 2048 : 0,
+  };
 }
 
 function finder(type: string, creator: string, flags = 0): Uint8Array {
@@ -345,5 +415,181 @@ describe('IconCache.getForNode', () => {
       },
     );
     expect(forks).toBe(1);
+    await cache.getForNode(
+      { ...base, id: 11, name: 'App copy', resourceBytes: 2048 },
+      undefined,
+      async () => {
+        forks += 1;
+        return rf;
+      },
+    );
+    expect(forks).toBe(1);
+  });
+
+  it('does not open a document resource fork just because it has resources', async () => {
+    const cache = new IconCache();
+    let forks = 0;
+    await cache.getForNode(
+      {
+        id: 3,
+        parentId: 2,
+        name: 'ReadMe',
+        isDir: false,
+        data: new Uint8Array(),
+        resource: new Uint8Array(),
+        finderInfo: finder('TEXT', 'ttxt'),
+        createDate: 0,
+        modDate: 0,
+        resourceBytes: 50_000,
+      },
+      undefined,
+      async () => {
+        forks += 1;
+        return null;
+      },
+    );
+    expect(forks).toBe(0);
+  });
+
+  it('does not GetIcon for ordinary documents', async () => {
+    const cache = new IconCache();
+    let desktopCalls = 0;
+    const urls = await cache.getForNode(
+      {
+        id: 3,
+        parentId: 2,
+        name: 'ReadMe',
+        isDir: false,
+        data: new Uint8Array(),
+        resource: new Uint8Array(),
+        finderInfo: finder('TEXT', 'ttxt'),
+        createDate: 0,
+        modDate: 0,
+      },
+      undefined,
+      async () => null,
+      {
+        loadDesktopIcons: async () => {
+          desktopCalls += 1;
+          return null;
+        },
+      },
+    );
+    expect(desktopCalls).toBe(0);
+    expect(urls.large).toMatch(/TEXT32\.png|FILE32\.png/);
+  });
+
+  it('reuses the system default and does not probe again after a miss', async () => {
+    const cache = new IconCache();
+    let forks = 0;
+    let desktopCalls = 0;
+    const base = {
+      parentId: 2,
+      isDir: false as const,
+      data: new Uint8Array(),
+      resource: new Uint8Array(),
+      finderInfo: finder('APPL', 'ttxt', HAS_BUNDLE),
+      createDate: 0,
+      modDate: 0,
+      resourceBytes: 100,
+    };
+    const first = await cache.getForNode(
+      { ...base, id: 9, name: 'App' },
+      undefined,
+      async () => {
+        forks += 1;
+        return null;
+      },
+      {
+        loadDesktopIcons: async () => {
+          desktopCalls += 1;
+          return null;
+        },
+      },
+    );
+    expect(first.large).toMatch(/APPL32\.png/);
+    const second = await cache.getForNode(
+      { ...base, id: 10, name: 'App copy' },
+      undefined,
+      async () => {
+        forks += 1;
+        return null;
+      },
+      {
+        loadDesktopIcons: async () => {
+          desktopCalls += 1;
+          return null;
+        },
+      },
+    );
+    expect(second).toEqual(first);
+    expect(forks).toBe(1);
+    expect(desktopCalls).toBe(1);
+  });
+
+  it('caches FREF document icons when an application bundle is read', async () => {
+    const cache = new IconCache();
+    const rf = ResourceFork.fromEntries([
+      entry(
+        'BNDL',
+        128,
+        bndlFrefAndIcn([
+          { local: 0, frefId: 128, icnId: 128 },
+          { local: 1, frefId: 129, icnId: 129 },
+        ]),
+      ),
+      entry('FREF', 128, fref('APPL', 0)),
+      entry('FREF', 129, fref('TEXT', 1)),
+      entry('ICN#', 128, icnFill(0xaa)),
+      entry('ICN#', 129, icnFill(0x33)),
+    ]);
+    const appUrls = await cache.getForNode(
+      fileNode(9, 'SimpleText', 'APPL', 'ttxt', HAS_BUNDLE),
+      undefined,
+      async () => rf,
+    );
+    let forks = 0;
+    const docUrls = await cache.getForNode(
+      fileNode(10, 'ReadMe', 'TEXT', 'ttxt'),
+      undefined,
+      async () => {
+        forks += 1;
+        return null;
+      },
+    );
+    expect(forks).toBe(0);
+    expect(docUrls.large.startsWith('data:')).toBe(true);
+    expect(docUrls.large).not.toMatch(/TEXT32\.png|FILE32\.png/);
+    expect(docUrls.large).not.toEqual(appUrls.large);
+  });
+
+  it('ingestExtracted caches an application fork without a later AFP open', async () => {
+    const cache = new IconCache();
+    const rf = ResourceFork.fromEntries([
+      entry(
+        'BNDL',
+        128,
+        bndlFrefAndIcn([{ local: 0, frefId: 128, icnId: 128 }]),
+      ),
+      entry('FREF', 128, fref('APPL', 0)),
+      entry('ICN#', 128, icnFill(0xaa)),
+    ]);
+    await cache.ingestExtracted({
+      name: 'SimpleText',
+      finderInfo: finder('APPL', 'ttxt', HAS_BUNDLE),
+      resource: new Uint8Array(),
+      fork: rf,
+    });
+    let forks = 0;
+    const urls = await cache.getForNode(
+      fileNode(9, 'SimpleText', 'APPL', 'ttxt', HAS_BUNDLE),
+      undefined,
+      async () => {
+        forks += 1;
+        return rf;
+      },
+    );
+    expect(forks).toBe(0);
+    expect(urls.large.startsWith('data:')).toBe(true);
   });
 });

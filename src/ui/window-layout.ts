@@ -2,7 +2,7 @@
 
 export const WINDOWS_STORAGE_KEY = 'classicstack.windows';
 
-export type WindowId = 'finder' | 'log' | 'activity' | 'resource';
+export type WindowId = 'finder' | 'log' | 'activity' | 'resource' | 'info';
 
 export interface WindowFrame {
   left: number;
@@ -11,6 +11,8 @@ export interface WindowFrame {
   height: number;
   maximized?: boolean;
   open?: boolean;
+  /** True after the user drags the resize handle; skip auto-fit to contents. */
+  userSized?: boolean;
 }
 
 export type WindowLayouts = Partial<Record<WindowId, WindowFrame>>;
@@ -21,7 +23,7 @@ export function parseWindowLayouts(raw: unknown): WindowLayouts {
   if (!raw || typeof raw !== 'object') return {};
   const src = raw as Record<string, unknown>;
   const out: WindowLayouts = {};
-  for (const id of ['finder', 'log', 'activity', 'resource'] as const) {
+  for (const id of ['finder', 'log', 'activity', 'resource', 'info'] as const) {
     const frame = parseFrame(src[id]);
     if (frame) out[id] = frame;
   }
@@ -41,6 +43,7 @@ export function parseFrame(raw: unknown): WindowFrame | null {
     height: o.height as number,
     maximized: o.maximized === true,
     open: o.open === true,
+    userSized: o.userSized === true,
   };
 }
 
@@ -83,6 +86,7 @@ export function saveWindowLayout(id: WindowId, patch: Partial<WindowFrame>): Win
     height: patch.height ?? prev?.height ?? 360,
     maximized: patch.maximized ?? prev?.maximized ?? false,
     open: patch.open ?? prev?.open ?? false,
+    userSized: patch.userSized ?? prev?.userSized ?? false,
   };
   all[id] = next;
   persistAll(all);
@@ -110,6 +114,7 @@ export function captureWindowFrame(el: HTMLElement): WindowFrame {
     height: Math.round(r.height),
     maximized: el.classList.contains('is-maximized'),
     open: !el.hidden,
+    userSized: el.dataset.userSized === '1',
   };
 }
 
@@ -120,6 +125,43 @@ export function applyWindowFrame(el: HTMLElement, frame: WindowFrame): void {
   el.style.width = `${clamped.width}px`;
   el.style.height = `${clamped.height}px`;
   el.classList.toggle('is-maximized', clamped.maximized === true);
+  if (frame.userSized) el.dataset.userSized = '1';
+  else delete el.dataset.userSized;
+}
+
+/**
+ * Grow a floating window to its content (capped to the viewport).
+ * No-op after the user resizes, or while the window is hidden / maximized.
+ */
+export function fitWindowToContents(
+  el: HTMLElement,
+  opts: { panel?: string; minHeight?: number } = {},
+): void {
+  if (el.hidden || el.classList.contains('is-maximized') || el.dataset.userSized === '1') return;
+  const panel = (opts.panel ? el.querySelector(opts.panel) : null) as HTMLElement | null;
+  const prev = panel
+    ? { flex: panel.style.flex, minHeight: panel.style.minHeight, overflow: panel.style.overflow }
+    : null;
+  if (panel) {
+    panel.style.flex = 'none';
+    panel.style.minHeight = 'auto';
+    panel.style.overflow = 'visible';
+  }
+  el.style.height = 'auto';
+  const minH = opts.minHeight ?? 160;
+  const neededH = Math.max(minH, Math.ceil(el.scrollHeight));
+  if (panel && prev) {
+    panel.style.flex = prev.flex;
+    panel.style.minHeight = prev.minHeight;
+    panel.style.overflow = prev.overflow;
+  }
+  const maxH = Math.max(minH, window.innerHeight - 16);
+  const height = Math.min(neededH, maxH);
+  el.style.height = `${height}px`;
+  const r = el.getBoundingClientRect();
+  if (r.bottom > window.innerHeight - 8) {
+    el.style.top = `${Math.max(8, window.innerHeight - height - 8)}px`;
+  }
 }
 
 export function persistWindow(id: WindowId, el: HTMLElement): void {
@@ -173,6 +215,18 @@ export function defaultLogFrame(): WindowFrame {
 
 export function defaultActivityFrame(): WindowFrame {
   return { left: 56, top: 72, width: 480, height: 460, open: false };
+}
+
+export function defaultInfoFrame(): WindowFrame {
+  const width = Math.min(320, window.innerWidth - 32);
+  const height = Math.min(560, window.innerHeight - 32);
+  return {
+    left: Math.max(16, window.innerWidth - width - 16),
+    top: 56,
+    width,
+    height,
+    open: false,
+  };
 }
 
 export function defaultResourceFrame(): WindowFrame {

@@ -18,3 +18,23 @@ export function formatBytesPerSec(n: number): string {
   if (!Number.isFinite(n) || n < 0) return '—';
   return `${Math.round(n).toLocaleString()} bytes/s`;
 }
+
+function unitPhrase(n: number, singular: string, plural: string): string {
+  return n === 1 ? `1 ${singular}` : `${n} ${plural}`;
+}
+
+/** Remaining time from seconds, e.g. "38 seconds" or "3 minutes, 38 seconds". */
+export function formatRemainingTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  const s = Math.round(seconds);
+  if (s < 1) return 'less than a second';
+  if (s < 60) return unitPhrase(s, 'second', 'seconds');
+  const hours = Math.floor(s / 3600);
+  const minutes = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  const parts: string[] = [];
+  if (hours > 0) parts.push(unitPhrase(hours, 'hour', 'hours'));
+  if (minutes > 0) parts.push(unitPhrase(minutes, 'minute', 'minutes'));
+  if (hours === 0 && rem > 0) parts.push(unitPhrase(rem, 'second', 'seconds'));
+  return parts.join(', ');
+}

@@ -184,6 +184,7 @@ async function writeMetaNode(
     const dir = await fs.ensureDir(parentId, node.name);
     const folderMeta = folderExpanded(node);
     if (folderMeta) await stampDir(fs, dir, folderMeta);
+    track?.onDir?.(parentId, node.name, dir.id, path);
     for (const child of node.children) {
       await writeMetaNode(fs, dir.id, child, read, track, path);
     }

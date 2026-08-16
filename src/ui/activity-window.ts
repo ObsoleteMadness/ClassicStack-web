@@ -1,8 +1,8 @@
 import type { AfpServer } from '../services/afp-server/server';
 import type { TrafficStats } from '../util/traffic-stats';
 import { formatBytes, formatBytesPerSec } from './format-bytes';
-import { enableWindowMove, enableWindowResize, onWindowGeometryChange } from './window-resize';
-import { defaultActivityFrame, persistWindow, restoreWindow } from './window-layout';
+import { defaultActivityFrame, fitWindowToContents, persistWindow, restoreWindow } from './window-layout';
+import { enableWindowMove, enableWindowResize, onWindowGeometryChange, raiseFloatingWindow } from './window-resize';
 
 export interface ActivityHost {
   traffic: TrafficStats;
@@ -30,7 +30,7 @@ export class ActivityWindow extends HTMLElement {
   connectedCallback(): void {
     this.classList.add('activity-window');
     this.renderShell();
-    enableWindowResize(this, { minWidth: 320, minHeight: 240 });
+    enableWindowResize(this, { minWidth: 320, minHeight: 160 });
     enableWindowMove(this, '.activity-window__chrome');
     this.addEventListener('click', (e) => this.onClick(e));
     window.addEventListener('keydown', this.onKey);
@@ -52,7 +52,17 @@ export class ActivityWindow extends HTMLElement {
     this.hidden = false;
     this.refresh();
     this.startTimer();
-    persistWindow('activity', this);
+    raiseFloatingWindow(this);
+    requestAnimationFrame(() => {
+      fitWindowToContents(this, { panel: '[data-role="panel"]', minHeight: 160 });
+      persistWindow('activity', this);
+    });
+  }
+
+  private fitToContents(): void {
+    requestAnimationFrame(() => {
+      fitWindowToContents(this, { panel: '[data-role="panel"]', minHeight: 160 });
+    });
   }
 
   hide(): void {
@@ -88,16 +98,18 @@ export class ActivityWindow extends HTMLElement {
         <div class="activity-window__title">Activity</div>
         <button type="button" class="btn log-panel__btn" data-act="close" aria-label="Close">✕</button>
       </div>
-      <div class="activity-window__stats" data-role="stats"></div>
-      <div class="activity-window__body">
-        <section class="activity-window__section">
-          <h3>Connected users</h3>
-          <div class="activity-window__table-wrap" data-role="users"></div>
-        </section>
-        <section class="activity-window__section">
-          <h3>Open files</h3>
-          <div class="activity-window__table-wrap" data-role="files"></div>
-        </section>
+      <div class="activity-window__panel" data-role="panel">
+        <div class="activity-window__stats" data-role="stats"></div>
+        <div class="activity-window__body">
+          <section class="activity-window__section">
+            <h3>Connected users</h3>
+            <div class="activity-window__table-wrap" data-role="users"></div>
+          </section>
+          <section class="activity-window__section">
+            <h3>Open files</h3>
+            <div class="activity-window__table-wrap" data-role="files"></div>
+          </section>
+        </div>
       </div>
     `;
   }
@@ -182,6 +194,7 @@ export class ActivityWindow extends HTMLElement {
         `;
       }
     }
+    if (!this.hidden && this.dataset.userSized !== '1') this.fitToContents();
   }
 
   private onClick(e: MouseEvent): void {

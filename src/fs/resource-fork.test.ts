@@ -124,6 +124,44 @@ function applFref(): Uint8Array {
   return fref;
 }
 
+function frefOf(type: string, localId: number): Uint8Array {
+  const fref = new Uint8Array(6);
+  writeAscii4(fref, 0, type);
+  fref[4] = (localId >> 8) & 0xff;
+  fref[5] = localId & 0xff;
+  return fref;
+}
+
+/** BNDL ICN# lists only APPL (local 0 → 128); TEXT FREF points at local 129. */
+function applAndTextBndl(): Uint8Array {
+  const bndl = new Uint8Array(8 + 2 * 10 + 4);
+  writeAscii4(bndl, 0, 'APPL');
+  bndl[5] = 128;
+  bndl[7] = 1;
+  let p = 8;
+  writeAscii4(bndl, p, 'FREF');
+  p += 4;
+  bndl[p++] = 0;
+  bndl[p++] = 1; // 2 mappings
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 128;
+  bndl[p++] = 0;
+  bndl[p++] = 1;
+  bndl[p++] = 0;
+  bndl[p++] = 129;
+  writeAscii4(bndl, p, 'ICN#');
+  p += 4;
+  bndl[p++] = 0;
+  bndl[p++] = 0; // 1 mapping
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 128;
+  return bndl;
+}
+
 describe('resource fork + icon decode', () => {
   it('parses ICN# from a synthetic resource fork', () => {
     const rf = ResourceFork.fromBytes(buildForkWithICN());
@@ -171,6 +209,34 @@ describe('resource fork + icon decode', () => {
     expect(icon?.pixels[0]).toBe(0);
     expect(icon?.pixels[1]).toBe(0);
     expect(icon?.pixels[2]).toBe(0);
+    expect(icon?.pixels[3]).toBe(255);
+  });
+
+  it('copies ICN# / ics# mask alpha onto icl8 and ics8', () => {
+    const color32 = new Uint8Array(1024);
+    color32.fill(1);
+    const color16 = new Uint8Array(256);
+    color16.fill(1);
+    const icn = new Uint8Array(256);
+    icn.fill(0xaa, 0, 128);
+    icn[128] = 0x80; // only the first large pixel is opaque
+    const ics = new Uint8Array(64);
+    ics.fill(0xaa, 0, 32);
+    ics[32] = 0x80;
+    const set = new IconSet([
+      decodeIcon('icl8', color32)!,
+      decodeIcon('ics8', color16)!,
+      decodeIcon('ICN#', icn)!,
+      decodeIcon('ics#', ics)!,
+    ]);
+    const large = set.getIconBySize(IconSize.Large, true)!;
+    expect(large.typeCode).toBe('icl8');
+    expect(large.pixels[3]).toBe(255);
+    expect(large.pixels[7]).toBe(0);
+    const small = set.getIconBySize(IconSize.Small, true)!;
+    expect(small.typeCode).toBe('ics8');
+    expect(small.pixels[3]).toBe(255);
+    expect(small.pixels[7]).toBe(0);
   });
 
   it('prefers 8-bit over 4-bit over B&W for the same size', () => {
@@ -253,6 +319,100 @@ describe('resource fork + icon decode', () => {
     expect(reads.reduce((n, r) => n + r.count, 0)).toBeLessThan(fork.length);
   });
 
+  it('loads FREF-referenced icon families even when BNDL ICN# only lists APPL', async () => {
+    const noise = new Uint8Array(256);
+    noise.fill(0x11);
+    const textIcon = icnPayload();
+    textIcon.fill(0x66, 0, 128);
+    const fork = buildResourceFork([
+      { type: 'BNDL', id: 128, data: applAndTextBndl() },
+      { type: 'FREF', id: 128, data: frefOf('APPL', 0) },
+      { type: 'FREF', id: 129, data: frefOf('TEXT', 129) },
+      { type: 'ICN#', id: 128, data: icnPayload() },
+      { type: 'ICN#', id: 129, data: textIcon },
+      { type: 'ICN#', id: 999, data: noise },
+    ]);
+    const parsed = ResourceFork.fromBytes(fork);
+    const extra = parsed.findById('ICN#', 999)!;
+    const rf = await loadFinderIconFork(async (offset, count) =>
+      fork.subarray(offset, offset + count),
+    );
+    expect(rf?.findById('ICN#', 128)?.payload).toBeTruthy();
+    expect(rf?.findById('ICN#', 129)?.payload?.subarray(0, 1)[0]).toBe(0x66);
+    expect(rf?.findById('ICN#', 999)).toBeUndefined();
+    const extraStart = extra.dataOffset;
+    const extraEnd = extra.dataOffset + extra.length;
+    const reads: { offset: number; count: number }[] = [];
+    await loadFinderIconFork(async (offset, count) => {
+      reads.push({ offset, count });
+      return fork.subarray(offset, offset + count);
+    });
+    expect(reads.some((r) => r.offset < extraEnd && r.offset + r.count > extraStart)).toBe(false);
+  });
+
+  it('Finder icon extract probes then reads remaining icl8 bytes at the map offset', async () => {
+    const blob = new Uint8Array(200_000);
+    blob.fill(0xab);
+    const icl8 = new Uint8Array(1024);
+    icl8.fill(0x33);
+    const fork = buildResourceFork([
+      { type: 'CODE', id: 1, data: blob },
+      { type: 'icl8', id: 128, data: icl8 },
+    ]);
+    const prefix = ResourceFork.fromBytes(fork).findById('icl8', 128)!.dataOffset - 4;
+    const reads: { offset: number; count: number }[] = [];
+    const rf = await loadFinderIconFork(
+      async (offset, count) => {
+        reads.push({ offset, count });
+        return fork.subarray(offset, Math.min(fork.length, offset + count));
+      },
+      { extraIds: [128] },
+    );
+    expect(rf?.findById('icl8', 128)?.length).toBe(1024);
+    expect([...rf!.findById('icl8', 128)!.payload!]).toEqual([...icl8]);
+    expect(reads.some((r) => r.offset === prefix && r.count === 4 + 512)).toBe(true);
+    expect(reads.some((r) => r.offset === prefix && r.count === 4 + 1024)).toBe(false);
+    expect(reads.some((r) => r.count >= blob.length)).toBe(false);
+  });
+
+  it('loads ICN# / ics# masks with icl8 / ics8 and skips icl4', async () => {
+    const icl8 = new Uint8Array(1024);
+    icl8.fill(0x33);
+    const ics8 = new Uint8Array(256);
+    ics8.fill(0x44);
+    const icl4 = new Uint8Array(512);
+    icl4.fill(0x55);
+    const ics = new Uint8Array(64);
+    ics.fill(0xff, 32, 64);
+    const fork = buildResourceFork([
+      { type: 'BNDL', id: 128, data: applBndl() },
+      { type: 'FREF', id: 128, data: applFref() },
+      { type: 'icl8', id: 128, data: icl8 },
+      { type: 'ics8', id: 128, data: ics8 },
+      { type: 'icl4', id: 128, data: icl4 },
+      { type: 'ICN#', id: 128, data: icnPayload() },
+      { type: 'ics#', id: 128, data: ics },
+    ]);
+    const parsed = ResourceFork.fromBytes(fork);
+    const icl4Ent = parsed.findById('icl4', 128)!;
+    const reads: { offset: number; count: number }[] = [];
+    const rf = await loadFinderIconFork(async (offset, count) => {
+      reads.push({ offset, count });
+      return fork.subarray(offset, Math.min(fork.length, offset + count));
+    });
+    expect(rf?.findById('icl8', 128)?.payload?.length).toBe(1024);
+    expect(rf?.findById('ics8', 128)?.payload?.length).toBe(256);
+    expect(rf?.findById('ICN#', 128)?.payload?.length).toBe(256);
+    expect(rf?.findById('ics#', 128)?.payload?.length).toBe(64);
+    expect(rf?.findById('icl4', 128)?.payload).toBeUndefined();
+    const overlaps = (start: number, end: number) =>
+      reads.some((r) => r.offset < end && r.offset + r.count > start);
+    expect(overlaps(icl4Ent.dataOffset, icl4Ent.dataOffset + icl4Ent.length)).toBe(false);
+    const set = IconSet.fromResourceFork(128, rf!);
+    expect(set?.getIconBySize(IconSize.Large, true)?.typeCode).toBe('icl8');
+    expect(set?.getIconBySize(IconSize.Large, true)?.pixels[3]).toBe(255);
+  });
+
   it('parses the same map through fromReader as fromBytes without pulling payloads', async () => {
     const fork = buildForkWithICN();
     const fromBuf = ResourceFork.fromBytes(fork);
@@ -274,5 +434,30 @@ describe('resource fork + icon decode', () => {
     expect(fromRead?.hasPayload(icn!)).toBe(true);
     expect(reads).toHaveLength(3);
     expect(reads[2]!.count).toBe(4 + 256);
+  });
+
+  it('pulls a small PICT by offset instead of reading the rest of a large fork', async () => {
+    const blob = new Uint8Array(200_000);
+    blob.fill(0xab);
+    const pict = new Uint8Array(200);
+    pict.fill(0x11);
+    const fork = buildResourceFork([
+      { type: 'CODE', id: 1, data: blob },
+      { type: 'PICT', id: 128, data: pict },
+    ]);
+    const parsed = ResourceFork.fromBytes(fork);
+    const prefix = parsed.findById('PICT', 128)!.dataOffset - 4;
+    const reads: { offset: number; count: number }[] = [];
+    const rf = await ResourceFork.fromReader(async (offset, count) => {
+      reads.push({ offset, count });
+      return fork.subarray(offset, Math.min(fork.length, offset + count));
+    });
+    const pulled = await rf!.pullBytes(rf!.findById('PICT', 128)!);
+    expect([...pulled]).toEqual([...pict]);
+    const payloadReads = reads.filter((r) => r.offset === prefix);
+    expect(payloadReads.length).toBe(1);
+    expect(payloadReads[0]!.count).toBeLessThanOrEqual(4 + 512);
+    expect(reads.some((r) => r.count >= blob.length)).toBe(false);
+    expect(reads.reduce((n, r) => n + r.count, 0)).toBeLessThan(fork.length / 4);
   });
 });

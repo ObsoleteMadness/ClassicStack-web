@@ -21,6 +21,7 @@ import { LoginDialog } from './ui/login-dialog';
 import { NameConflictDialog } from './ui/name-conflict-dialog';
 import { ExtensionEditorDialog } from './ui/extension-editor-dialog';
 import { ResourceForkExplorer } from './ui/resource-fork-explorer';
+import { GetInfoWindow } from './ui/get-info-window';
 import {
   NetbootDialog,
   BUNDLED_BLOCK_SIZE,
@@ -77,23 +78,25 @@ async function main(): Promise<void> {
   const extensionEditor = new ExtensionEditorDialog();
   const resourceExplorer = new ResourceForkExplorer();
   resourceExplorer.hidden = true;
+  const getInfoWindow = new GetInfoWindow();
+  getInfoWindow.hidden = true;
 
   stage.appendChild(finder);
-  app.append(menubar, stage, logPanel, activityWindow, fileActivityWindow, netboot, about, alertDialog, afpSessions, loginDialog, nameConflictDialog, extensionEditor, resourceExplorer);
+  app.append(menubar, stage, logPanel, activityWindow, fileActivityWindow, netboot, about, alertDialog, afpSessions, loginDialog, nameConflictDialog, extensionEditor, resourceExplorer, getInfoWindow);
 
   const serial = new WebSerialPort();
   const pcap = new PcapCapture();
   const traffic = new TrafficStats();
-  let badgeRaf = 0;
+  const CAPTURE_STATUS_MS = 5_000;
+  let lastCaptureStatusAt = 0;
   serial.tapFrames((frame, direction) => {
     traffic.record(frame.length, direction);
     pcap.record(frame, direction);
     if (!pcap.capturing) return;
-    if (badgeRaf) return;
-    badgeRaf = requestAnimationFrame(() => {
-      badgeRaf = 0;
-      menubar.refreshCaptureStatus();
-    });
+    const now = Date.now();
+    if (now - lastCaptureStatusAt < CAPTURE_STATUS_MS) return;
+    lastCaptureStatusAt = now;
+    menubar.refreshCaptureStatus();
   });
 
   let stack: LocalTalkStack | null = null;
@@ -398,6 +401,7 @@ async function main(): Promise<void> {
     afpSessions,
     extensionEditor,
     resourceExplorer,
+    getInfoWindow,
     about,
     alertDialog,
     finder,
@@ -434,6 +438,7 @@ async function main(): Promise<void> {
 
   finder.bind(vfs, host);
   finder.bindResourceExplorer(resourceExplorer);
+  finder.bindGetInfoWindow(getInfoWindow);
 
   if (!WebSerialPort.supported()) {
     log.warn('WebSerial unavailable — use Chrome/Edge over HTTPS or localhost', 'serial');

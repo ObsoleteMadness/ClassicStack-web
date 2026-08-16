@@ -5,6 +5,7 @@ import type { AtpClient } from '../atp-client';
 import * as asp from '../../protocol/asp';
 import * as atp from '../../protocol/atp';
 import * as C from '../../protocol/afp/constants';
+import { be16 } from '../../protocol/binary';
 import * as cmd from './commands';
 import { desEncryptBlock } from '../../hash/des';
 import { encodeMacRoman } from '../../protocol/macroman';
@@ -12,14 +13,15 @@ import { log } from '../../util/logger';
 import { AsyncSemaphore } from '../../util/async-semaphore';
 import { isAbortError, throwIfAborted } from '../../util/abort';
 
-/** Keep OpenFork sessions (and other long AFP tasks) from flooding a classic server. */
-const MAX_PARALLEL_TASKS = 3;
 /**
- * Enumerate is a separate pool from icon stat/fork work. ASP still runs one
- * Command/Write at a time; this only stops listing from waiting on a full
- * OpenFork session or a queue of Icon\\r probes.
+ * One FPWrite stream at a time so LocalTalk does not interleave copies.
+ * FPEnumerate / stat / resource-fork reads use a separate browse channel and
+ * share the ASP session between write quantums.
  */
-const MAX_PARALLEL_LISTS = 3;
+const WRITE_SLOTS = 1;
+const BROWSE_SLOTS = 2;
+const BROWSE_LIST_PRIORITY = 1;
+const BROWSE_FORK_PRIORITY = 0;
 
 export type AfpCredentials =
   | { kind: 'guest' }
@@ -75,14 +77,16 @@ export class AfpClient {
   private pendingNotices: AfpServerNotice[] = [];
   private sawShutdown = false;
   private inFlight = 0;
-  private readonly lists = new AsyncSemaphore(MAX_PARALLEL_LISTS);
-  private readonly tasks = new AsyncSemaphore(MAX_PARALLEL_TASKS);
+  private readonly writes = new AsyncSemaphore(WRITE_SLOTS);
+  private readonly browse = new AsyncSemaphore(BROWSE_SLOTS);
   /** VolumeID → DTRefNum (Netatalk uses the same value). */
   private readonly dtRefs = new Map<number, number>();
   private readonly dtUnavailable = new Set<number>();
   private readonly desktopInfo = new Map<string, cmd.DesktopIconInfo[]>();
   private readonly desktopInfoInflight = new Map<string, Promise<cmd.DesktopIconInfo[] | null>>();
   private readonly desktopIconInflight = new Map<string, Promise<{ iconType: number; data: Uint8Array }[] | null>>();
+  /** Open forkRef → path, so FPRead/FPWrite traces can name the file. */
+  private readonly openForks = new Map<number, { path: string; resource: boolean }>();
 
   private constructor(sess: AspSession) {
     this.sess = sess;
@@ -123,7 +127,16 @@ export class AfpClient {
   }
 
   private fpDetail(block: Uint8Array): string {
-    return cmd.afpRequestDetail(block);
+    const base = cmd.afpRequestDetail(block);
+    const op = block[0] ?? 0;
+    if (
+      (op === C.CmdRead || op === C.CmdWrite || op === C.CmdCloseFork) &&
+      block.length >= 4
+    ) {
+      const info = this.openForks.get(be16(block, 2));
+      if (info) return `${base} “${info.path}”${info.resource ? ' rsrc' : ' data'}`;
+    }
+    return base;
   }
 
   private async fp(
@@ -431,7 +444,11 @@ export class AfpClient {
     signal?: AbortSignal,
   ): Promise<cmd.DirEntry[]> {
     log.trace(`list did=${dirId} path=“${path}” vol=${this.vid(volId)}`, 'afp');
-    return this.lists.run(() => this.listUnlocked(dirId, path, volId, onBatch, signal), signal);
+    return this.browse.run(
+      () => this.listUnlocked(dirId, path, volId, onBatch, signal),
+      signal,
+      BROWSE_LIST_PRIORITY,
+    );
   }
 
   private async listUnlocked(
@@ -475,7 +492,11 @@ export class AfpClient {
     signal?: AbortSignal,
   ): Promise<cmd.DirEntry | undefined> {
     log.trace(`stat did=${dirId} path=“${path}” vol=${this.vid(volId)}`, 'afp');
-    return this.tasks.run(() => this.statUnlocked(dirId, path, volId), signal);
+    return this.browse.run(
+      () => this.statUnlocked(dirId, path, volId),
+      signal,
+      BROWSE_LIST_PRIORITY,
+    );
   }
 
   private async statUnlocked(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry | undefined> {
@@ -505,6 +526,8 @@ export class AfpClient {
     const open = await this.fp(openCmd, { signal });
     if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
     const { forkRef } = cmd.parseOpenFork(open.data);
+    const opened = cmd.parseOpenForkRequest(openCmd);
+    if (opened) this.openForks.set(forkRef, opened);
     try {
       return await fn(forkRef);
     } finally {
@@ -518,6 +541,8 @@ export class AfpClient {
           `FPCloseFork ${forkRef} error ${err instanceof Error ? err.message : String(err)}`,
           'afp',
         );
+      } finally {
+        this.openForks.delete(forkRef);
       }
     }
   }
@@ -573,9 +598,10 @@ export class AfpClient {
       `withForkReader “${path}” did=${dirId} ${resource ? 'rsrc' : 'data'} vol=${this.vid(volId)}`,
       'afp',
     );
-    return this.tasks.run(
+    return this.browse.run(
       () => this.withForkReaderUnlocked(path, dirId, resource, fn, volId, signal),
       signal,
+      BROWSE_FORK_PRIORITY,
     );
   }
 
@@ -647,7 +673,11 @@ export class AfpClient {
       `readFile “${path}” did=${dirId} ${resource ? 'rsrc' : 'data'} vol=${this.vid(volId)}`,
       'afp',
     );
-    return this.tasks.run(() => this.readFileUnlocked(path, dirId, resource, volId, onBytes, signal), signal);
+    return this.browse.run(
+      () => this.readFileUnlocked(path, dirId, resource, volId, onBytes, signal),
+      signal,
+      BROWSE_FORK_PRIORITY,
+    );
   }
 
   private async readFileUnlocked(
@@ -715,7 +745,10 @@ export class AfpClient {
       `writeFile “${path}” did=${dirId} ${resource ? 'rsrc' : 'data'} ${data.length}b vol=${this.vid(volId)}`,
       'afp',
     );
-    return this.tasks.run(() => this.writeFileUnlocked(path, data, dirId, resource, volId, onBytes, signal), signal);
+    return this.writes.run(
+      () => this.writeFileUnlocked(path, data, dirId, resource, volId, onBytes, signal),
+      signal,
+    );
   }
 
   private async writeFileUnlocked(
@@ -865,7 +898,11 @@ export class AfpClient {
         if (joined !== undefined) return joined;
         continue;
       }
-      const work = this.loadDesktopIconsUnlocked(type, creator, volId, signal);
+      const work = this.browse.run(
+        () => this.loadDesktopIconsUnlocked(type, creator, volId, signal),
+        signal,
+        BROWSE_FORK_PRIORITY,
+      );
       this.desktopIconInflight.set(cacheKey, work);
       void work.finally(() => {
         if (this.desktopIconInflight.get(cacheKey) === work) this.desktopIconInflight.delete(cacheKey);

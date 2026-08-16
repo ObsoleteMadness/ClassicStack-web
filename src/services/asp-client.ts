@@ -18,6 +18,8 @@ export class AspSession {
   private atp: AtpClient;
   private destNetwork: number;
   private destNode: number;
+  /** Session listening socket — OpenSess, GetStatus, and workstation tickles. */
+  private slsSocket: number;
   private destSocket: number; // SSS after open, or SLS before
   /**
    * Workstation session socket advertised in OpenSess. ClassicStack's AFP client
@@ -60,6 +62,7 @@ export class AspSession {
     this.atp = atp;
     this.destNetwork = destNetwork;
     this.destNode = destNode;
+    this.slsSocket = slsSocket;
     this.destSocket = slsSocket;
     this.wssSocket = allocDynSocket();
     this.cmdSocket = allocDynSocket();
@@ -107,21 +110,35 @@ export class AspSession {
     this.seq = 0;
     this.seqInit = false;
     this.ensureWssHandler();
+    void this.sendTickle();
     this.tickleTimer = setInterval(() => {
-      void this.atp
-        .request({
-          destNetwork: this.destNetwork,
-          destNode: this.destNode,
-          destSocket: this.destSocket,
-          srcSocket: this.cmdSocket,
-          userData: asp.packTickle(this.sessionId),
-          timeoutMs: 5000,
-          retries: 1,
-          bitmap: 0x01,
-          quietTimeout: true,
-        })
-        .catch(() => undefined);
+      void this.sendTickle();
     }, asp.TickleIntervalMs);
+  }
+
+  /**
+   * Workstation tickles go to the SLS (Inside AppleTalk 11-15), not the SSS.
+   * System 7 AppleShare ignores Tickle on the session socket, then CloseSess
+   * after the 2-minute maintenance timeout.
+   */
+  private sendTickle(): Promise<unknown> {
+    log.trace(
+      `ASP Tickle sess=${this.sessionId} sls=${this.slsSocket}`,
+      'asp',
+    );
+    return this.atp
+      .request({
+        destNetwork: this.destNetwork,
+        destNode: this.destNode,
+        destSocket: this.slsSocket,
+        srcSocket: this.cmdSocket,
+        userData: asp.packTickle(this.sessionId),
+        timeoutMs: asp.TickleIntervalMs,
+        retries: 1,
+        bitmap: 0x01,
+        quietTimeout: true,
+      })
+      .catch(() => undefined);
   }
 
   /**
