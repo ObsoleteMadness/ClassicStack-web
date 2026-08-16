@@ -2,10 +2,11 @@
 
 import { CNIDRoot, macTime } from '../protocol/afp/constants';
 import type { AfpClient } from '../services/afp-client/client';
+import type { DirEntry } from '../services/afp-client/commands';
 import { unescapeHostFilename } from '../protocol/host-filename';
 import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appledouble';
 import { be32 } from '../protocol/binary';
-import type { Catalog, VNode, VfsChangeListener } from './virtual-fs';
+import type { Catalog, VNode, VfsChangeListener, ChildrenBatchListener } from './virtual-fs';
 import { importDataTransferInto, type ImportProgress } from './import-transfer';
 import { finderInfoFromName } from './extension-map';
 import { loadFinderIconFork, ResourceFork } from './resource-fork';
@@ -65,13 +66,21 @@ export class RemoteVfs implements Catalog {
     return node;
   }
 
-  async children(parentId: number): Promise<VNode[]> {
-    const entries = await this.client.list(parentId, '', this.volId);
+  async children(parentId: number, onBatch?: ChildrenBatchListener): Promise<VNode[]> {
     const kids: VNode[] = [];
-    for (const e of entries) {
-      if (!e.cnid) continue;
-      kids.push(this.adopt(e, parentId));
-    }
+    const seen = new Set<number>();
+    const take = async (batch: DirEntry[]) => {
+      let added = false;
+      for (const e of batch) {
+        if (!e.cnid || seen.has(e.cnid)) continue;
+        seen.add(e.cnid);
+        kids.push(this.adopt(e, parentId));
+        added = true;
+      }
+      if (added) await onBatch?.(kids);
+    };
+    const entries = await this.client.list(parentId, '', this.volId, take);
+    await take(entries);
     return kids;
   }
 

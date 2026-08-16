@@ -9,6 +9,9 @@ import {
   writeFork,
   readFork,
   parseEnumerate,
+  collectEnumeratePages,
+  ENUMERATE_REQ_COUNT,
+  type DirEntry,
   parseSrvrParms,
   setFileDirParms,
   parseServerInfo,
@@ -126,6 +129,47 @@ describe('AFP client parseEnumerate', () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]!.isDir).toBe(false);
     expect(entries[0]!.name).toBe('Doc');
+  });
+});
+
+function dirEnt(name: string, cnid: number): DirEntry {
+  return {
+    isDir: false,
+    name,
+    cnid,
+    parentId: 2,
+    dataLen: 0,
+    rsrcLen: 0,
+    createDate: 0,
+    modDate: 0,
+    finderInfo: new Uint8Array(32),
+  };
+}
+
+describe('collectEnumeratePages', () => {
+  it('invokes onBatch after each page before the directory is complete', async () => {
+    const pages = [
+      Array.from({ length: ENUMERATE_REQ_COUNT }, (_, i) => dirEnt(`a${i}`, 100 + i)),
+      Array.from({ length: ENUMERATE_REQ_COUNT }, (_, i) => dirEnt(`b${i}`, 200 + i)),
+      [dirEnt('last', 300)],
+    ];
+    const seen: number[] = [];
+    const starts: number[] = [];
+    const all = await collectEnumeratePages(async (start) => {
+      starts.push(start);
+      return pages.shift() ?? null;
+    }, (batch) => {
+      seen.push(batch.length);
+    });
+    expect(starts).toEqual([1, 1 + ENUMERATE_REQ_COUNT, 1 + ENUMERATE_REQ_COUNT * 2]);
+    expect(seen).toEqual([ENUMERATE_REQ_COUNT, ENUMERATE_REQ_COUNT, 1]);
+    expect(all).toHaveLength(ENUMERATE_REQ_COUNT * 2 + 1);
+    expect(all[all.length - 1]!.name).toBe('last');
+  });
+
+  it('stops on an empty or not-found page', async () => {
+    const all = await collectEnumeratePages(async () => null);
+    expect(all).toEqual([]);
   });
 });
 

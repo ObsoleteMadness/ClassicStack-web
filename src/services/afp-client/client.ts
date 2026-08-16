@@ -414,38 +414,41 @@ export class AfpClient {
     return volId && volId > 0 ? volId : this.volId;
   }
 
-  async list(dirId = C.CNIDRoot, path = '', volId?: number): Promise<cmd.DirEntry[]> {
-    return this.tasks.run(() => this.listUnlocked(dirId, path, volId));
+  async list(
+    dirId = C.CNIDRoot,
+    path = '',
+    volId?: number,
+    onBatch?: (batch: cmd.DirEntry[]) => void | Promise<void>,
+  ): Promise<cmd.DirEntry[]> {
+    return this.tasks.run(() => this.listUnlocked(dirId, path, volId, onBatch));
   }
 
-  private async listUnlocked(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry[]> {
+  private async listUnlocked(
+    dirId: number,
+    path: string,
+    volId?: number,
+    onBatch?: (batch: cmd.DirEntry[]) => void | Promise<void>,
+  ): Promise<cmd.DirEntry[]> {
     const vol = this.vid(volId);
     if (!vol) return [];
-    const all: cmd.DirEntry[] = [];
-    let start = 1;
-    for (;;) {
+    return cmd.collectEnumeratePages(async (start) => {
       const r = await this.fp(
         cmd.enumerate(
           vol,
           dirId,
           cmd.DEFAULT_FILE_BITMAP,
           cmd.DEFAULT_DIR_BITMAP,
-          20,
+          cmd.ENUMERATE_REQ_COUNT,
           start,
           4000,
           path,
         ),
         { bitmap: 0xff },
       );
-      if (r.result === C.ErrObjectNotFnd) break;
+      if (r.result === C.ErrObjectNotFnd) return null;
       if (r.result !== C.NoErr) throw new Error(`FPEnumerate ${r.result}`);
-      const batch = cmd.parseEnumerate(r.data, cmd.DEFAULT_FILE_BITMAP, cmd.DEFAULT_DIR_BITMAP);
-      if (batch.length === 0) break;
-      all.push(...batch);
-      start += batch.length;
-      if (batch.length < 20) break;
-    }
-    return all;
+      return cmd.parseEnumerate(r.data, cmd.DEFAULT_FILE_BITMAP, cmd.DEFAULT_DIR_BITMAP);
+    }, onBatch);
   }
 
   async stat(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry | undefined> {

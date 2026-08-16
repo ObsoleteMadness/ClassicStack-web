@@ -182,12 +182,15 @@ export function parseOpenVol(b: Uint8Array): { volId: number } {
   return { volId };
 }
 
+/** Entries requested per FPEnumerate; also the “short last page” threshold. */
+export const ENUMERATE_REQ_COUNT = 20;
+
 export function enumerate(
   volId: number,
   dirId: number,
   fileBitmap: number,
   dirBitmap: number,
-  reqCount = 20,
+  reqCount = ENUMERATE_REQ_COUNT,
   startIndex = 1,
   maxReplySize = 4624,
   path = '',
@@ -237,6 +240,29 @@ export function parseEnumerate(b: Uint8Array, fileBitmap: number, dirBitmap: num
     o += entryLen;
   }
   return entries;
+}
+
+/**
+ * Walk FPEnumerate startIndex until a short page or empty/not-found.
+ * `readPage` returns null for aeObjectNotFound / empty; `onBatch` sees each page
+ * as it arrives so callers can paint before the directory is complete.
+ */
+export async function collectEnumeratePages(
+  readPage: (startIndex: number) => Promise<DirEntry[] | null>,
+  onBatch?: (batch: DirEntry[]) => void | Promise<void>,
+  pageSize = ENUMERATE_REQ_COUNT,
+): Promise<DirEntry[]> {
+  const all: DirEntry[] = [];
+  let start = 1;
+  for (;;) {
+    const batch = await readPage(start);
+    if (!batch || batch.length === 0) break;
+    all.push(...batch);
+    await onBatch?.(batch);
+    start += batch.length;
+    if (batch.length < pageSize) break;
+  }
+  return all;
 }
 
 function parseParms(b: Uint8Array, bitmap: number, isDir: boolean): DirEntry {

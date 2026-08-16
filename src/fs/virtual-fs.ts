@@ -10,6 +10,8 @@ import { finderInfoFromName } from './extension-map';
 
 export type VfsChange = { parentIds: number[] };
 export type VfsChangeListener = (change: VfsChange) => void;
+/** Invoked with children gathered so far after each remote enumerate page. */
+export type ChildrenBatchListener = (nodes: VNode[]) => void | Promise<void>;
 
 export interface VNode {
   id: number;
@@ -35,7 +37,7 @@ export interface Catalog {
   get(id: number): Promise<VNode | undefined>;
   /** Load data/resource forks if the catalog stores them separately (remote AFP). */
   ensureContent(id: number, onBytes?: (n: number) => void): Promise<VNode | undefined>;
-  children(parentId: number): Promise<VNode[]>;
+  children(parentId: number, onBatch?: ChildrenBatchListener): Promise<VNode[]>;
   lookup(parentId: number, name: string): Promise<VNode | undefined>;
   /** Enough of the resource fork to decode Finder icons (optional; remote AFP). */
   loadIconResources?(node: VNode): Promise<import('./resource-fork').ResourceFork | null>;
@@ -196,9 +198,11 @@ export class VirtualFS implements Catalog {
     await this.db.delete('nodes', id);
   }
 
-  async children(parentId: number): Promise<VNode[]> {
+  async children(parentId: number, onBatch?: ChildrenBatchListener): Promise<VNode[]> {
     const all = await this.db.getAllFromIndex('nodes', 'parentId', parentId);
-    return all.map(revive);
+    const kids = all.map(revive);
+    await onBatch?.(kids);
+    return kids;
   }
 
   async lookup(parentId: number, name: string): Promise<VNode | undefined> {

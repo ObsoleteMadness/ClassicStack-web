@@ -789,6 +789,7 @@ export class FinderWindow extends HTMLElement {
   private async reload(): Promise<void> {
     if (!this.vfs) return;
     this.discardPendingVfsRefresh();
+    this.iconLoadGen++;
     this.nodes = await this.streamChildren(this.cwd, (kids) => {
       this.nodes = kids;
       this.listChildCache.set(this.cwd, kids);
@@ -1583,6 +1584,45 @@ export class FinderWindow extends HTMLElement {
     return el;
   }
 
+  private columnPaneBody(kids: VNode[], colIndex: number, selectedId: number | null): string {
+    if (kids.length === 0) {
+      return `<div class="empty" style="padding:16px;font-size:12px">Empty</div>`;
+    }
+    return kids
+      .map((n) =>
+        this.colItemHtml(
+          {
+            key: String(n.id),
+            name: n.name,
+            isDir: n.isDir,
+            size: nodeByteSize(n),
+            mod: fromMacTime(n.modDate),
+            node: n,
+          },
+          colIndex,
+          selectedId,
+        ),
+      )
+      .join('');
+  }
+
+  /** Replace a loading column (or refresh its pane) without remounting earlier columns. */
+  private paintColumnKids(view: Element, parentColIndex: number, kids: VNode[]): void {
+    const colIndex = parentColIndex + 1;
+    const body = this.columnPaneBody(kids, colIndex, null);
+    const loadingCol = view.querySelector('.column--loading');
+    if (loadingCol) {
+      loadingCol.replaceWith(this.mountColumnEl(colIndex, body));
+      return;
+    }
+    const pane = view.querySelector(`[data-col-index="${colIndex}"] .column-pane`);
+    if (pane) {
+      pane.innerHTML = body;
+      return;
+    }
+    view.querySelector(`[data-col-index="${parentColIndex}"]`)?.after(this.mountColumnEl(colIndex, body));
+  }
+
   private onColumnResizeDown(e: PointerEvent): void {
     const handle = (e.target as HTMLElement | null)?.closest?.('[data-col-resize]') as HTMLElement | null;
     if (!handle || isCompactUi()) return;
@@ -1874,7 +1914,15 @@ export class FinderWindow extends HTMLElement {
     this.renderPath();
     this.renderContent();
     try {
-      const kids = this.sortNodes(await this.vfs.children(folderId));
+      const kids = await this.streamChildren(folderId, (partial) => {
+        if (gen !== this.columnLoadGen) return;
+        this.columnChildren = this.columnChildren.slice(0, parentColIndex + 1);
+        this.columnChildren.push(partial);
+        this.nodes = partial;
+        this.columnLoading = false;
+        this.renderPath();
+        this.renderContent();
+      });
       if (gen !== this.columnLoadGen) return;
       this.columnChildren = this.columnChildren.slice(0, parentColIndex + 1);
       this.columnChildren.push(kids);
@@ -1929,7 +1977,14 @@ export class FinderWindow extends HTMLElement {
     this.setDiscloseState(disclose, 'loading');
     if (!row) this.renderContent();
     try {
-      const kids = this.sortNodes(await this.vfs.children(id));
+      const kids = await this.streamChildren(id, (partial) => {
+        if (!this.folderLoadIsCurrent(id, gen) || !this.expandedIds.has(id)) return;
+        this.listChildCache.set(id, partial);
+        this.loadingIds.delete(id);
+        const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
+        if (live?.parentElement) this.replaceListChildRows(live, partial, id);
+        else this.renderContent();
+      });
       if (!this.folderLoadIsCurrent(id, gen)) return;
       this.listChildCache.set(id, kids);
     } catch (err) {
@@ -1942,8 +1997,10 @@ export class FinderWindow extends HTMLElement {
       if (this.folderLoadIsCurrent(id, gen)) this.loadingIds.delete(id);
     }
     if (!this.folderLoadIsCurrent(id, gen)) return;
-    if (row?.parentElement && this.expandedIds.has(id)) this.insertListChildRows(row, this.listChildCache.get(id) ?? [], id);
-    else this.renderContent();
+    const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
+    if (live?.parentElement && this.expandedIds.has(id)) {
+      this.replaceListChildRows(live, this.listChildCache.get(id) ?? [], id);
+    } else this.renderContent();
   }
 
   private setDiscloseState(disclose: Element | null, state: 'open' | 'closed' | 'loading'): void {
@@ -2454,17 +2511,29 @@ export class FinderWindow extends HTMLElement {
       this.renderContent();
     }
     try {
-      const kids = this.sortNodes(await this.vfs.children(id));
+      const kids = await this.streamChildren(id, (partial) => {
+        if (!this.folderLoadIsCurrent(id, gen) || !this.expandedIds.has(id)) return;
+        this.listChildCache.set(id, partial);
+        this.loadingIds.delete(id);
+        const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
+        if (live?.parentElement) this.replaceListChildRows(live, partial, id);
+        else {
+          this.parkDragSource();
+          this.renderContent();
+          this.paintDropTarget(id, false);
+        }
+      });
       if (!this.folderLoadIsCurrent(id, gen)) return;
       this.listChildCache.set(id, kids);
       this.loadingIds.delete(id);
-      if (!row?.parentElement) {
+      const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
+      if (!live?.parentElement) {
         this.parkDragSource();
         this.renderContent();
         this.paintDropTarget(id, false);
         return;
       }
-      this.insertListChildRows(row, kids, id);
+      this.replaceListChildRows(live, kids, id);
     } catch (err) {
       if (!this.folderLoadIsCurrent(id, gen)) return;
       this.expandedIds.delete(id);
@@ -2473,6 +2542,11 @@ export class FinderWindow extends HTMLElement {
       this.setStatus(`Couldn’t expand folder: ${msg}`);
       this.renderContent();
     }
+  }
+
+  private replaceListChildRows(row: HTMLTableRowElement, kids: VNode[], folderId: number): void {
+    this.removeListChildRows(row);
+    this.insertListChildRows(row, kids, folderId);
   }
 
   private insertListChildRows(row: HTMLTableRowElement | null, kids: VNode[], folderId: number): void {
@@ -2584,34 +2658,21 @@ export class FinderWindow extends HTMLElement {
     this.scrollColumnsToEnd();
 
     try {
-      const kids = this.sortNodes(await this.vfs.children(node.id));
+      const kids = await this.streamChildren(node.id, (partial) => {
+        if (gen !== this.columnLoadGen) return;
+        this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
+        this.columnChildren.push(partial);
+        this.nodes = partial;
+        this.columnLoading = false;
+        this.paintColumnKids(view, colIndex, partial);
+        this.scrollColumnsToEnd();
+      });
       if (gen !== this.columnLoadGen) return;
+      this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
       this.columnChildren.push(kids);
       this.nodes = kids;
       this.columnLoading = false;
-      const loadingCol = view.querySelector('.column--loading');
-      const body =
-        kids.length === 0
-          ? `<div class="empty" style="padding:16px;font-size:12px">Empty</div>`
-          : kids
-              .map((n) =>
-                this.colItemHtml(
-                  {
-                    key: String(n.id),
-                    name: n.name,
-                    isDir: n.isDir,
-                    size: nodeByteSize(n),
-                    mod: fromMacTime(n.modDate),
-                    node: n,
-                  },
-                  colIndex + 1,
-                  null,
-                ),
-              )
-              .join('');
-      const newCol = this.mountColumnEl(colIndex + 1, body);
-      if (loadingCol) loadingCol.replaceWith(newCol);
-      else parentCol?.after(newCol);
+      this.paintColumnKids(view, colIndex, kids);
     } catch (err) {
       if (gen !== this.columnLoadGen) return;
       this.columnLoading = false;
