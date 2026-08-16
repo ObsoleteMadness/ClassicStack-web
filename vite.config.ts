@@ -12,11 +12,11 @@ const welcomeDir = path.join(root, 'public', 'welcome');
 
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string };
 
-/** Short SHA of main (CI / origin/main / main), else HEAD. Empty if git is unavailable. */
+/** Short SHA of main (CI / main / origin/main), else HEAD. Empty if git is unavailable. */
 function gitCommitShort(): string {
   const fromCi = process.env.GITHUB_SHA;
   if (fromCi && /^[0-9a-f]{7,40}$/i.test(fromCi)) return fromCi.slice(0, 7);
-  for (const ref of ['origin/main', 'main', 'HEAD']) {
+  for (const ref of ['main', 'origin/main', 'HEAD']) {
     try {
       const sha = execSync(`git rev-parse ${ref}`, {
         cwd: root,
