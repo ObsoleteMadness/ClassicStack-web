@@ -92,7 +92,11 @@ interface ListItem {
   mod: Date;
   node: VNode | null;
   finderInfo?: Uint8Array;
+  /** Synthetic row shown until the first enumerate page arrives. */
+  placeholder?: boolean;
 }
+
+const LISTING_PLACEHOLDER_KEY = '__listing__';
 
 interface ClipNode {
   name: string;
@@ -157,6 +161,8 @@ export class FinderWindow extends HTMLElement {
     startW: number;
   } | null = null;
   private folderOpening = false;
+  /** Folder whose children are being enumerated (spinner on that folder's glyph). */
+  private enumeratingFolderId: number | null = null;
   private listChildCache = new Map<number, VNode[]>();
   /** Skip pushState while applying browser back/forward. */
   private historyQuiet = false;
@@ -289,6 +295,7 @@ export class FinderWindow extends HTMLElement {
     this.columnLoading = false;
     this.columnLoadGen++;
     this.folderOpening = false;
+    this.enumeratingFolderId = null;
     this.iconUrls.clear();
     this.iconLoadGen++;
     this.abortAllListings();
@@ -802,6 +809,8 @@ export class FinderWindow extends HTMLElement {
     this.navListAbort?.abort();
     this.navListAbort = null;
     this.abortAllExpandListings();
+    this.enumeratingFolderId = null;
+    this.folderOpening = false;
   }
 
   /** Abort the previous folder listing (and any list-view expands) and start a new one. */
@@ -831,36 +840,51 @@ export class FinderWindow extends HTMLElement {
     this.iconLoadGen++;
     const listedId = this.cwd;
     const signal = this.beginNavListing();
-    const kids = await this.streamChildren(
-      listedId,
-      (partial) => {
-        if (signal.aborted || this.cwd !== listedId) return;
-        this.nodes = partial;
-        this.listChildCache.set(listedId, partial);
-        this.renderContent();
-      },
-      signal,
-    );
-    if (signal.aborted || this.cwd !== listedId) return;
-    this.nodes = kids;
-    this.listChildCache.set(listedId, kids);
-    for (const id of [...this.expandedIds]) {
-      if (signal.aborted) return;
-      this.listChildCache.set(
-        id,
-        await this.streamChildren(
-          id,
-          (partial) => {
-            if (signal.aborted || this.cwd !== listedId) return;
-            this.listChildCache.set(id, partial);
-            if (this.view === 'list') this.renderContent();
-          },
-          signal,
-        ),
+    this.enumeratingFolderId = listedId;
+    this.folderOpening = this.view !== 'column';
+    this.nodes = [];
+    this.renderPath();
+    this.renderContent();
+    try {
+      const kids = await this.streamChildren(
+        listedId,
+        (partial) => {
+          if (signal.aborted || this.cwd !== listedId) return;
+          this.folderOpening = false;
+          this.nodes = partial;
+          this.listChildCache.set(listedId, partial);
+          this.renderContent();
+        },
+        signal,
       );
+      if (signal.aborted || this.cwd !== listedId) return;
+      this.nodes = kids;
+      this.listChildCache.set(listedId, kids);
+      for (const id of [...this.expandedIds]) {
+        if (signal.aborted) return;
+        this.listChildCache.set(
+          id,
+          await this.streamChildren(
+            id,
+            (partial) => {
+              if (signal.aborted || this.cwd !== listedId) return;
+              this.listChildCache.set(id, partial);
+              if (this.view === 'list') this.renderContent();
+            },
+            signal,
+          ),
+        );
+      }
+      if (signal.aborted || this.cwd !== listedId) return;
+      await this.refreshColumns(listedId, signal);
+    } finally {
+      if (!signal.aborted && this.enumeratingFolderId === listedId) {
+        this.enumeratingFolderId = null;
+        this.folderOpening = false;
+        this.renderPath();
+        this.renderContent();
+      }
     }
-    if (signal.aborted || this.cwd !== listedId) return;
-    await this.refreshColumns(listedId, signal);
   }
 
   /**
@@ -935,7 +959,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   private currentItems(): ListItem[] {
-    return this.nodes.map((n) => ({
+    const items = this.nodes.map((n) => ({
       key: String(n.id),
       name: n.name,
       isDir: n.isDir,
@@ -944,6 +968,24 @@ export class FinderWindow extends HTMLElement {
       node: n,
       finderInfo: n.finderInfo,
     }));
+    if (items.length === 0 && this.folderOpening) return [this.listingPlaceholderItem()];
+    return items;
+  }
+
+  private listingPlaceholderItem(): ListItem {
+    return {
+      key: LISTING_PLACEHOLDER_KEY,
+      name: 'Loading…',
+      isDir: false,
+      size: 0,
+      mod: new Date(0),
+      node: null,
+      placeholder: true,
+    };
+  }
+
+  private isFolderEnumerating(id: number): boolean {
+    return this.enumeratingFolderId === id || this.loadingIds.has(id);
   }
 
   private selectedNode(): VNode | null {
@@ -1166,9 +1208,11 @@ export class FinderWindow extends HTMLElement {
         const sep = i > 0 ? `<span class="crumb-sep" aria-hidden="true">&gt;</span>` : '';
         const urls = p.id != null ? this.iconUrls.get(String(p.id)) : undefined;
         const icon =
-          urls && !isDefaultFolderIcon(urls)
-            ? `<img class="crumb-icon-img" src="${this.escape(urls.small)}" alt="" width="16" height="16" draggable="false" />`
-            : this.folderGlyphHtml('small', 'crumb');
+          p.id != null && this.isFolderEnumerating(p.id)
+            ? this.listingSpinnerHtml('crumb')
+            : urls && !isDefaultFolderIcon(urls)
+              ? `<img class="crumb-icon-img" src="${this.escape(urls.small)}" alt="" width="16" height="16" draggable="false" />`
+              : this.folderGlyphHtml('small', 'crumb');
         return `${sep}<button type="button" class="crumb${current ? ' current' : ''}" data-path-index="${p.index}" ${dropAttr} title="${label}" aria-label="${label}">
           ${icon}
           <span class="crumb-label">${label}</span>
@@ -1224,6 +1268,9 @@ export class FinderWindow extends HTMLElement {
         content.innerHTML = `<div class="icon-grid">${items.map((it) => this.iconHtml(it)).join('')}</div>`;
       } else if (this.view === 'list') {
         const rows = this.buildOutlineRows(this.nodes, 0);
+        if (rows.length === 0 && this.folderOpening) {
+          rows.push({ item: this.listingPlaceholderItem(), depth: 0 });
+        }
         iconItems = rows.map((r) => r.item);
         content.innerHTML = `<table class="list-table">
           <thead><tr>
@@ -1238,13 +1285,6 @@ export class FinderWindow extends HTMLElement {
           .map((it) => this.colItemHtml(it, 0, this.selectedId))
           .join('')}</div></div>`;
       }
-    }
-
-    if (this.folderOpening && this.view !== 'column' && this.nodes.length === 0) {
-      content.insertAdjacentHTML(
-        'beforeend',
-        `<div class="content-loading">${this.spinnerHtml()}<span>Loading</span></div>`,
-      );
     }
 
     if (this.view === 'column') {
@@ -1336,13 +1376,23 @@ export class FinderWindow extends HTMLElement {
       rows.push({ item, depth });
       if (n.isDir && this.expandedIds.has(n.id)) {
         const kids = this.listChildCache.get(n.id) ?? [];
-        rows.push(...this.buildOutlineRows(kids, depth + 1));
+        if (kids.length === 0 && this.loadingIds.has(n.id)) {
+          rows.push({ item: this.listingPlaceholderItem(), depth: depth + 1 });
+        } else {
+          rows.push(...this.buildOutlineRows(kids, depth + 1));
+        }
       }
     }
     return rows;
   }
 
   private iconHtml(it: ListItem): string {
+    if (it.placeholder) {
+      return `<div class="icon-item icon-item--listing" aria-busy="true" aria-label="Loading">
+      ${this.listingSpinnerHtml('icon')}
+      <div class="icon-name"><span class="item-label">Loading…</span></div>
+    </div>`;
+    }
     const sel = this.selectedId != null && it.key === String(this.selectedId) ? 'selected' : '';
     const drag = 'draggable="true"';
     return `<div class="icon-item ${sel}" data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" ${drag}>
@@ -1352,6 +1402,13 @@ export class FinderWindow extends HTMLElement {
   }
 
   private listRowHtml(it: ListItem, depth = 0): string {
+    if (it.placeholder) {
+      return `<tr class="listing-placeholder" aria-busy="true" aria-label="Loading" style="--depth:${depth}">
+      <td class="name-cell"><span class="disclose spacer"></span>${this.listingSpinnerHtml('row')}<span class="row-name item-label">Loading…</span></td>
+      <td></td>
+      <td></td>
+    </tr>`;
+    }
     const sel = this.selectedId != null && it.key === String(this.selectedId) ? 'selected' : '';
     const id = Number(it.key);
     const expanded = it.isDir && this.expandedIds.has(id);
@@ -1360,7 +1417,7 @@ export class FinderWindow extends HTMLElement {
     const disclose = it.isDir
       ? `<button type="button" class="disclose ${expanded ? 'open' : ''}${loading ? ' loading' : ''}" data-disclose="${it.key}" aria-busy="${loading}" aria-label="${
           loading ? 'Loading' : expanded ? 'Collapse' : 'Expand'
-        }">${loading ? this.spinnerHtml('disclose-spinner') : uiIcons.disclose}</button>`
+        }">${uiIcons.disclose}</button>`
       : `<span class="disclose spacer"></span>`;
     return `<tr data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" class="${sel}" style="--depth:${depth}" aria-label="${this.escape(it.name)}" ${drag}>
       <td class="name-cell">${disclose}${this.glyphHtml(it, 'small', 'row')}${this.nameLabelHtml(it)}</td>
@@ -1370,6 +1427,11 @@ export class FinderWindow extends HTMLElement {
   }
 
   private colItemHtml(it: ListItem, colIndex: number, selectedInColumn: number | null): string {
+    if (it.placeholder) {
+      return `<div class="col-item col-item--listing" aria-busy="true" aria-label="Loading">
+      ${this.listingSpinnerHtml('col')}<span class="col-name item-label">Loading…</span>
+    </div>`;
+    }
     const sel = selectedInColumn != null && it.key === String(selectedInColumn) ? 'selected' : '';
     const drag = 'draggable="true"';
     const label = this.nameLabelHtml(it, 'col-name');
@@ -1393,7 +1455,26 @@ export class FinderWindow extends HTMLElement {
     return `<span class="${cls}" aria-hidden="true">${svg}</span>`;
   }
 
+  private listingSpinnerHtml(kind: 'icon' | 'row' | 'col' | 'crumb' | 'preview'): string {
+    const cls =
+      kind === 'icon'
+        ? 'icon-glyph-spinner'
+        : kind === 'col'
+          ? 'col-icon-spinner'
+          : kind === 'row'
+            ? 'row-icon-spinner'
+            : kind === 'crumb'
+              ? 'crumb-icon-spinner'
+              : 'preview-glyph-spinner';
+    return this.spinnerHtml(cls);
+  }
+
   private glyphHtml(it: ListItem, size: 'small' | 'large', kind: 'icon' | 'row' | 'col'): string {
+    if (it.placeholder) return this.listingSpinnerHtml(kind);
+    const id = Number(it.key);
+    if (it.isDir && Number.isFinite(id) && this.isFolderEnumerating(id)) {
+      return this.listingSpinnerHtml(kind);
+    }
     const urls = this.iconUrls.get(it.key);
     const px = size === 'large' ? 32 : 16;
     if (urls && !(it.isDir && isDefaultFolderIcon(urls))) {
@@ -1426,7 +1507,7 @@ export class FinderWindow extends HTMLElement {
       let changed = false;
       await Promise.all(
         items.map(async (it) => {
-          if (this.iconUrls.has(it.key)) return;
+          if (it.placeholder || this.iconUrls.has(it.key)) return;
           try {
             let urls: IconUrls;
             if (it.node) {
@@ -1455,6 +1536,8 @@ export class FinderWindow extends HTMLElement {
   }
 
   private patchIconInDom(key: string, urls: IconUrls): void {
+    const id = Number(key);
+    if (Number.isFinite(id) && this.isFolderEnumerating(id)) return;
     const nodes = this.querySelectorAll(`[data-id="${key}"], [data-path-id="${key}"]`);
     for (const el of nodes) {
       const large = el.querySelector('.icon-glyph, .icon-glyph-img, .icon-glyph-svg');
@@ -1543,11 +1626,14 @@ export class FinderWindow extends HTMLElement {
     const glyphClass = node.isDir ? 'folder' : 'file';
     const urls = this.iconUrls.get(String(node.id));
     const custom = urls && !isDefaultFolderIcon(urls);
-    const glyph = custom
-      ? `<img class="preview-glyph-img" src="${this.escape(urls.large)}" alt="" width="32" height="32" draggable="false" />`
-      : node.isDir
-        ? this.folderGlyphHtml('large', 'preview')
-        : `<div class="preview-glyph ${glyphClass}"></div>`;
+    const glyph =
+      node.isDir && this.isFolderEnumerating(node.id)
+        ? this.listingSpinnerHtml('preview')
+        : custom
+          ? `<img class="preview-glyph-img" src="${this.escape(urls.large)}" alt="" width="32" height="32" draggable="false" />`
+          : node.isDir
+            ? this.folderGlyphHtml('large', 'preview')
+            : `<div class="preview-glyph ${glyphClass}"></div>`;
     const closeBtn =
       opts.variant === 'dialog'
         ? `<button type="button" class="btn item-info-close" data-act="close-props">Close</button>`
@@ -1737,6 +1823,9 @@ export class FinderWindow extends HTMLElement {
 
   private renderColumnView(): string {
     if (this.columnChildren.length === 0) {
+      if (this.columnLoading || this.enumeratingFolderId != null) {
+        return `<div class="column-view">${this.columnLoadingHtml(0)}</div>`;
+      }
       return `<div class="column-view">${this.columnHtml(0, `<div class="empty">Drop files or folders here</div>`)}</div>`;
     }
     const listColCount = this.columnChildren.length;
@@ -1772,11 +1861,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   private columnLoadingHtml(colIndex: number): string {
-    return this.columnHtml(
-      colIndex,
-      `<div class="column-loading">${this.spinnerHtml()}<span>Loading</span></div>`,
-      'column--loading',
-    );
+    return this.columnHtml(colIndex, this.colItemHtml(this.listingPlaceholderItem(), colIndex, null), 'column--loading');
   }
 
   private nextFolderLoad(id: number): number {
@@ -1980,6 +2065,7 @@ export class FinderWindow extends HTMLElement {
     const signal = this.beginNavListing();
     this.columnLoadGen++;
     const gen = this.columnLoadGen;
+    this.enumeratingFolderId = folderId;
     this.columnLoading = true;
     this.renderPath();
     this.renderContent();
@@ -2008,7 +2094,10 @@ export class FinderWindow extends HTMLElement {
       this.pathStack = this.pathStack.slice(0, parentColIndex + 1);
       this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
     } finally {
-      if (gen === this.columnLoadGen) this.columnLoading = false;
+      if (gen === this.columnLoadGen && !signal.aborted) {
+        this.columnLoading = false;
+        if (this.enumeratingFolderId === folderId) this.enumeratingFolderId = null;
+      }
     }
     if (gen !== this.columnLoadGen) return;
     this.renderPath();
@@ -2031,6 +2120,7 @@ export class FinderWindow extends HTMLElement {
       this.setDiscloseState(disclose, 'closed');
       if (row) this.removeListChildRows(row);
       else this.renderContent();
+      this.refreshFolderGlyph(id);
       return;
     }
     this.expandedIds.add(id);
@@ -2050,7 +2140,9 @@ export class FinderWindow extends HTMLElement {
     const gen = this.nextFolderLoad(id);
     this.loadingIds.add(id);
     this.setDiscloseState(disclose, 'loading');
-    if (!row) this.renderContent();
+    this.refreshFolderGlyph(id);
+    if (row) this.insertListingPlaceholderRow(row);
+    else this.renderContent();
     const signal = this.beginExpandListing(id);
     try {
       const kids = await this.streamChildren(
@@ -2058,7 +2150,6 @@ export class FinderWindow extends HTMLElement {
         (partial) => {
           if (!this.folderLoadIsCurrent(id, gen) || !this.expandedIds.has(id)) return;
           this.listChildCache.set(id, partial);
-          this.loadingIds.delete(id);
           const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
           if (live?.parentElement) this.replaceListChildRows(live, partial, id);
           else this.renderContent();
@@ -2077,6 +2168,7 @@ export class FinderWindow extends HTMLElement {
       if (this.folderLoadIsCurrent(id, gen)) this.loadingIds.delete(id);
     }
     if (!this.folderLoadIsCurrent(id, gen)) return;
+    this.refreshFolderGlyph(id);
     const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
     if (live?.parentElement && this.expandedIds.has(id)) {
       this.replaceListChildRows(live, this.listChildCache.get(id) ?? [], id);
@@ -2159,12 +2251,14 @@ export class FinderWindow extends HTMLElement {
     this.syncResourceExplorer();
     this.expandedIds.clear();
     this.folderOpening = true;
+    this.enumeratingFolderId = node.id;
+    this.nodes = [];
     this.renderPath();
     this.renderContent();
     try {
       await this.reload();
     } finally {
-      this.folderOpening = false;
+      if (this.cwd === openedId) this.folderOpening = false;
     }
     if (this.cwd !== openedId) return;
     this.renderPath();
@@ -2588,11 +2682,10 @@ export class FinderWindow extends HTMLElement {
     const gen = this.nextFolderLoad(id);
     this.loadingIds.add(id);
     const disclose = row?.querySelector('[data-disclose]');
-    if (disclose) {
-      this.setDiscloseState(disclose, 'loading');
-    } else {
-      this.renderContent();
-    }
+    if (disclose) this.setDiscloseState(disclose, 'loading');
+    this.refreshFolderGlyph(id);
+    if (row) this.insertListingPlaceholderRow(row);
+    else this.renderContent();
     const signal = this.beginExpandListing(id);
     try {
       const kids = await this.streamChildren(
@@ -2600,7 +2693,6 @@ export class FinderWindow extends HTMLElement {
         (partial) => {
           if (!this.folderLoadIsCurrent(id, gen) || !this.expandedIds.has(id)) return;
           this.listChildCache.set(id, partial);
-          this.loadingIds.delete(id);
           const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
           if (live?.parentElement) this.replaceListChildRows(live, partial, id);
           else {
@@ -2613,23 +2705,66 @@ export class FinderWindow extends HTMLElement {
       );
       if (!this.folderLoadIsCurrent(id, gen)) return;
       this.listChildCache.set(id, kids);
-      this.loadingIds.delete(id);
-      const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
-      if (!live?.parentElement) {
-        this.parkDragSource();
-        this.renderContent();
-        this.paintDropTarget(id, false);
-        return;
-      }
-      this.replaceListChildRows(live, kids, id);
     } catch (err) {
       if (!this.folderLoadIsCurrent(id, gen) || isAbortError(err)) return;
       this.expandedIds.delete(id);
-      this.loadingIds.delete(id);
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus(`Couldn’t expand folder: ${msg}`);
-      this.renderContent();
+    } finally {
+      if (this.folderLoadIsCurrent(id, gen)) this.loadingIds.delete(id);
     }
+    if (!this.folderLoadIsCurrent(id, gen)) return;
+    this.refreshFolderGlyph(id);
+    const live = this.querySelector(`tr[data-id="${id}"]`) as HTMLTableRowElement | null;
+    if (!live?.parentElement) {
+      this.parkDragSource();
+      this.renderContent();
+      this.paintDropTarget(id, false);
+      return;
+    }
+    if (this.expandedIds.has(id)) this.replaceListChildRows(live, this.listChildCache.get(id) ?? [], id);
+    else this.renderContent();
+  }
+
+  private insertListingPlaceholderRow(row: HTMLTableRowElement): void {
+    const depth = Number(String(row.style.getPropertyValue('--depth') || '0'));
+    row.insertAdjacentHTML('afterend', this.listRowHtml(this.listingPlaceholderItem(), depth + 1));
+  }
+
+  private refreshFolderGlyph(id: number): void {
+    const node = this.findNodeAnywhere(id);
+    if (!node?.isDir) {
+      this.renderPath();
+      return;
+    }
+    const item: ListItem = {
+      key: String(id),
+      name: node.name,
+      isDir: true,
+      size: 0,
+      mod: fromMacTime(node.modDate),
+      node,
+      finderInfo: node.finderInfo,
+    };
+    const sel =
+      '.icon-glyph-img, .icon-glyph-svg, .icon-glyph-spinner, .col-icon-img, .col-icon-svg, .col-icon-spinner, .row-icon-img, .row-icon-svg, .row-icon-spinner';
+    for (const el of this.querySelectorAll(`[data-id="${id}"]`)) {
+      const kind = el.classList.contains('icon-item')
+        ? 'icon'
+        : el.classList.contains('col-item')
+          ? 'col'
+          : el.tagName === 'TR'
+            ? 'row'
+            : null;
+      if (!kind) continue;
+      const g = el.querySelector(sel);
+      if (!g) continue;
+      const tmp = document.createElement('div');
+      tmp.innerHTML = this.glyphHtml(item, kind === 'icon' ? 'large' : 'small', kind);
+      const next = tmp.firstElementChild;
+      if (next) g.replaceWith(next);
+    }
+    this.renderPath();
   }
 
   private replaceListChildRows(row: HTMLTableRowElement, kids: VNode[], folderId: number): void {
@@ -2743,7 +2878,9 @@ export class FinderWindow extends HTMLElement {
 
     this.columnLoadGen++;
     const gen = this.columnLoadGen;
+    this.enumeratingFolderId = node.id;
     this.columnLoading = true;
+    this.refreshFolderGlyph(node.id);
     parentCol?.insertAdjacentHTML('afterend', this.columnLoadingHtml(colIndex + 1));
     this.renderPath();
     this.scrollColumnsToEnd();
@@ -2776,6 +2913,11 @@ export class FinderWindow extends HTMLElement {
       this.setStatus(`Couldn’t open folder: ${msg}`);
       this.pathStack = this.pathStack.slice(0, colIndex + 1);
       this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+    } finally {
+      if (gen === this.columnLoadGen && !signal.aborted && this.enumeratingFolderId === node.id) {
+        this.enumeratingFolderId = null;
+        this.refreshFolderGlyph(node.id);
+      }
     }
 
     if (gen !== this.columnLoadGen) return;

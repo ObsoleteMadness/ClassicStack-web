@@ -464,6 +464,12 @@ finder-window {
   display: block;
 }
 
+.pathbar .crumb-icon-spinner {
+  width: 14px;
+  height: 14px;
+  border-width: 1.5px;
+}
+
 .pathbar .crumb-icon.root {
   background: linear-gradient(160deg, #6b8cae, #3d5a73);
 }
@@ -646,6 +652,30 @@ finder-window {
   display: block;
 }
 
+.icon-glyph-spinner {
+  width: 20px;
+  height: 20px;
+  margin: 14px 0;
+  border-width: 2px;
+  display: block;
+}
+
+.icon-item--listing,
+.col-item--listing,
+.list-table tr.listing-placeholder {
+  pointer-events: none;
+  color: var(--text-muted);
+}
+
+.icon-item--listing:hover,
+.col-item--listing:hover {
+  background: transparent;
+}
+
+.list-table tr.listing-placeholder:hover td {
+  background: transparent;
+}
+
 .icon-glyph.folder {
   background: linear-gradient(160deg, #6b8cae, #3d5a73);
   color: #e8f0f8;
@@ -782,6 +812,19 @@ finder-window {
   width: 12px;
   height: 12px;
   border-width: 1.5px;
+}
+
+.list-table .row-icon-spinner,
+.column .col-icon-spinner {
+  width: 14px;
+  height: 14px;
+  border-width: 1.5px;
+}
+
+.preview-glyph-spinner {
+  width: 20px;
+  height: 20px;
+  border-width: 2px;
 }
 
 .list-table .row-icon {
