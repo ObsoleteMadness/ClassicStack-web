@@ -9,6 +9,7 @@ import type { ExtensionEditorDialog } from './extension-editor-dialog';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
 import type { FinderWindow } from './finder-window';
 import type { AboutDialog } from './about-dialog';
+import type { AlertDialog } from './alert-dialog';
 import { iconCache } from '../fs/icon-cache';
 
 type OpenMenu = 'app' | 'advanced' | null;
@@ -22,7 +23,9 @@ export interface AdvancedMenuHost {
   extensionEditor: ExtensionEditorDialog;
   resourceExplorer: ResourceForkExplorer;
   about: AboutDialog;
+  alertDialog?: AlertDialog;
   finder?: FinderWindow;
+  resetEnvironment?(eraseShare: boolean): Promise<void>;
   onCaptureChanged?(capturing: boolean): void;
 }
 
@@ -159,6 +162,11 @@ export class AppMenuBar extends HTMLElement {
               <button type="button" role="menuitem" data-act="clear-icon-cache" class="app-menu__item">
                 <span class="app-menu__check"></span>
                 Clear icon cache
+              </button>
+              <hr />
+              <button type="button" role="menuitem" data-act="reset-environment" class="app-menu__item">
+                <span class="app-menu__check"></span>
+                Reset environment…
               </button>
             </div>
           </div>
@@ -305,7 +313,28 @@ export class AppMenuBar extends HTMLElement {
         this.host?.finder?.invalidateIcons?.();
         log.info('Cleared application icon cache', 'icons');
       })();
+      return;
     }
+
+    if (act === 'reset-environment') {
+      this.closeMenus();
+      void this.resetEnvironment();
+      return;
+    }
+  }
+
+  private async resetEnvironment(): Promise<void> {
+    const host = this.host;
+    if (!host?.alertDialog || !host.resetEnvironment) return;
+    const result = await host.alertDialog.confirm({
+      title: 'Reset environment',
+      text: 'This restores default window positions and preferences, then reloads ClassicStack.',
+      checkboxLabel: 'Erase all Browser Share items',
+      confirmLabel: 'Reset',
+      danger: true,
+    });
+    if (!result.confirmed) return;
+    await host.resetEnvironment(result.checked);
   }
 }
 

@@ -56,3 +56,11 @@ export function savePrefs(patch: Partial<AppPrefs>): AppPrefs {
   }
   return next;
 }
+
+export function clearPrefs(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    /* private mode */
+  }
+}

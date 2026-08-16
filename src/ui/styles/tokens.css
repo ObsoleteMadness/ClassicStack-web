@@ -14,6 +14,7 @@
   --font: 'DM Sans', system-ui, sans-serif;
   --mono: 'IBM Plex Mono', ui-monospace, monospace;
   --shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  --app-menubar-height: 30px;
 }
 
 * {
@@ -51,9 +52,10 @@ body {
 finder-window {
   display: flex;
   flex-direction: column;
-  position: relative;
-  width: min(1100px, 100%);
-  height: min(720px, 100%);
+  position: fixed;
+  z-index: 20;
+  width: min(1100px, calc(100vw - 48px));
+  height: min(720px, calc(100vh - 80px));
   min-width: min(560px, 100%);
   min-height: min(360px, 100%);
   background: var(--bg-elevated);
@@ -62,6 +64,23 @@ finder-window {
   box-shadow: var(--shadow);
   overflow: hidden;
   animation: rise 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+finder-window.is-maximized {
+  left: 0 !important;
+  top: var(--app-menubar-height, 30px) !important;
+  width: 100vw !important;
+  height: calc(100vh - var(--app-menubar-height, 30px)) !important;
+  min-width: 0;
+  min-height: 0;
+  border-radius: 0;
+  border-left: 0;
+  border-right: 0;
+  border-bottom: 0;
+}
+
+finder-window.is-maximized .window-resize-handle {
+  display: none;
 }
 
 @keyframes rise {
@@ -82,6 +101,17 @@ finder-window {
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #2c333b, #262c33);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+finder-window.is-dragging .titlebar {
+  cursor: grabbing;
+}
+
+.titlebar-zoom {
+  flex-shrink: 0;
 }
 
 .brand {
@@ -128,6 +158,16 @@ finder-window {
   background: var(--accent);
   border-color: transparent;
   color: #fff;
+}
+
+.btn.danger {
+  background: var(--danger);
+  border-color: transparent;
+  color: #fff;
+}
+
+.btn.danger:hover {
+  filter: brightness(1.06);
 }
 
 .connect-icon {
@@ -1444,7 +1484,7 @@ finder-window {
   display: flex;
   align-items: center;
   gap: 16px;
-  height: 30px;
+  height: var(--app-menubar-height, 30px);
   padding: 0 12px;
 }
 
@@ -2390,6 +2430,10 @@ netboot-dialog[hidden],
   padding: 12px 16px 14px;
 }
 
+.netboot-dialog__footer .spacer {
+  flex: 1;
+}
+
 /* —— Alert / AFP sessions / About dialogs —— */
 
 alert-dialog,
@@ -2420,6 +2464,21 @@ about-dialog[hidden],
   font-size: 13px;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.alert-dialog__check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 0 16px 4px;
+  font-size: 13px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.alert-dialog__check input {
+  margin-top: 2px;
 }
 
 .about-dialog__card {
@@ -2915,6 +2974,10 @@ html.compact-ui #app {
   max-height: 100dvh;
 }
 
+html.compact-ui {
+  --app-menubar-height: 44px;
+}
+
 html.compact-ui .app-menubar {
   z-index: 90;
   padding-top: env(safe-area-inset-top);
@@ -2925,8 +2988,12 @@ html.compact-ui .app-stage {
 }
 
 html.compact-ui finder-window {
-  width: 100%;
-  height: 100%;
+  position: relative;
+  z-index: auto;
+  left: auto !important;
+  top: auto !important;
+  width: 100% !important;
+  height: 100% !important;
   min-width: 0;
   min-height: 0;
   border-radius: 0;

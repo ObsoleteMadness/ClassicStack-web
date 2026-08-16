@@ -313,6 +313,12 @@ async function importWelcomePaths(
   return result;
 }
 
+/** Record the current welcome-pack stamp so a later seed will not re-import. */
+export async function skipWelcomePackSeed(store: WelcomePackStore): Promise<void> {
+  const paths = await fetchWelcomePaths();
+  await store.setMeta(WELCOME_PACK_META_KEY, welcomePackStamp(paths));
+}
+
 /** Import any new welcome-pack files once per bundled file list. */
 export async function seedWelcomePackIfNeeded(
   store: WelcomePackStore,

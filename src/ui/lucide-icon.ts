@@ -10,7 +10,9 @@ import {
   Info,
   LayoutGrid,
   List,
+  Maximize2,
   Menu,
+  Minimize2,
   Plus,
   RefreshCw,
   Scissors,
@@ -56,4 +58,6 @@ export const uiIcons = {
   import: lucideSvg(Upload),
   usb: lucideSvg(Usb),
   disclose: lucideSvg(ChevronRight, 16),
+  maximize: lucideSvg(Maximize2, 14),
+  restore: lucideSvg(Minimize2, 14),
 };

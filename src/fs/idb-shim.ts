@@ -7,6 +7,7 @@ export interface IDBPDatabase {
   getAllFromIndex(store: string, index: string, query?: IDBValidKey): Promise<any[]>;
   objectStoreNames: DOMStringList;
   createObjectStore(name: string, opts?: IDBObjectStoreParameters): IDBObjectStore;
+  close(): void;
 }
 
 type UpgradeFn = (db: IDBDatabase) => void;
@@ -42,6 +43,9 @@ function wrap(db: IDBDatabase): IDBPDatabase {
         const idx = s.index(index);
         return reqToPromise(query !== undefined ? idx.getAll(query) : idx.getAll());
       });
+    },
+    close() {
+      db.close();
     },
   };
 }

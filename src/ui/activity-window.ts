@@ -1,7 +1,8 @@
 import type { AfpServer } from '../services/afp-server/server';
 import type { TrafficStats } from '../util/traffic-stats';
 import { formatBytes, formatBytesPerSec } from './format-bytes';
-import { enableWindowMove, enableWindowResize } from './window-resize';
+import { enableWindowMove, enableWindowResize, onWindowGeometryChange } from './window-resize';
+import { defaultActivityFrame, persistWindow, restoreWindow } from './window-layout';
 
 export interface ActivityHost {
   traffic: TrafficStats;
@@ -33,7 +34,8 @@ export class ActivityWindow extends HTMLElement {
     enableWindowMove(this, '.activity-window__chrome');
     this.addEventListener('click', (e) => this.onClick(e));
     window.addEventListener('keydown', this.onKey);
-    this.applyDefaultPosition();
+    restoreWindow('activity', this, defaultActivityFrame);
+    onWindowGeometryChange(this, () => persistWindow('activity', this));
   }
 
   disconnectedCallback(): void {
@@ -50,22 +52,18 @@ export class ActivityWindow extends HTMLElement {
     this.hidden = false;
     this.refresh();
     this.startTimer();
+    persistWindow('activity', this);
   }
 
   hide(): void {
     this.hidden = true;
     this.stopTimer();
+    persistWindow('activity', this);
   }
 
   toggle(): void {
     if (this.hidden) this.show();
     else this.hide();
-  }
-
-  private applyDefaultPosition(): void {
-    if (this.style.left || this.style.top) return;
-    this.style.left = '56px';
-    this.style.top = '72px';
   }
 
   private onKey = (e: KeyboardEvent): void => {

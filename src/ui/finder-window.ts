@@ -30,7 +30,14 @@ import { loadPrefs, savePrefs } from '../util/prefs';
 import { log } from '../util/logger';
 import { isAbortError, throwIfAborted } from '../util/abort';
 import { uiIcons } from './lucide-icon';
-import { enableWindowResize } from './window-resize';
+import { enableWindowMove, enableWindowResize, onWindowGeometryChange } from './window-resize';
+import {
+  applyWindowFrame,
+  defaultFinderFrame,
+  loadWindowLayouts,
+  persistWindow,
+  restoreWindow,
+} from './window-layout';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
 import { isCompactUi, onLayoutModeChange } from './layout-mode';
 import { positionCallout } from './callout';
@@ -243,6 +250,7 @@ export class FinderWindow extends HTMLElement {
   private transferBtnVisible = false;
   private writeSig = '';
   private resourceExplorer: ResourceForkExplorer | null = null;
+  private finderLayoutReady = false;
 
   bindResourceExplorer(panel: ResourceForkExplorer): void {
     this.resourceExplorer = panel;
@@ -496,12 +504,15 @@ export class FinderWindow extends HTMLElement {
     item: { name: string; isDir: boolean; bytesTotal: number },
     dest: Catalog = this.vfs,
     destParent?: number,
+    overlayItem = destParent != null,
   ): ImportItemTrack & {
     onBytes: (n: number) => void;
     onDone: (err?: Error) => void;
   } {
     const id = this.startTransfer(item.name, item.isDir, item.bytesTotal);
-    if (destParent != null) transferActivity.setDest(id, dest, destParent, item.name);
+    if (overlayItem && destParent != null) {
+      transferActivity.setDest(id, dest, destParent, item.name, item.isDir ? 'folder' : 'file');
+    }
     const queuedByPath = new Map<string, string>();
     const bind = (jobId: string): ImportItemTrack & {
       onBytes: (n: number) => void;
@@ -530,6 +541,13 @@ export class FinderWindow extends HTMLElement {
           /* dest may already be gone */
         }
       },
+      onWrite: (parentId, name) => {
+        transferActivity.setDest(jobId, dest, parentId, name, 'file');
+        transferActivity.watchPartial(jobId, dest, parentId, name);
+      },
+      onDir: (parentId, name) => {
+        transferActivity.addDest(id, dest, parentId, name, 'folder');
+      },
     });
     return {
       ...bind(id),
@@ -538,6 +556,19 @@ export class FinderWindow extends HTMLElement {
       },
       onExpandBegin: (bytesTotal, files) => {
         transferActivity.setBytes(id, 0, bytesTotal, 'Expanding');
+        if (destParent != null) {
+          transferActivity.clearDest(id);
+          const tops = new Map<string, 'file' | 'folder'>();
+          for (const f of files) {
+            const slash = f.path.indexOf('/');
+            const top = slash < 0 ? f.path : f.path.slice(0, slash);
+            if (slash >= 0) tops.set(top, 'folder');
+            else if (!tops.has(top)) tops.set(top, 'file');
+          }
+          for (const [name, kind] of tops) {
+            if (kind === 'folder') transferActivity.addDest(id, dest, destParent, name, 'folder');
+          }
+        }
         const childIds = transferActivity.startMany(
           files.map((f) => ({
             name: f.path,
@@ -553,6 +584,9 @@ export class FinderWindow extends HTMLElement {
           const f = files[i]!;
           const childId = childIds[i]!;
           queuedByPath.set(f.path, childId);
+          if (destParent != null && !f.path.includes('/')) {
+            transferActivity.setDest(childId, dest, destParent, f.name, 'file');
+          }
           if (!f.finderInfo || f.finderInfo.length < 8) continue;
           const { type, creator } = readTypeCreator(f.finderInfo);
           void iconCache.getForTypeCreator(type, creator).then((urls) => {
@@ -1138,6 +1172,7 @@ export class FinderWindow extends HTMLElement {
         <div class="brand">ClassicStack</div>
         <div class="spacer"></div>
         <span class="node-label" style="font-size:12px;color:var(--text-muted)">${this.escape(this.host.nodeLabel())}</span>
+        <button type="button" class="btn icon-btn titlebar-zoom" data-act="zoom" aria-label="${this.classList.contains('is-maximized') ? 'Restore' : 'Maximize'}" title="${this.classList.contains('is-maximized') ? 'Restore' : 'Maximize'}">${this.classList.contains('is-maximized') ? uiIcons.restore : uiIcons.maximize}</button>
       </div>
       <div class="toolbar">
         <button type="button" class="btn primary" data-act="connect" aria-label="${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}" title="${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}">
@@ -1201,6 +1236,56 @@ export class FinderWindow extends HTMLElement {
     this.bindToolbarExtras();
     this.syncTransferButton();
     enableWindowResize(this, { minWidth: 560, minHeight: 360 });
+    this.ensureFinderLayout();
+  }
+
+  private ensureFinderLayout(): void {
+    enableWindowMove(this, '.titlebar');
+    if (this.finderLayoutReady) return;
+    this.finderLayoutReady = true;
+    onWindowGeometryChange(this, () => this.persistFinderLayout());
+    this.restoreFinderLayout();
+  }
+
+  private persistFinderLayout(): void {
+    if (isCompactUi()) return;
+    persistWindow('finder', this);
+  }
+
+  private restoreFinderLayout(): void {
+    if (isCompactUi()) {
+      this.style.left = '';
+      this.style.top = '';
+      this.style.width = '';
+      this.style.height = '';
+      this.classList.remove('is-maximized');
+      return;
+    }
+    restoreWindow('finder', this, defaultFinderFrame);
+  }
+
+  private toggleMaximized(): void {
+    if (isCompactUi()) return;
+    if (this.classList.contains('is-maximized')) {
+      const saved = loadWindowLayouts().finder ?? defaultFinderFrame();
+      applyWindowFrame(this, { ...saved, maximized: false });
+      persistWindow('finder', this);
+      this.syncZoomButton();
+      return;
+    }
+    persistWindow('finder', this);
+    this.classList.add('is-maximized');
+    persistWindow('finder', this);
+    this.syncZoomButton();
+  }
+
+  private syncZoomButton(): void {
+    const btn = this.querySelector('[data-act="zoom"]') as HTMLButtonElement | null;
+    if (!btn) return;
+    const max = this.classList.contains('is-maximized');
+    btn.setAttribute('aria-label', max ? 'Restore' : 'Maximize');
+    btn.title = max ? 'Restore' : 'Maximize';
+    btn.innerHTML = max ? uiIcons.restore : uiIcons.maximize;
   }
 
   private syncClipboardButtons(): void {
@@ -1608,7 +1693,7 @@ export class FinderWindow extends HTMLElement {
     const loading = it.isDir && Number.isFinite(id) && this.loadingIds.has(id);
     const drag = it.writing && !it.node ? '' : 'draggable="true"';
     const write = this.writeItemAttrs(it);
-    const disclose = it.isDir
+    const disclose = it.isDir && it.node
       ? `<button type="button" class="disclose ${expanded ? 'open' : ''}${loading ? ' loading' : ''}" data-disclose="${it.key}" aria-busy="${loading}" aria-label="${
           loading ? 'Loading' : expanded ? 'Collapse' : 'Expand'
         }">${uiIcons.disclose}</button>`
@@ -2574,6 +2659,12 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async onDblClick(e: MouseEvent): Promise<void> {
+    const t = e.target as HTMLElement;
+    if (t.closest('.titlebar') && !t.closest('button, select, label, input, a')) {
+      e.preventDefault();
+      this.toggleMaximized();
+      return;
+    }
     const item = this.itemFromEvent(e);
     if (!item || !this.querySelector('.content')?.contains(item)) return;
     if (item.getAttribute('data-dir') !== '1') return;
@@ -3567,6 +3658,9 @@ export class FinderWindow extends HTMLElement {
       case 'import':
         this.querySelector<HTMLInputElement>('[data-import-files]')?.click();
         break;
+      case 'zoom':
+        this.toggleMaximized();
+        break;
       case 'expand':
         await this.expandArchive();
         break;
@@ -3889,7 +3983,7 @@ export class FinderWindow extends HTMLElement {
       this.setStatus(`Couldn’t expand “${node.name}”`);
     };
     const bytesTotal = nodeByteSize(node);
-    const track = this.trackImportItem({ name: node.name, isDir: false, bytesTotal });
+    const track = this.trackImportItem({ name: node.name, isDir: false, bytesTotal }, this.vfs, node.parentId, false);
     this.setStatus(`Expanding “${node.name}”…`, { busy: true });
     try {
       const inPlace = await expandSitInPlace(this.vfs, node, {
@@ -4224,6 +4318,7 @@ export class FinderWindow extends HTMLElement {
     const compact = isCompactUi();
     if (compact) {
       if (this.desktopView == null) this.desktopView = this.view;
+      this.restoreFinderLayout();
       if (this.view !== 'icon') {
         void this.setView('icon', true);
         return;
@@ -4231,6 +4326,7 @@ export class FinderWindow extends HTMLElement {
     } else {
       this.sidebarOpen = false;
       this.classList.remove('sidebar-open');
+      this.restoreFinderLayout();
       if (this.desktopView != null) {
         const restore = this.desktopView;
         this.desktopView = null;
@@ -4313,7 +4409,10 @@ export class FinderWindow extends HTMLElement {
   private syncWriteOverlays(): void {
     const sig = this.writingSignature();
     if (sig !== this.writeSig) {
+      const had = this.writeSig;
       this.writeSig = sig;
+      // Keep dest icons until the catalog refresh remounts; don't flash an empty folder.
+      if (!sig && had) return;
       this.renderContent();
       return;
     }

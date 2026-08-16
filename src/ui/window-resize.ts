@@ -15,6 +15,7 @@ let resize: ResizeDrag | null = null;
 let move: MoveDrag | null = null;
 let listening = false;
 let floatZ = 63;
+const geometryListeners = new WeakMap<HTMLElement, () => void>();
 
 function raiseFloatingWindow(el: HTMLElement): void {
   floatZ = Math.min(floatZ + 1, 89);
@@ -49,12 +50,22 @@ function onPointerMove(e: PointerEvent): void {
   move.el.style.top = `${Math.round(top)}px`;
 }
 
+function isLocked(el: HTMLElement): boolean {
+  return el.classList.contains('is-maximized');
+}
+
+function notifyGeometry(el: HTMLElement): void {
+  geometryListeners.get(el)?.();
+}
+
 function onPointerUp(): void {
+  const el = resize?.el ?? move?.el ?? null;
   resize = null;
   if (move) {
     move.el.classList.remove('is-dragging');
     move = null;
   }
+  if (el) notifyGeometry(el);
 }
 
 function ensureListeners(): void {
@@ -77,12 +88,18 @@ export function enableWindowResize(el: HTMLElement, opts: ResizeOpts = {}): void
   el.addEventListener('pointerdown', (e) => {
     const t = e.target as HTMLElement;
     if (!t.closest('.window-resize-handle')) return;
+    if (isLocked(el)) return;
     e.preventDefault();
     e.stopPropagation();
     const r = el.getBoundingClientRect();
     resize = { el, w: r.width, h: r.height, x: e.clientX, y: e.clientY };
     t.setPointerCapture?.(e.pointerId);
   });
+}
+
+/** Persist size/position after a drag or resize finishes. */
+export function onWindowGeometryChange(el: HTMLElement, fn: () => void): void {
+  geometryListeners.set(el, fn);
 }
 
 /** Drag a floating window by its title chrome (ignores buttons and fields). */
@@ -94,6 +111,7 @@ export function enableWindowMove(el: HTMLElement, chromeSelector: string): void 
     raiseFloatingWindow(el);
     const t = e.target as HTMLElement;
     if (t.closest('.window-resize-handle')) return;
+    if (isLocked(el)) return;
     const chrome = t.closest(chromeSelector);
     if (!chrome || !el.contains(chrome)) return;
     if (t.closest('button, select, label, input, a')) return;

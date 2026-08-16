@@ -89,6 +89,7 @@ export interface Catalog {
 }
 
 const ROOT_ID = 2;
+export const SHARE_DB_NAME = 'classicstack-share';
 
 export class VirtualFS implements Catalog {
   private db!: IDBPDatabase;
@@ -150,7 +151,7 @@ export class VirtualFS implements Catalog {
   }
 
   async init(): Promise<void> {
-    this.db = await openDB('classicstack-share', 1, {
+    this.db = await openDB(SHARE_DB_NAME, 1, {
       upgrade(db) {
         if (!db.objectStoreNames.contains('nodes')) {
           const store = db.createObjectStore('nodes', { keyPath: 'id' });
@@ -180,6 +181,21 @@ export class VirtualFS implements Catalog {
     }
     const meta = await this.db.get('meta', 'nextId');
     if (meta) this.nextId = meta.value as number;
+  }
+
+  close(): void {
+    this.db?.close();
+  }
+
+  /** Delete every item in Browser Share, leaving an empty root. */
+  async eraseAllItems(): Promise<void> {
+    const kids = await this.children(ROOT_ID);
+    this.beginBatch();
+    try {
+      for (const k of kids) await this.remove(k.id);
+    } finally {
+      this.endBatch();
+    }
   }
 
   async getMeta(key: string): Promise<unknown> {

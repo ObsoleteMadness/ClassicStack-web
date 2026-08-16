@@ -1,5 +1,6 @@
 import { log, meetsLevel, type LogEntry, type LogLevel } from '../util/logger';
-import { enableWindowMove, enableWindowResize } from './window-resize';
+import { enableWindowMove, enableWindowResize, onWindowGeometryChange } from './window-resize';
+import { defaultLogFrame, persistWindow, restoreWindow } from './window-layout';
 
 const LEVELS: LogLevel[] = ['trace', 'info', 'warn', 'error'];
 
@@ -18,7 +19,8 @@ export class LogPanel extends HTMLElement {
     this.addEventListener('click', (e) => this.onClick(e));
     this.addEventListener('change', (e) => this.onChange(e));
     window.addEventListener('keydown', this.onKey);
-    this.applyDefaultPosition();
+    restoreWindow('log', this, defaultLogFrame);
+    onWindowGeometryChange(this, () => persistWindow('log', this));
   }
 
   disconnectedCallback(): void {
@@ -31,21 +33,17 @@ export class LogPanel extends HTMLElement {
     this.hidden = false;
     this.reload();
     this.scrollToBottom();
+    persistWindow('log', this);
   }
 
   hide(): void {
     this.hidden = true;
+    persistWindow('log', this);
   }
 
   toggle(): void {
     if (this.hidden) this.show();
     else this.hide();
-  }
-
-  private applyDefaultPosition(): void {
-    if (this.style.left || this.style.top) return;
-    this.style.left = '24px';
-    this.style.top = '56px';
   }
 
   private onKey = (e: KeyboardEvent): void => {

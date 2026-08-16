@@ -6,7 +6,8 @@ import { AtpClient } from './services/atp-client';
 import { AfpServer } from './services/afp-server/server';
 import { AfpClient, type AfpCredentials, type AfpServerNotice } from './services/afp-client/client';
 import { VirtualFS } from './fs/virtual-fs';
-import { addWelcomePack, seedWelcomePackIfNeeded } from './fs/welcome-pack';
+import { addWelcomePack, seedWelcomePackIfNeeded, skipWelcomePackSeed } from './fs/welcome-pack';
+import { resetExtensionMap } from './fs/extension-map';
 import { RemoteVfs } from './fs/remote-vfs';
 import { FinderWindow, type FinderHost } from './ui/finder-window';
 import { AppMenuBar } from './ui/app-menubar';
@@ -29,6 +30,9 @@ import {
 import { PcapCapture } from './util/pcap';
 import { TrafficStats } from './util/traffic-stats';
 import { log } from './util/logger';
+import { clearPrefs } from './util/prefs';
+import { iconCache } from './fs/icon-cache';
+import { clearWindowLayouts, loadWindowLayouts } from './ui/window-layout';
 import { startLayoutMode } from './ui/layout-mode';
 import * as asp from './protocol/asp';
 import { assemblePayload, MemoryDisk, NetbootService } from './services/netboot';
@@ -90,21 +94,6 @@ async function main(): Promise<void> {
       badgeRaf = 0;
       menubar.refreshCaptureStatus();
     });
-  });
-
-  menubar.bind({
-    pcap,
-    logPanel,
-    activityWindow,
-    netboot,
-    afpSessions,
-    extensionEditor,
-    resourceExplorer,
-    about,
-    finder,
-    onCaptureChanged() {
-      menubar.refreshCaptureStatus();
-    },
   });
 
   let stack: LocalTalkStack | null = null;
@@ -400,6 +389,48 @@ async function main(): Promise<void> {
       log.info('Ejected AFP server', 'afp');
     },
   };
+
+  menubar.bind({
+    pcap,
+    logPanel,
+    activityWindow,
+    netboot,
+    afpSessions,
+    extensionEditor,
+    resourceExplorer,
+    about,
+    alertDialog,
+    finder,
+    onCaptureChanged() {
+      menubar.refreshCaptureStatus();
+    },
+    async resetEnvironment(eraseShare) {
+      log.info(eraseShare ? 'Resetting environment (including Browser Share)' : 'Resetting environment', 'app');
+      try {
+        await host.disconnectSerial();
+      } catch {
+        /* already disconnected */
+      }
+      clearPrefs();
+      clearWindowLayouts();
+      resetExtensionMap();
+      await iconCache.clear().catch(() => undefined);
+      if (eraseShare) {
+        try {
+          await vfs.eraseAllItems();
+          await skipWelcomePackSeed(vfs);
+        } catch (err) {
+          log.warn(`Failed to erase Browser Share: ${err instanceof Error ? err.message : String(err)}`, 'fs');
+        }
+      }
+      location.reload();
+    },
+  });
+
+  const savedWindows = loadWindowLayouts();
+  if (savedWindows.log?.open) logPanel.show();
+  if (savedWindows.activity?.open) activityWindow.show();
+  if (savedWindows.resource?.open) resourceExplorer.show();
 
   finder.bind(vfs, host);
   finder.bindResourceExplorer(resourceExplorer);

@@ -142,6 +142,14 @@ export function loadExtensionMap(): ExtensionMapping[] {
   }
 }
 
+export function resetExtensionMap(): void {
+  try {
+    localStorage.removeItem(EXTENSION_MAP_STORAGE_KEY);
+  } catch {
+    /* private mode */
+  }
+}
+
 export function saveExtensionMap(rows: readonly ExtensionMapping[]): ExtensionMapping[] {
   const next = normalizeMappings(rows);
   try {

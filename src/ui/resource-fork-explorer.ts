@@ -21,7 +21,8 @@ import {
 import { decodeIcon, SUPPORTED_ICON_TYPES, decodedIconToDataUrl } from '../fs/resource-types/icon-decoder';
 import { readTypeCreator } from '../fs/icon-cache';
 import { formatBytes } from './format-bytes';
-import { enableWindowMove, enableWindowResize } from './window-resize';
+import { enableWindowMove, enableWindowResize, onWindowGeometryChange } from './window-resize';
+import { defaultResourceFrame, persistWindow, restoreWindow } from './window-layout';
 
 const ICON_TYPE_SET = new Set<string>(SUPPORTED_ICON_TYPES);
 const HEX_PREVIEW_BYTES = 512;
@@ -59,6 +60,8 @@ export class ResourceForkExplorer extends HTMLElement {
     enableWindowMove(this, '.rsrc-explorer__chrome');
     this.addEventListener('click', (e) => this.onClick(e));
     window.addEventListener('keydown', this.onKey);
+    restoreWindow('resource', this, defaultResourceFrame);
+    onWindowGeometryChange(this, () => persistWindow('resource', this));
   }
 
   disconnectedCallback(): void {
@@ -67,11 +70,12 @@ export class ResourceForkExplorer extends HTMLElement {
 
   show(): void {
     this.hidden = false;
-    this.reposition();
+    persistWindow('resource', this);
   }
 
   hide(): void {
     this.hidden = true;
+    persistWindow('resource', this);
   }
 
   toggle(): void {
@@ -89,17 +93,6 @@ export class ResourceForkExplorer extends HTMLElement {
   followSelection(catalog: Catalog | null, node: VNode | null): void {
     if (this.hidden) return;
     void this.inspectNode(catalog, node, false);
-  }
-
-  private reposition(): void {
-    if (this.style.left || this.style.top) return;
-    const pad = 16;
-    const w = Math.min(640, window.innerWidth - pad * 2);
-    const h = Math.min(480, window.innerHeight - pad * 2);
-    this.style.width = `${w}px`;
-    this.style.height = `${h}px`;
-    this.style.left = `${Math.max(pad, window.innerWidth - w - pad)}px`;
-    this.style.top = `${Math.max(pad, window.innerHeight - h - pad)}px`;
   }
 
   private onKey = (e: KeyboardEvent): void => {
