@@ -97,6 +97,10 @@ export function clearWindowLayouts(): void {
   }
 }
 
+export function replaceWindowLayouts(all: WindowLayouts): void {
+  persistAll(parseWindowLayouts(all));
+}
+
 export function captureWindowFrame(el: HTMLElement): WindowFrame {
   const r = el.getBoundingClientRect();
   return {

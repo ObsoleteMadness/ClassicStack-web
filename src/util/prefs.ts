@@ -2,7 +2,7 @@
 
 import type { ZipExportStyle } from '../fs/appledouble';
 
-const STORAGE_KEY = 'classicstack.prefs';
+export const PREFS_STORAGE_KEY = 'classicstack.prefs';
 
 export interface AppPrefs {
   /** When false, Finder hides items with the AppleDouble/Finder kIsInvisible flag (and Icon\\r). */
@@ -22,26 +22,31 @@ const DEFAULTS: AppPrefs = {
   zipExportStyle: 'appledouble',
 };
 
+export function parsePrefs(raw: unknown): AppPrefs {
+  if (!raw || typeof raw !== 'object') return { ...DEFAULTS };
+  const parsed = raw as Partial<AppPrefs>;
+  return {
+    showHiddenFiles:
+      typeof parsed.showHiddenFiles === 'boolean'
+        ? parsed.showHiddenFiles
+        : DEFAULTS.showHiddenFiles,
+    readFinderIcons:
+      typeof parsed.readFinderIcons === 'boolean'
+        ? parsed.readFinderIcons
+        : DEFAULTS.readFinderIcons,
+    autoExpandFiles:
+      typeof parsed.autoExpandFiles === 'boolean'
+        ? parsed.autoExpandFiles
+        : DEFAULTS.autoExpandFiles,
+    zipExportStyle: parsed.zipExportStyle === 'macosx' ? 'macosx' : DEFAULTS.zipExportStyle,
+  };
+}
+
 export function loadPrefs(): AppPrefs {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(PREFS_STORAGE_KEY);
     if (!raw) return { ...DEFAULTS };
-    const parsed = JSON.parse(raw) as Partial<AppPrefs>;
-    return {
-      showHiddenFiles:
-        typeof parsed.showHiddenFiles === 'boolean'
-          ? parsed.showHiddenFiles
-          : DEFAULTS.showHiddenFiles,
-      readFinderIcons:
-        typeof parsed.readFinderIcons === 'boolean'
-          ? parsed.readFinderIcons
-          : DEFAULTS.readFinderIcons,
-      autoExpandFiles:
-        typeof parsed.autoExpandFiles === 'boolean'
-          ? parsed.autoExpandFiles
-          : DEFAULTS.autoExpandFiles,
-      zipExportStyle: parsed.zipExportStyle === 'macosx' ? 'macosx' : DEFAULTS.zipExportStyle,
-    };
+    return parsePrefs(JSON.parse(raw) as unknown);
   } catch {
     return { ...DEFAULTS };
   }
@@ -50,16 +55,24 @@ export function loadPrefs(): AppPrefs {
 export function savePrefs(patch: Partial<AppPrefs>): AppPrefs {
   const next = { ...loadPrefs(), ...patch };
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(next));
   } catch {
     /* quota / private mode */
   }
   return next;
 }
 
+export function replacePrefs(prefs: AppPrefs): void {
+  try {
+    localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(parsePrefs(prefs)));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
 export function clearPrefs(): void {
   try {
-    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(PREFS_STORAGE_KEY);
   } catch {
     /* private mode */
   }

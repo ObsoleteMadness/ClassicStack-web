@@ -1,6 +1,7 @@
 import { downloadBytes, type PcapCapture } from '../util/pcap';
 import { log } from '../util/logger';
 import { loadPrefs, savePrefs } from '../util/prefs';
+import { applyPrefsBundle, parsePrefsBundle, stringifyPrefsBundle } from '../util/prefs-bundle';
 import type { LogPanel } from './log-panel';
 import type { ActivityWindow } from './activity-window';
 import type { NetbootDialog } from './netboot-dialog';
@@ -11,6 +12,8 @@ import type { FinderWindow } from './finder-window';
 import type { AboutDialog } from './about-dialog';
 import type { AlertDialog } from './alert-dialog';
 import { iconCache } from '../fs/icon-cache';
+import { persistWindow } from './window-layout';
+import { isCompactUi } from './layout-mode';
 
 type OpenMenu = 'app' | 'advanced' | null;
 
@@ -162,6 +165,15 @@ export class AppMenuBar extends HTMLElement {
               <button type="button" role="menuitem" data-act="clear-icon-cache" class="app-menu__item">
                 <span class="app-menu__check"></span>
                 Clear icon cache
+              </button>
+              <hr />
+              <button type="button" role="menuitem" data-act="export-prefs" class="app-menu__item">
+                <span class="app-menu__check"></span>
+                Export preferences…
+              </button>
+              <button type="button" role="menuitem" data-act="import-prefs" class="app-menu__item">
+                <span class="app-menu__check"></span>
+                Import preferences…
               </button>
               <hr />
               <button type="button" role="menuitem" data-act="reset-environment" class="app-menu__item">
@@ -316,11 +328,66 @@ export class AppMenuBar extends HTMLElement {
       return;
     }
 
+    if (act === 'export-prefs') {
+      this.closeMenus();
+      this.exportPreferences();
+      return;
+    }
+
+    if (act === 'import-prefs') {
+      this.closeMenus();
+      void this.importPreferences();
+      return;
+    }
+
     if (act === 'reset-environment') {
       this.closeMenus();
       void this.resetEnvironment();
       return;
     }
+  }
+
+  private snapshotWindows(): void {
+    const host = this.host;
+    if (!host) return;
+    if (host.finder && !isCompactUi()) persistWindow('finder', host.finder);
+    persistWindow('log', host.logPanel);
+    persistWindow('activity', host.activityWindow);
+    persistWindow('resource', host.resourceExplorer);
+  }
+
+  private exportPreferences(): void {
+    this.snapshotWindows();
+    const json = stringifyPrefsBundle();
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadBytes(new TextEncoder().encode(json), `classicstack-prefs-${stamp}.json`, 'application/json');
+    log.info('Exported preferences', 'app');
+  }
+
+  private async importPreferences(): Promise<void> {
+    const host = this.host;
+    if (!host) return;
+    const file = await pickJsonFile();
+    if (!file) return;
+    let parsed;
+    try {
+      parsed = parsePrefsBundle(JSON.parse(await file.text()) as unknown);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      host.alertDialog?.show('Could not import preferences', msg);
+      return;
+    }
+    const confirm = host.alertDialog
+      ? await host.alertDialog.confirm({
+          title: 'Import preferences',
+          text: 'Replace current preferences, window layout, and extension mappings with this file? ClassicStack will reload.',
+          confirmLabel: 'Import',
+        })
+      : { confirmed: true, checked: false };
+    if (!confirm.confirmed) return;
+    applyPrefsBundle(parsed);
+    log.info(`Imported preferences from “${file.name}”`, 'app');
+    location.reload();
   }
 
   private async resetEnvironment(): Promise<void> {
@@ -336,6 +403,19 @@ export class AppMenuBar extends HTMLElement {
     if (!result.confirmed) return;
     await host.resetEnvironment(result.checked);
   }
+}
+
+function pickJsonFile(): Promise<File | null> {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json,.json';
+    input.addEventListener('change', () => {
+      resolve(input.files?.[0] ?? null);
+    });
+    input.addEventListener('cancel', () => resolve(null));
+    input.click();
+  });
 }
 
 customElements.define('app-menubar', AppMenuBar);
