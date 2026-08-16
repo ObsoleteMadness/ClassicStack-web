@@ -2,17 +2,33 @@
 
 import * as asp from '../protocol/asp';
 import { be16, u32ToI32 } from '../protocol/binary';
-import type { AtpClient } from './atp-client';
+import type { AtpClient, AtpInboundTReq } from './atp-client';
 import { log } from '../util/logger';
 
-let nextWss = 128;
+let nextDyn = 128;
+
+function allocDynSocket(): number {
+  const s = nextDyn++;
+  if (nextDyn > 250) nextDyn = 128;
+  return s;
+}
 
 export class AspSession {
   private atp: AtpClient;
   private destNetwork: number;
   private destNode: number;
   private destSocket: number; // SSS after open, or SLS before
+  /**
+   * Workstation session socket advertised in OpenSess. ClassicStack's AFP client
+   * (`client/asp`) binds WSS only for server-initiated TReqs (Tickle / Attention /
+   * WriteContinue / CloseSession). Command TResps must not land here.
+   */
   private wssSocket: number;
+  /**
+   * Outbound Command/Write/Tickle/OpenSess source socket. ClassicStack's ATP
+   * requester binds an ephemeral socket per Request so replies never mix with WSS.
+   */
+  private cmdSocket: number;
   private sessionId = 0;
   private seq = 0;
   private seqInit = false;
@@ -24,6 +40,8 @@ export class AspSession {
    * System 7 ASP accepts one Command/Write at a time and silently drops any
    * other sequence (ClassicStack errata). Finder icon prefetch used to pipeline
    * Enumerate + GetFileDirParms; the Mac then answered none of them.
+   * ClassicStack's own client does not serialize (csfs is typically single-threaded
+   * per volume); we still must, or a real Mac answers none of the overlapped seqs.
    */
   private cmdTail: Promise<unknown> = Promise.resolve();
   opened = false;
@@ -42,8 +60,8 @@ export class AspSession {
     this.destNetwork = destNetwork;
     this.destNode = destNode;
     this.destSocket = slsSocket;
-    this.wssSocket = nextWss++;
-    if (nextWss > 250) nextWss = 128;
+    this.wssSocket = allocDynSocket();
+    this.cmdSocket = allocDynSocket();
   }
 
   /** ASP GetStatus → FPGetSrvrInfo body (no session). */
@@ -56,7 +74,7 @@ export class AspSession {
       destNetwork: this.destNetwork,
       destNode: this.destNode,
       destSocket: this.destSocket,
-      srcSocket: this.wssSocket,
+      srcSocket: this.cmdSocket,
       userData: asp.packGetStatus(),
       bitmap: 0xff,
     });
@@ -72,7 +90,7 @@ export class AspSession {
       destNetwork: this.destNetwork,
       destNode: this.destNode,
       destSocket: this.destSocket,
-      srcSocket: this.wssSocket,
+      srcSocket: this.cmdSocket,
       userData: asp.packOpenSess(this.wssSocket),
       xo: false,
       bitmap: 0x01,
@@ -94,7 +112,7 @@ export class AspSession {
           destNetwork: this.destNetwork,
           destNode: this.destNode,
           destSocket: this.destSocket,
-          srcSocket: this.wssSocket,
+          srcSocket: this.cmdSocket,
           userData: asp.packTickle(this.sessionId),
           timeoutMs: 5000,
           retries: 1,
@@ -112,37 +130,45 @@ export class AspSession {
   private ensureWssHandler(): void {
     if (this.wssReady) return;
     this.wssReady = true;
-    this.atp.onTReq(this.wssSocket, async (req) => {
-      const { spFunc, word: seq } = asp.unpackUserData(req.header.userData);
-      switch (spFunc) {
-        case asp.SPFuncWriteContinue: {
-          let data = this.pendingWrites.get(seq) ?? new Uint8Array();
-          const bufSize = req.data.length >= 2 ? be16(req.data, 0) : 0;
-          if (bufSize > 0 && bufSize < data.length) data = data.subarray(0, bufSize);
-          await this.atp.replyTReq(req.dg, req.header, req.header.userData, data);
-          break;
-        }
-        case asp.SPFuncTickle:
-          await this.atp.replyTReq(req.dg, req.header, 0, new Uint8Array());
-          break;
-        case asp.SPFuncAttention: {
-          const { word } = asp.unpackUserData(req.header.userData);
-          // Observed AppleShare: TResp user bytes are four zeros.
-          await this.atp.replyTReq(req.dg, req.header, 0, new Uint8Array());
-          this.onAttention?.(word);
-          break;
-        }
-        case asp.SPFuncCloseSess:
-          await this.atp.replyTReq(req.dg, req.header, 0, new Uint8Array());
-          this.stopTickle();
-          this.opened = false;
-          this.onServerClose?.();
-          break;
-        default:
-          await this.atp.replyTReq(req.dg, req.header, req.header.userData, new Uint8Array());
-          break;
+    this.atp.onTReq(this.wssSocket, (req) => this.handleWssReq(req));
+  }
+
+  private async handleWssReq(req: AtpInboundTReq): Promise<void> {
+    const { spFunc, b1, word } = asp.unpackUserData(req.header.userData);
+    log.trace(`ASP WSS TReq fn=${spFunc} sess=${b1} word=${word}`, 'asp');
+    switch (spFunc) {
+      case asp.SPFuncWriteContinue: {
+        let data = this.pendingWrites.get(word) ?? new Uint8Array();
+        const bufSize = req.data.length >= 2 ? be16(req.data, 0) : 0;
+        if (bufSize > 0 && bufSize < data.length) data = data.subarray(0, bufSize);
+        await this.atp.replyTReq(req.dg, req.header, req.header.userData, data);
+        break;
       }
-    });
+      case asp.SPFuncTickle:
+        // ClassicStack client/asp serveWSS acks Tickle with the request UserData.
+        await this.atp.replyTReq(req.dg, req.header, req.header.userData, new Uint8Array());
+        break;
+      case asp.SPFuncAttention: {
+        // Observed AppleShare: TResp user bytes are four zeros.
+        await this.atp.replyTReq(req.dg, req.header, 0, new Uint8Array());
+        this.onAttention?.(word);
+        break;
+      }
+      case asp.SPFuncCloseSess:
+        await this.atp.replyTReq(req.dg, req.header, 0, new Uint8Array());
+        if (b1 !== this.sessionId) {
+          log.warn(`ASP CloseSess ignored (sess ${b1} != ${this.sessionId})`, 'asp');
+          break;
+        }
+        log.info(`ASP CloseSess from server sess=${this.sessionId}`, 'asp');
+        this.stopTickle();
+        this.opened = false;
+        this.onServerClose?.();
+        break;
+      default:
+        await this.atp.replyTReq(req.dg, req.header, req.header.userData, new Uint8Array());
+        break;
+    }
   }
 
   /**
@@ -175,6 +201,9 @@ export class AspSession {
   ): Promise<{ result: number; data: Uint8Array }> {
     if (!this.opened) throw new Error('ASP session not open');
     return this.enqueueCmd(async () => {
+      // Re-check after waiting in the queue (ClassicStack Command checks stop
+      // at entry; a server CloseSession can land while we were queued).
+      if (!this.opened) throw new Error('ASP session not open');
       const seq = this.nextSeq();
       log.trace(
         `ASP Command sess=${this.sessionId} seq=${seq} ${block.length}b`,
@@ -184,7 +213,7 @@ export class AspSession {
         destNetwork: this.destNetwork,
         destNode: this.destNode,
         destSocket: this.destSocket,
-        srcSocket: this.wssSocket,
+        srcSocket: this.cmdSocket,
         userData: asp.packCommand(this.sessionId, seq),
         data: block,
         xo: true,
@@ -205,6 +234,7 @@ export class AspSession {
     if (!this.opened) throw new Error('ASP session not open');
     this.ensureWssHandler();
     return this.enqueueCmd(async () => {
+      if (!this.opened) throw new Error('ASP session not open');
       const seq = this.nextSeq();
       this.pendingWrites.set(seq, writeData);
       try {
@@ -212,7 +242,7 @@ export class AspSession {
           destNetwork: this.destNetwork,
           destNode: this.destNode,
           destSocket: this.destSocket,
-          srcSocket: this.wssSocket,
+          srcSocket: this.cmdSocket,
           userData: asp.packWrite(this.sessionId, seq),
           data: cmdBlock,
           xo: true,
@@ -239,7 +269,7 @@ export class AspSession {
         destNetwork: this.destNetwork,
         destNode: this.destNode,
         destSocket: this.destSocket,
-        srcSocket: this.wssSocket,
+        srcSocket: this.cmdSocket,
         userData: asp.packClose(this.sessionId),
         timeoutMs: 3000,
         retries: 1,
