@@ -1,15 +1,8 @@
 import { log } from '../util/logger';
+import type { CredentialPromptOptions, Credentials } from './finder-host';
 
-export type LoginCredentials =
-  | { kind: 'guest' }
-  | { kind: 'password'; username: string; password: string };
-
-export interface LoginPromptOptions {
-  serverName: string;
-  uams: string[];
-  error?: string;
-  allowGuest: boolean;
-}
+export type LoginCredentials = Credentials;
+export type LoginPromptOptions = CredentialPromptOptions;
 
 /** Modal AFP login (guest or username/password). */
 export class LoginDialog extends HTMLElement {

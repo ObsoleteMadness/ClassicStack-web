@@ -4,12 +4,12 @@ import { LocalTalkStack } from './net/stack';
 import { NbpService, type LookupResult } from './services/nbp';
 import { AtpClient } from './services/atp-client';
 import { AfpServer } from './services/afp-server/server';
-import { AfpClient, type AfpCredentials, type AfpServerNotice } from './services/afp-client/client';
+import { AfpClient, type AfpServerNotice } from './services/afp-client/client';
 import { VirtualFS } from './fs/virtual-fs';
 import { addWelcomePack, seedWelcomePackIfNeeded, skipWelcomePackSeed } from './fs/welcome-pack';
 import { resetExtensionMap } from './fs/extension-map';
 import { RemoteVfs } from './fs/remote-vfs';
-import { FinderWindow, type FinderHost } from './ui/finder-window';
+import { FinderWindow, type FinderHost, type RemoteEndpoint } from './ui/finder-window';
 import { AppMenuBar } from './ui/app-menubar';
 import { LogPanel } from './ui/log-panel';
 import { ActivityWindow } from './ui/activity-window';
@@ -194,6 +194,15 @@ async function main(): Promise<void> {
     void applyNetboot(state);
   });
 
+  function toEndpoint(s: LookupResult): RemoteEndpoint {
+    return {
+      id: s.object,
+      kind: 'afp',
+      title: s.object,
+      subtitle: s.zone && s.zone !== '*' ? s.zone : `${s.network}.${s.node}`,
+    };
+  }
+
   function afpServerKey(s: LookupResult): string {
     return `${s.object}\0${s.network}.${s.node}:${s.socket}`;
   }
@@ -228,7 +237,7 @@ async function main(): Promise<void> {
       const key = afpServerListKey(list);
       const changed = key !== prevKey;
       lastAfpScanKey = key;
-      finder.setServers(list);
+      finder.setServers(list.map(toEndpoint));
       if (kind === 'manual' || !prevKey || changed) {
         log.info(`NBP found ${list.length} AFPServer(s)`, 'nbp');
       }
@@ -267,19 +276,9 @@ async function main(): Promise<void> {
       stack && stack.node
         ? `node ${stack.node.toString(16).padStart(2, '0').toUpperCase()} net ${stack.network}`
         : '',
+    localTitle: () => 'Browser Share',
 
-    remoteMeta: () =>
-      remote
-        ? {
-            nbpName: remoteNbpName || remote.serverName,
-            serverName: remote.serverName,
-            volumeName: remote.volumeName,
-            volumes: remote.volumes.map((v) => v.name),
-            loggedIn: remote.loggedIn,
-          }
-        : null,
-
-    async connectSerial() {
+    async connectTransport() {
       if (!WebSerialPort.supported()) {
         alertDialog.show('Web Serial is not supported', WEB_SERIAL_HELP);
         throw new Error('Web Serial is not supported');
@@ -300,7 +299,7 @@ async function main(): Promise<void> {
       await stack.startClaim();
     },
 
-    async disconnectSerial() {
+    async disconnectTransport() {
       stopAfpServerScan();
       await remote?.close().catch(() => undefined);
       remote = null;
@@ -318,11 +317,17 @@ async function main(): Promise<void> {
     },
 
     async refreshNetwork() {
-      return scanAfpServers('manual');
+      const list = await scanAfpServers('manual');
+      return list.map(toEndpoint);
     },
 
-    async beginRemote(h: LookupResult) {
+    async beginRemote(ep) {
       if (!atp) throw new Error('not connected');
+      const list = nbp ? await nbp.lookup('=', 'AFPServer') : [];
+      const h =
+        list.find((x) => x.object === ep.id || x.object === ep.title) ??
+        list.find((x) => x.object.toLowerCase() === ep.title.toLowerCase());
+      if (!h) throw new Error(`AFP server “${ep.title}” is not on the network`);
       log.info(`AFP GetStatus/OpenSess ${h.object} (${h.network}.${h.node}:${h.socket || asp.DefaultSLS})`, 'afp');
       await remote?.close().catch(() => undefined);
       remote = await AfpClient.openSession(atp, h.network, h.node, h.socket || asp.DefaultSLS);
@@ -330,18 +335,19 @@ async function main(): Promise<void> {
       attachRemoteNotices(remote);
       return {
         serverName: remote.serverName,
-        versions: remote.versions,
+        volumes: [],
+        allowGuest: remote.uams.some((u) => /no user authent/i.test(u)),
         uams: remote.uams,
       };
     },
 
-    async loginRemote(creds: AfpCredentials) {
+    async loginRemote(creds) {
       if (!remote) throw new Error('no AFP session');
       await remote.login(creds);
       return remote.volumes.map((v) => v.name);
     },
 
-    async openRemoteVolume(name: string) {
+    async openVolume(name: string) {
       if (!remote) throw new Error('not logged in');
       const volId = await remote.openVolume(name);
       log.info(`Mounted remote ${remote.serverName || remoteNbpName}:${name} (vol ${volId})`, 'afp');
@@ -376,17 +382,6 @@ async function main(): Promise<void> {
       return nameConflictDialog.prompt(opts);
     },
 
-    async findServer(nbpName: string) {
-      if (!nbp) return null;
-      let list = await nbp.lookup(nbpName, 'AFPServer');
-      if (!list.length) list = await nbp.lookup('=', 'AFPServer');
-      const hit =
-        list.find((x) => x.object.toLowerCase() === nbpName.toLowerCase()) ??
-        list.find((x) => x.object.toLowerCase().includes(nbpName.toLowerCase()));
-      if (hit) finder.setServers(list);
-      return hit ?? null;
-    },
-
     async closeRemote() {
       await remote?.close().catch(() => undefined);
       remote = null;
@@ -413,7 +408,7 @@ async function main(): Promise<void> {
     async resetEnvironment(eraseShare) {
       log.info(eraseShare ? 'Resetting environment (including Browser Share)' : 'Resetting environment', 'app');
       try {
-        await host.disconnectSerial();
+        await host.disconnectTransport?.();
       } catch {
         /* already disconnected */
       }

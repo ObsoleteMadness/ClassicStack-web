@@ -4,6 +4,18 @@
   "version": "0.1.0",
   "license": "GPL-3.0",
   "type": "module",
+  "exports": {
+    "./ui/finder": "./src/ui/finder-window.ts",
+    "./ui/finder-host": "./src/ui/finder-host.ts",
+    "./ui/styles": "./src/ui/styles/tokens.css",
+    "./ui/login": "./src/ui/login-dialog.ts",
+    "./ui/alert": "./src/ui/alert-dialog.ts",
+    "./ui/name-conflict": "./src/ui/name-conflict-dialog.ts",
+    "./ui/get-info": "./src/ui/get-info-window.ts",
+    "./ui/resource-explorer": "./src/ui/resource-fork-explorer.ts",
+    "./fs/catalog": "./src/fs/virtual-fs.ts",
+    "./fs/empty-catalog": "./src/fs/empty-catalog.ts"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

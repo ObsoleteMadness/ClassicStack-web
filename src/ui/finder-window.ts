@@ -1,6 +1,11 @@
 import type { Catalog, VNode } from '../fs/virtual-fs';
-import type { LookupResult } from '../services/nbp';
-import type { AfpCredentials, AfpServerInfo } from '../services/afp-client/client';
+import { EmptyCatalog } from '../fs/empty-catalog';
+import type {
+  Credentials,
+  FinderHost,
+  RemoteEndpoint,
+  SessionInfo,
+} from './finder-host';
 import { fromMacTime } from '../protocol/afp/constants';
 import { decodeMacRoman } from '../protocol/macroman';
 import { buildAppleDouble, zipSidecarPath, zipStore, type ZipExportStyle } from '../fs/appledouble';
@@ -53,7 +58,6 @@ import {
   planItemPlacement,
   uniqueCopyName,
   TransferCancelled,
-  type NameConflictChoice,
   type PlacementPlan,
 } from '../fs/name-conflict';
 import { decodePict, pictToSvg } from '../fs/pict/pict';
@@ -65,43 +69,7 @@ export type SortKey = 'name' | 'modified' | 'size';
 /** Finder file types that open in the Quick Look overlay. */
 const PREVIEW_TEXT_MAX_BYTES = 512 * 1024;
 
-export interface FinderHost {
-  connectSerial(): Promise<void>;
-  disconnectSerial(): Promise<void>;
-  refreshNetwork(): Promise<LookupResult[]>;
-  beginRemote(host: LookupResult): Promise<AfpServerInfo>;
-  loginRemote(creds: AfpCredentials): Promise<string[]>;
-  openRemoteVolume(name: string): Promise<Catalog>;
-  findServer(nbpName: string): Promise<LookupResult | null>;
-  promptCredentials(opts: {
-    serverName: string;
-    uams: string[];
-    error?: string;
-    allowGuest: boolean;
-  }): Promise<AfpCredentials | null>;
-  dismissLogin(): void;
-  closeRemote(): Promise<void>;
-  localCatalog(): Catalog;
-  remoteMeta(): {
-    nbpName: string;
-    serverName: string;
-    volumeName: string;
-    volumes: string[];
-    loggedIn: boolean;
-  } | null;
-  isConnected(): boolean;
-  nodeLabel(): string;
-  showAlert(title: string, text: string): void;
-  promptNameConflict(opts: {
-    name: string;
-    isDir: boolean;
-    suggestedName: string;
-  }): Promise<NameConflictChoice>;
-  /** Copy bundled public/welcome files into Browser Share (skips existing names). */
-  installWelcomePack(opts?: WelcomePackProgress): Promise<{ imported: number; skipped: number }>;
-  /** Import new bundled files once per pack list; returns null when already up to date. */
-  seedWelcomePack(opts?: WelcomePackProgress): Promise<{ imported: number; skipped: number } | null>;
-}
+export type { Credentials, FinderHost, RemoteEndpoint, SessionInfo } from './finder-host';
 
 interface ListItem {
   key: string;
@@ -150,7 +118,7 @@ export class FinderWindow extends HTMLElement {
   private columnChildren: VNode[][] = [];
   private selectedId: number | null = null;
   private nodes: VNode[] = [];
-  private servers: LookupResult[] = [];
+  private servers: RemoteEndpoint[] = [];
   private source: 'local' | 'remote' = 'local';
   private status = 'Connect a TashTalk adaptor to begin.';
   private statusBusy = false;
@@ -162,7 +130,7 @@ export class FinderWindow extends HTMLElement {
   private remoteVolumes: string[] = [];
   private remoteBusy = false;
   private remoteNbpName = '';
-  private remoteLookup: LookupResult | null = null;
+  private remoteEndpoint: RemoteEndpoint | null = null;
   private eventsBound = false;
   private dragDepth = 0;
   /** Folder ids expanded in list-view outline. */
@@ -340,16 +308,36 @@ export class FinderWindow extends HTMLElement {
     this.invalidateIcons();
   }
 
-  bind(vfs: Catalog, host: FinderHost): void {
-    this.localVfs = vfs;
-    this.catalogs.set('local', vfs);
-    this.attachCatalog(vfs);
+  bind(vfs: Catalog | null, host: FinderHost): void {
     this.host = host;
+    this.localVfs = vfs ?? host.localCatalog();
+    if (this.localVfs) {
+      this.catalogs.set('local', this.localVfs);
+      this.attachCatalog(this.localVfs);
+    } else {
+      this.attachCatalog(new EmptyCatalog());
+    }
     this.ensureShellEvents();
     void this.bootstrapFromLocation().then(() => {
       this.applyCompactView();
-      void this.runWelcomePack({ seed: true });
+      if (this.hasLocalShare()) void this.runWelcomePack({ seed: true });
+      if (!this.hasTransport()) {
+        this.setStatus('Select a volume in the sidebar to browse.');
+        void this.onRefresh();
+      }
     });
+  }
+
+  private hasLocalShare(): boolean {
+    return this.localVfs != null;
+  }
+
+  private localShareTitle(): string {
+    return this.host?.localTitle?.() || 'Browser Share';
+  }
+
+  private hasTransport(): boolean {
+    return typeof this.host?.connectTransport === 'function';
   }
 
   private attachCatalog(next: Catalog): void {
@@ -397,12 +385,13 @@ export class FinderWindow extends HTMLElement {
   /** Drop a remote mount (server CloseSession / disconnect attention). */
   unmountRemote(status?: string): void {
     const local = this.localVfs ?? this.host?.localCatalog();
-    if (local) this.mountCatalog(local, 'local', 'Browser Share');
+    if (local) this.mountCatalog(local, 'local', this.localShareTitle());
+    else this.attachCatalog(new EmptyCatalog());
     this.remoteOpen = false;
     this.remoteLoggedIn = false;
     this.remoteVolumes = [];
     this.remoteNbpName = '';
-    this.remoteLookup = null;
+    this.remoteEndpoint = null;
     this.dropRemoteCatalogs();
     if (status) this.setStatus(status);
     void this.reload().then(() => {
@@ -660,14 +649,14 @@ export class FinderWindow extends HTMLElement {
     btn.setAttribute('aria-busy', String(busy));
   }
 
-  setServers(list: LookupResult[]): void {
+  setServers(list: RemoteEndpoint[]): void {
     this.servers = list;
     if (
       this.remoteLoggedIn &&
-      this.remoteLookup &&
-      !list.some((s) => s.object === this.remoteLookup!.object && s.node === this.remoteLookup!.node)
+      this.remoteEndpoint &&
+      !list.some((s) => s.id === this.remoteEndpoint!.id)
     ) {
-      this.servers = [this.remoteLookup, ...list];
+      this.servers = [this.remoteEndpoint, ...list];
     }
     this.renderSidebar();
   }
@@ -760,12 +749,12 @@ export class FinderWindow extends HTMLElement {
     vol: string;
     path: string[];
   } {
-    const meta = this.host.remoteMeta();
+    const metaId = this.remoteEndpoint?.id ?? '';
     return {
       view: this.view,
       source: this.source,
-      share: this.source === 'remote' ? this.remoteNbpName || meta?.nbpName || '' : '',
-      vol: this.source === 'remote' ? this.pathStack[0]?.name || meta?.volumeName || '' : '',
+      share: this.source === 'remote' ? this.remoteNbpName || metaId : '',
+      vol: this.source === 'remote' ? this.pathStack[0]?.name || '' : '',
       path: this.pathNamesForUrl(),
     };
   }
@@ -884,7 +873,7 @@ export class FinderWindow extends HTMLElement {
         return;
       }
       this.showLocalShare();
-      this.pathStack = await this.resolvePathNames(state.path, 'Browser Share');
+      this.pathStack = await this.resolvePathNames(state.path, this.localShareTitle());
       this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
       await this.reload();
     } finally {
@@ -896,9 +885,8 @@ export class FinderWindow extends HTMLElement {
   /** True when this Finder session is already logged in to the named AFP server. */
   private remoteServerConnected(share: string): boolean {
     if (!this.remoteLoggedIn || !share) return false;
-    const meta = this.host.remoteMeta();
-    const nbp = this.remoteNbpName || meta?.nbpName || '';
-    return nbp.toLowerCase() === share.toLowerCase() && !!meta?.loggedIn;
+    const id = this.remoteNbpName || this.remoteEndpoint?.id || '';
+    return id.toLowerCase() === share.toLowerCase();
   }
 
   private canonicalVolumeName(vol: string): string | null {
@@ -915,7 +903,8 @@ export class FinderWindow extends HTMLElement {
 
   private showLocalShare(): void {
     const local = this.localVfs ?? this.host.localCatalog();
-    this.mountCatalog(local, 'local', 'Browser Share');
+    if (!local) return;
+    this.mountCatalog(local, 'local', this.localShareTitle());
     this.remoteOpen = false;
   }
 
@@ -923,14 +912,14 @@ export class FinderWindow extends HTMLElement {
     this.showLocalShare();
     this.remoteLoggedIn = false;
     this.remoteVolumes = [];
-    this.remoteLookup = null;
+    this.remoteEndpoint = null;
     this.remoteNbpName = '';
   }
 
   private async resolvePathNames(names: string[], rootName?: string): Promise<{ id: number; name: string }[]> {
     const rootId = this.vfs.rootId();
     const stack: { id: number; name: string }[] = [
-      { id: rootId, name: rootName ?? this.pathStack[0]?.name ?? 'Browser Share' },
+      { id: rootId, name: rootName ?? this.pathStack[0]?.name ?? this.localShareTitle() },
     ];
     let parent = rootId;
     for (const name of names) {
@@ -1231,10 +1220,14 @@ export class FinderWindow extends HTMLElement {
         <button type="button" class="btn icon-btn titlebar-zoom" data-act="zoom" aria-label="${this.classList.contains('is-maximized') ? 'Restore' : 'Maximize'}" title="${this.classList.contains('is-maximized') ? 'Restore' : 'Maximize'}">${this.classList.contains('is-maximized') ? uiIcons.restore : uiIcons.maximize}</button>
       </div>
       <div class="toolbar">
-        <button type="button" class="btn primary" data-act="connect" aria-label="${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}" title="${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}">
+        ${
+          this.hasTransport()
+            ? `<button type="button" class="btn primary" data-act="connect" aria-label="${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}" title="${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}">
           <span class="connect-icon">${uiIcons.usb}</span>
           <span class="connect-label">${this.host.isConnected() ? 'Disconnect' : 'Connect TashTalk'}</span>
-        </button>
+        </button>`
+            : ''
+        }
         <button type="button" class="btn icon-btn" data-act="import" aria-label="Upload" title="Upload">${uiIcons.import}</button>
         <button type="button" class="btn transfer-btn" data-act="transfers" hidden aria-label="File transfers" title="File transfers"></button>
         <button type="button" class="btn icon-btn" data-act="mkdir" aria-label="New Folder" title="New Folder">${uiIcons.mkdir}</button>
@@ -1404,18 +1397,14 @@ export class FinderWindow extends HTMLElement {
   private renderSidebar(): void {
     const side = this.querySelector('.sidebar');
     if (!side) return;
-    const meta = this.host?.remoteMeta?.() ?? null;
-    const connectedName = this.remoteNbpName || meta?.nbpName || '';
-    const volumes = this.remoteVolumes.length ? this.remoteVolumes : (meta?.volumes ?? []);
-    const viewingLocal = this.source === 'local';
+    const connectedId = this.remoteNbpName || this.remoteEndpoint?.id || '';
+    const volumes = this.remoteVolumes;
+    const viewingLocal = this.source === 'local' && this.hasLocalShare();
     const openVol = this.source === 'remote' ? this.pathStack[0]?.name || '' : '';
     const viewingServer = this.source === 'remote' && !this.remoteOpen;
     const servers = this.servers
       .map((s, i) => {
-        const connected =
-          this.remoteLoggedIn &&
-          (s.object === connectedName ||
-            (this.remoteLookup != null && s.node === this.remoteLookup.node && s.socket === this.remoteLookup.socket));
+        const connected = this.remoteLoggedIn && s.id === connectedId;
         const serverSel = viewingServer && connected ? 'selected' : '';
         const kids =
           connected && volumes.length
@@ -1432,26 +1421,33 @@ export class FinderWindow extends HTMLElement {
         const eject = connected
           ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
           : '';
+        const subtitle = s.subtitle ? ` title="${this.escape(s.subtitle)}"` : '';
         return `
-      <div class="side-item ${serverSel}" data-server="${i}">
+      <div class="side-item ${serverSel}" data-server="${i}"${subtitle}>
         <span class="dot"></span>
-        <span class="side-item-label" aria-label="${this.escape(s.object)}">${this.escape(s.object)}</span>
+        <span class="side-item-label" aria-label="${this.escape(s.title)}">${this.escape(s.title)}</span>
         ${eject}
       </div>${kids}`;
       })
       .join('');
-    side.innerHTML = `
-      <div class="side-label">Local</div>
+    const localBlock = this.hasLocalShare()
+      ? `<div class="side-label">Local</div>
       <div class="side-item ${viewingLocal ? 'selected' : ''}" data-local>
         <span class="dot"></span>
-        <span class="side-item-label" aria-label="Browser Share">Browser Share</span>
+        <span class="side-item-label" aria-label="${this.escape(this.localShareTitle())}">${this.escape(this.localShareTitle())}</span>
         <button type="button" class="side-more" data-act="share-actions" aria-label="Share actions" title="Share actions">${uiIcons.more}</button>
-      </div>
+      </div>`
+      : '';
+    const netLabel = this.hasTransport() ? 'LocalTalk' : 'Network';
+    const emptyNet = this.hasTransport() ? 'No AFP servers' : 'No servers';
+    const refreshEnabled = this.host?.isConnected() || !this.hasTransport();
+    side.innerHTML = `
+      ${localBlock}
       <div class="side-label side-label--with-action">
-        <span>LocalTalk</span>
-        <button type="button" class="side-refresh${this.networkScanning ? ' spinning' : ''}" data-act="refresh" aria-label="Refresh network" aria-busy="${this.networkScanning}" ${this.host?.isConnected() ? '' : 'disabled'}>${uiIcons.refresh}</button>
+        <span>${netLabel}</span>
+        <button type="button" class="side-refresh${this.networkScanning ? ' spinning' : ''}" data-act="refresh" aria-label="Refresh network" aria-busy="${this.networkScanning}" ${refreshEnabled ? '' : 'disabled'}>${uiIcons.refresh}</button>
       </div>
-      ${servers || '<div class="side-item"><span class="dot off"></span><span>No AFP servers</span></div>'}
+      ${servers || `<div class="side-item"><span class="dot off"></span><span>${emptyNet}</span></div>`}
     `;
   }
 
@@ -1463,7 +1459,7 @@ export class FinderWindow extends HTMLElement {
       name:
         i === 0 && this.source === 'remote' && this.remoteNbpName
           ? `${this.remoteNbpName}:${p.name}`
-          : p.name || 'Browser Share',
+          : p.name || this.localShareTitle(),
       id: p.id,
       index: i,
     }));
@@ -1535,7 +1531,7 @@ export class FinderWindow extends HTMLElement {
       const items = this.currentItems();
       iconItems = items;
       if (items.length === 0) {
-        content.innerHTML = `<div class="empty">Drop files or folders here, or browse the LocalTalk network.</div>`;
+        content.innerHTML = `<div class="empty">${this.hasTransport() ? 'Drop files or folders here, or browse the LocalTalk network.' : 'Select a volume in the sidebar to browse.'}</div>`;
       } else if (this.view === 'icon') {
         content.innerHTML = `<div class="icon-grid">${items.map((it) => this.iconHtml(it)).join('')}</div>`;
       } else if (this.view === 'list') {
@@ -2524,6 +2520,7 @@ export class FinderWindow extends HTMLElement {
       return;
     }
     if (t.closest('[data-local]')) {
+      if (!this.hasLocalShare()) return;
       this.showLocalShare();
       this.closeSidebar();
       await this.reload();
@@ -2562,7 +2559,7 @@ export class FinderWindow extends HTMLElement {
       const s = this.servers[i];
       if (!s) return;
       if (this.remoteBusy) return;
-      if (this.remoteLoggedIn && this.remoteNbpName === s.object) {
+      if (this.remoteLoggedIn && this.remoteNbpName === s.id) {
         this.renderSidebar();
         return;
       }
@@ -3022,7 +3019,7 @@ export class FinderWindow extends HTMLElement {
     const side = this.querySelector('.sidebar');
     if (!side) return null;
     if (t.closest('[data-local]') && side.contains(t.closest('[data-local]')!)) {
-      return { key: 'local', name: 'Browser Share' };
+      return { key: 'local', name: this.localShareTitle() };
     }
     const volEl = t.closest('[data-vol]') as HTMLElement | null;
     if (!volEl || !side.contains(volEl) || !this.remoteLoggedIn) return null;
@@ -3040,7 +3037,7 @@ export class FinderWindow extends HTMLElement {
     if (!this.remoteLoggedIn || !key.startsWith(prefix)) return null;
     const name = key.slice(prefix.length);
     if (!name) return null;
-    const cat = await this.host.openRemoteVolume(name);
+    const cat = await this.host.openVolume(name);
     this.catalogs.set(key, cat);
     return cat;
   }
@@ -3850,13 +3847,14 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async onConnect(): Promise<void> {
+    if (!this.hasTransport()) return;
     if (this.host.isConnected()) {
-      await this.host.disconnectSerial();
+      await this.host.disconnectTransport?.();
       this.unmountRemote('Disconnected');
       return;
     }
     try {
-      await this.host.connectSerial();
+      await this.host.connectTransport?.();
       this.setStatus('Serial connected — claiming LocalTalk node…');
       this.render();
     } catch (e) {
@@ -3864,68 +3862,72 @@ export class FinderWindow extends HTMLElement {
     }
   }
 
-  private async connectServerWithLogin(s: LookupResult): Promise<boolean> {
+  private async connectServerWithLogin(s: RemoteEndpoint): Promise<boolean> {
     if (this.remoteBusy) return false;
     this.remoteBusy = true;
     try {
-      this.setStatus(`Contacting ${s.object}…`, { busy: true });
-      log.info(
-        `Connecting to AFP “${s.object}” at ${s.network}.${s.node}:${s.socket}`,
-        'afp',
-      );
+      this.setStatus(`Contacting ${s.title}…`, { busy: true });
+      log.info(`Connecting to ${s.kind} “${s.title}” (${s.id})`, s.kind);
       this.remoteLoggedIn = false;
       this.remoteVolumes = [];
       this.remoteOpen = false;
       if (this.source === 'remote') this.showLocalShare();
-      const info = await this.host.beginRemote(s);
+      const info: SessionInfo = await this.host.beginRemote(s);
       this.dropRemoteCatalogs();
-      const allowGuest = info.uams.some((u) => /no user authent/i.test(u));
-      this.setStatus(`Connected to ${info.serverName || s.object} — sign in`);
+      const uams = info.uams ?? [];
+      const skipPrompt = info.allowGuest && uams.length === 0;
+      this.setStatus(`Connected to ${info.serverName || s.title} — sign in`);
       let error: string | undefined;
       for (;;) {
-        const creds = await this.host.promptCredentials({
-          serverName: info.serverName || s.object,
-          uams: info.uams,
-          error,
-          allowGuest,
-        });
+        const creds: Credentials | null = skipPrompt
+          ? { kind: 'guest' }
+          : await this.host.promptCredentials({
+              serverName: info.serverName || s.title,
+              uams,
+              error,
+              allowGuest: info.allowGuest,
+            });
         if (!creds) {
           await this.host.closeRemote().catch(() => undefined);
           this.remoteLoggedIn = false;
           this.remoteVolumes = [];
-          this.remoteLookup = null;
+          this.remoteEndpoint = null;
           this.setStatus('Login cancelled');
           return false;
         }
         try {
           const vols = await this.host.loginRemote(creds);
           this.remoteLoggedIn = true;
-          this.remoteVolumes = vols;
-          this.remoteNbpName = s.object;
-          this.remoteLookup = s;
+          this.remoteVolumes = vols.length ? vols : info.volumes;
+          this.remoteNbpName = s.id;
+          this.remoteEndpoint = s;
           this.remoteOpen = false;
           this.setStatus(
-            `Signed in to ${info.serverName || s.object} — ${vols.length} volume(s)`,
+            `Signed in to ${info.serverName || s.title} — ${this.remoteVolumes.length} volume(s)`,
           );
           log.info(
-            `Authenticated to “${info.serverName || s.object}”; volumes: ${vols.join(', ') || '(none)'}`,
-            'afp',
+            `Authenticated to “${info.serverName || s.title}”; volumes: ${this.remoteVolumes.join(', ') || '(none)'}`,
+            s.kind,
           );
-          this.host.dismissLogin();
+          this.host.dismissLogin?.();
+          if (skipPrompt && this.remoteVolumes.length === 1) {
+            await this.mountRemoteVolume(this.remoteVolumes[0]!);
+          }
           return true;
         } catch (err) {
           error = err instanceof Error ? err.message : String(err);
-          log.error(`AFP login failed: ${error}`, 'afp');
+          log.error(`Login failed: ${error}`, s.kind);
+          if (skipPrompt) throw err;
         }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      log.error(`AFP connect failed: ${msg}`, 'afp');
+      log.error(`Connect failed: ${msg}`, s.kind);
       this.setStatus(`Connect failed: ${msg}`);
       await this.host.closeRemote().catch(() => undefined);
       this.remoteLoggedIn = false;
       this.remoteVolumes = [];
-      this.remoteLookup = null;
+      this.remoteEndpoint = null;
       return false;
     } finally {
       this.remoteBusy = false;
@@ -3948,16 +3950,21 @@ export class FinderWindow extends HTMLElement {
     await this.host.closeRemote().catch(() => undefined);
     this.dropRemoteCatalogs(nbp);
     this.resetToLocalShare();
-    this.setStatus('Disconnected from AFP server');
+    this.setStatus('Disconnected from server');
     await this.reload();
     this.syncHistory();
     this.render();
   }
 
   private async onRefresh(): Promise<void> {
-    this.setStatus('Looking up AFPServer…');
-    const list = await this.host.refreshNetwork();
-    this.setStatus(`Found ${list.length} AFP server(s)`);
+    this.setStatus(this.hasTransport() ? 'Looking up AFPServer…' : 'Looking up servers…');
+    try {
+      const list = await this.host.refreshNetwork();
+      this.setServers(list);
+      this.setStatus(`Found ${list.length} server(s)`);
+    } catch (e) {
+      this.setStatus(`Lookup failed: ${(e as Error).message}`);
+    }
   }
 
   /**
@@ -4071,7 +4078,7 @@ export class FinderWindow extends HTMLElement {
       if (n.id === this.vfs.rootId()) break;
       id = n.parentId;
     }
-    const root = this.pathStack[0] ?? { id: this.vfs.rootId(), name: 'Browser Share' };
+    const root = this.pathStack[0] ?? { id: this.vfs.rootId(), name: this.localShareTitle() };
     const rest = suffix.reverse();
     if (rest[0]?.id === root.id) return rest;
     return [root, ...rest.filter((s) => s.id !== root.id)];
@@ -4902,6 +4909,8 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async runWelcomePack(opts: { seed: boolean }): Promise<void> {
+    if (opts.seed && !this.host.seedWelcomePack) return;
+    if (!opts.seed && !this.host.installWelcomePack) return;
     if (this.welcomePackBusy) {
       if (!opts.seed) this.setStatus('Welcome pack is already adding items');
       return;
@@ -4919,8 +4928,8 @@ export class FinderWindow extends HTMLElement {
     };
     try {
       const result = opts.seed
-        ? await this.host.seedWelcomePack(progress)
-        : await this.host.installWelcomePack(progress);
+        ? await this.host.seedWelcomePack!(progress)
+        : await this.host.installWelcomePack!(progress);
       if (!result) return;
       if (result.imported === 0 && result.skipped === 0) {
         this.setStatus('Welcome pack is empty');
@@ -4945,16 +4954,16 @@ export class FinderWindow extends HTMLElement {
     const root = cat.rootId();
     const kids = await cat.children(root);
     if (!kids.length) {
-      this.setStatus('Browser Share is empty');
+      this.setStatus(`${this.localShareTitle()} is empty`);
       return;
     }
-    if (!confirm('Erase all items in Browser Share? This cannot be undone.')) {
+    if (!confirm(`Erase all items in ${this.localShareTitle()}? This cannot be undone.`)) {
       return;
     }
-    this.setStatus('Erasing Browser Share…', { busy: true });
+    this.setStatus(`Erasing ${this.localShareTitle()}…`, { busy: true });
     if (this.source === 'local') {
       this.cwd = root;
-      this.pathStack = [{ id: root, name: 'Browser Share' }];
+      this.pathStack = [{ id: root, name: this.localShareTitle() }];
       this.selectedId = null;
       this.expandedIds.clear();
       this.loadingIds.clear();
@@ -4987,7 +4996,7 @@ export class FinderWindow extends HTMLElement {
       this.syncHistory();
       this.render();
     }
-    if (!failed) this.setStatus('Erased Browser Share');
+    if (!failed) this.setStatus(`Erased ${this.localShareTitle()}`);
   }
 
   private async pasteDestFromTarget(targetId: number | null): Promise<number> {
