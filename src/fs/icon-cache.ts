@@ -5,7 +5,7 @@
  */
 
 import { openDB, type IDBPDatabase } from './idb-shim';
-import { ResourceFork } from './resource-fork';
+import { ResourceFork, type FinderIconForkOpts } from './resource-fork';
 import { forkBytesFromNode } from './resource-inspect';
 import { parseBndl } from './resource-types/bndl';
 import { decodedIconToDataUrl } from './resource-types/icon-decoder';
