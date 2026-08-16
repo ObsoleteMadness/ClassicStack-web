@@ -789,18 +789,44 @@ export class FinderWindow extends HTMLElement {
   private async reload(): Promise<void> {
     if (!this.vfs) return;
     this.discardPendingVfsRefresh();
-    this.nodes = this.sortNodes(await this.vfs.children(this.cwd));
+    this.nodes = await this.streamChildren(this.cwd, (kids) => {
+      this.nodes = kids;
+      this.listChildCache.set(this.cwd, kids);
+      this.renderContent();
+    });
     this.listChildCache.set(this.cwd, this.nodes);
     for (const id of [...this.expandedIds]) {
-      this.listChildCache.set(id, this.sortNodes(await this.vfs.children(id)));
+      this.listChildCache.set(
+        id,
+        await this.streamChildren(id, (kids) => {
+          this.listChildCache.set(id, kids);
+          if (this.view === 'list') this.renderContent();
+        }),
+      );
     }
-    await this.refreshColumns();
+    await this.refreshColumns(this.cwd);
   }
 
-  private async refreshColumns(): Promise<void> {
+  /**
+   * List a folder, painting `onUpdate` after each AFP enumerate page.
+   * Local catalogs resolve in one shot (onUpdate may still fire once).
+   */
+  private async streamChildren(parentId: number, onUpdate?: (kids: VNode[]) => void): Promise<VNode[]> {
+    return this.sortNodes(
+      await this.vfs.children(parentId, (raw) => {
+        onUpdate?.(this.sortNodes(raw));
+      }),
+    );
+  }
+
+  private async refreshColumns(alreadyListedId?: number): Promise<void> {
     this.columnChildren = [];
     for (const step of this.pathStack) {
-      this.columnChildren.push(this.sortNodes(await this.vfs.children(step.id)));
+      if (step.id === alreadyListedId) {
+        this.columnChildren.push(this.listChildCache.get(step.id) ?? this.nodes);
+        continue;
+      }
+      this.columnChildren.push(await this.streamChildren(step.id));
     }
   }
 
@@ -1110,6 +1136,9 @@ export class FinderWindow extends HTMLElement {
   private renderContent(): void {
     const content = this.querySelector('.content');
     if (!content) return;
+    const keepScroll = this.view !== 'column';
+    const scrollTop = keepScroll ? content.scrollTop : 0;
+    const scrollLeft = keepScroll ? content.scrollLeft : 0;
 
     let iconItems: ListItem[] = [];
 
@@ -1141,7 +1170,7 @@ export class FinderWindow extends HTMLElement {
       }
     }
 
-    if (this.folderOpening && this.view !== 'column') {
+    if (this.folderOpening && this.view !== 'column' && this.nodes.length === 0) {
       content.insertAdjacentHTML(
         'beforeend',
         `<div class="content-loading">${this.spinnerHtml()}<span>Loading</span></div>`,
@@ -1151,6 +1180,8 @@ export class FinderWindow extends HTMLElement {
     if (this.view === 'column') {
       this.scrollColumnsToEnd();
     } else {
+      content.scrollTop = scrollTop;
+      content.scrollLeft = scrollLeft;
       this.refreshPropsPanel();
     }
     this.focusRenameInput();
@@ -1309,25 +1340,17 @@ export class FinderWindow extends HTMLElement {
   }
 
   private iconLookup(node: VNode): Promise<IconUrls> {
-    const probeFolder = node.isDir && this.folderContentsVisible(node.id);
+    // Folders in this view: named lookup of Icon\r (existence), not enumerate.
     return iconCache.getForNode(
       node,
-      probeFolder ? (id, name) => this.vfs.lookup(id, name) : undefined,
+      node.isDir ? (id, name) => this.vfs.lookup(id, name) : undefined,
       (n) => this.vfs.loadIconResources?.(n) ?? Promise.resolve(null),
     );
   }
 
-  /** True when this folder's children are on screen (cwd, column path, or expanded list). */
-  private folderContentsVisible(id: number): boolean {
-    if (id === this.cwd) return true;
-    if (this.expandedIds.has(id)) return true;
-    if (this.view === 'column' && this.pathStack.some((p) => p.id === id)) return true;
-    return false;
-  }
-
   /** Kick off icon resolution for visible items; patches DOM when ready. */
   private prefetchIcons(items: ListItem[]): void {
-    const gen = ++this.iconLoadGen;
+    const gen = this.iconLoadGen;
     void (async () => {
       await iconCache.init();
       let changed = false;

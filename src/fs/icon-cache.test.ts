@@ -148,10 +148,8 @@ describe('iconForkLoadOptions', () => {
 });
 
 describe('IconCache.getForNode', () => {
-  it('does not look up Icon\\r inside a closed folder', async () => {
-    const cache = new IconCache();
-    let probes = 0;
-    const dir: VNode = {
+  function folderNode(): VNode {
+    return {
       id: 4,
       parentId: 2,
       name: 'Folder',
@@ -162,10 +160,26 @@ describe('IconCache.getForNode', () => {
       createDate: 0,
       modDate: 0,
     };
-    await cache.getForNode(dir, undefined, async () => {
+  }
+
+  it('does not look up Icon\\r without a named findChild', async () => {
+    const cache = new IconCache();
+    let probes = 0;
+    await cache.getForNode(folderNode(), undefined, async () => {
       probes += 1;
       return null;
     });
     expect(probes).toBe(0);
+  });
+
+  it('probes Icon\\r by name and does not list the directory', async () => {
+    const cache = new IconCache();
+    const names: string[] = [];
+    const urls = await cache.getForNode(folderNode(), async (_id, name) => {
+      names.push(name);
+      return undefined;
+    });
+    expect(names).toEqual(['Icon\r', 'Icon0x0D']);
+    expect(urls.large).toMatch(/DIR32\.png/);
   });
 });

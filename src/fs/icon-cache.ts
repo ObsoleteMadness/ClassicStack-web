@@ -403,8 +403,8 @@ export class IconCache {
     const hit = this.dirMemory.get(pathKey);
     if (hit) return hit;
 
-    // Only probe Icon\\r / the directory fork when the caller listed this
-    // folder (findChild). Closed folders keep the default glyph until opened.
+    // Named Icon\\r lookup only when the caller supplies findChild (Finder does
+    // this for folders in the current view). Do not enumerate the directory.
     if (!findChild) {
       return (
         this.defaultFolder ?? {
