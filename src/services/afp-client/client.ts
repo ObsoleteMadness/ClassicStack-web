@@ -14,6 +14,12 @@ import { throwIfAborted } from '../../util/abort';
 
 /** Keep OpenFork sessions (and other long AFP tasks) from flooding a classic server. */
 const MAX_PARALLEL_TASKS = 3;
+/**
+ * Enumerate is a separate pool from icon stat/fork work. ASP still runs one
+ * Command/Write at a time; this only stops listing from waiting on a full
+ * OpenFork session or a queue of Icon\\r probes.
+ */
+const MAX_PARALLEL_LISTS = 3;
 
 export type AfpCredentials =
   | { kind: 'guest' }
@@ -57,6 +63,7 @@ export class AfpClient {
   private pendingNotices: AfpServerNotice[] = [];
   private sawShutdown = false;
   private inFlight = 0;
+  private readonly lists = new AsyncSemaphore(MAX_PARALLEL_LISTS);
   private readonly tasks = new AsyncSemaphore(MAX_PARALLEL_TASKS);
 
   private constructor(sess: AspSession) {
@@ -422,7 +429,7 @@ export class AfpClient {
     onBatch?: (batch: cmd.DirEntry[]) => void | Promise<void>,
     signal?: AbortSignal,
   ): Promise<cmd.DirEntry[]> {
-    return this.tasks.run(() => this.listUnlocked(dirId, path, volId, onBatch, signal), signal);
+    return this.lists.run(() => this.listUnlocked(dirId, path, volId, onBatch, signal), signal);
   }
 
   private async listUnlocked(
