@@ -37,6 +37,7 @@ import { clearWindowLayouts, loadWindowLayouts } from './ui/window-layout';
 import { startLayoutMode } from './ui/layout-mode';
 import * as asp from './protocol/asp';
 import { assemblePayload, MemoryDisk, NetbootService } from './services/netboot';
+import { registerPwa } from './pwa';
 
 async function fileBytes(file: File): Promise<Uint8Array> {
   return new Uint8Array(await file.arrayBuffer());
@@ -54,6 +55,7 @@ const WEB_SERIAL_HELP =
 async function main(): Promise<void> {
   log.installConsoleBridge();
   startLayoutMode();
+  registerPwa();
   log.info('ClassicStack starting', 'app');
 
   const app = document.querySelector('#app')!;

@@ -3317,3 +3317,38 @@ html.compact-ui .list-table th {
   }
 }
 
+/* —— PWA update notice —— */
+
+update-banner {
+  position: fixed;
+  z-index: 100;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  padding: 10px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+update-banner[hidden] {
+  display: none;
+}
+
+.update-banner__text {
+  margin: 0;
+  flex: 1 1 220px;
+  font: 500 13px var(--font);
+}
+
+.update-banner__actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+

@@ -15,7 +15,7 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true,
-    "types": ["vite/client", "w3c-web-serial"],
+    "types": ["vite/client", "vite-plugin-pwa/client", "w3c-web-serial"],
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"]
