@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitest/config';
 import { fileURLToPath, URL } from 'node:url';
+import { execSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import type { Plugin } from 'vite';
@@ -8,6 +9,27 @@ import { isWelcomePackSourceFile } from './src/fs/welcome-pack';
 const root = fileURLToPath(new URL('.', import.meta.url));
 const iconsDir = path.join(root, 'icons');
 const welcomeDir = path.join(root, 'public', 'welcome');
+
+const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string };
+
+/** Short SHA of main (CI / origin/main / main), else HEAD. Empty if git is unavailable. */
+function gitCommitShort(): string {
+  const fromCi = process.env.GITHUB_SHA;
+  if (fromCi && /^[0-9a-f]{7,40}$/i.test(fromCi)) return fromCi.slice(0, 7);
+  for (const ref of ['origin/main', 'main', 'HEAD']) {
+    try {
+      const sha = execSync(`git rev-parse ${ref}`, {
+        cwd: root,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      if (/^[0-9a-f]{7,40}$/i.test(sha)) return sha.slice(0, 7);
+    } catch {
+      // try the next ref
+    }
+  }
+  return '';
+}
 
 /** Serve and copy ./icons → /icons for system Finder glyphs. */
 function iconsStaticPlugin(): Plugin {
@@ -87,6 +109,10 @@ function welcomePackPlugin(): Plugin {
 
 export default defineConfig({
   plugins: [iconsStaticPlugin(), welcomePackPlugin()],
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+    __GIT_COMMIT__: JSON.stringify(gitCommitShort()),
+  },
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

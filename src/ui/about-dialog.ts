@@ -2,8 +2,7 @@
 
 import { log } from '../util/logger';
 
-const APP_VERSION = '0.1.0';
-
+const REPO = 'https://github.com/obsoletemadness/classicstack-web';
 const TASH_TALK = 'https://github.com/lampmerchant/tashtalk';
 const TASH_ROUTER = 'https://github.com/lampmerchant/tashrouter';
 const TASHTARI = 'https://github.com/lampmerchant';
@@ -17,6 +16,13 @@ const GPL = 'https://www.gnu.org/licenses/gpl-3.0.html';
 
 function extLink(href: string, label: string): string {
   return `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+}
+
+function appVersionId(): string {
+  const ver = __APP_VERSION__;
+  const sha = __GIT_COMMIT__;
+  if (!sha) return ver;
+  return `${ver} (${extLink(`${REPO}/commit/${sha}`, sha)})`;
 }
 
 /** Modal About box opened from the ClassicStack menu. */
@@ -52,9 +58,9 @@ export class AboutDialog extends HTMLElement {
         </header>
         <div class="about-dialog__body">
           <p class="about-dialog__name">ClassicStack</p>
-          <p class="about-dialog__ver">Version ${APP_VERSION}</p>
+          <p class="about-dialog__ver">Version ${appVersionId()}</p>
           <p>A browser AppleTalk / AFP stack over Web Serial → TashTalk → LocalTalk.</p>
-          <p><a href="https://github.com/obsoletemadness/classicstack-web">GitHub</a></p>
+          <p>${extLink(REPO, 'GitHub')}</p>
           <h3>License</h3>
           <p>
             ClassicStack is free software under the
