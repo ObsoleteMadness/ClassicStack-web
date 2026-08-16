@@ -2107,6 +2107,7 @@ export class FinderWindow extends HTMLElement {
         <input type="text" data-prop="creator" maxlength="4" spellcheck="false" autocomplete="off" value="${this.escape(creator)}" />
         <div class="preview-actions">
           ${expandBtn}
+          <button type="button" class="btn" data-act="download">Download Zip</button>
           <button type="button" class="btn primary" data-act="apply-props">Apply</button>
           <button type="button" class="btn" data-act="resources">Resources…</button>
         </div>
@@ -4837,6 +4838,7 @@ export class FinderWindow extends HTMLElement {
             this.isExpandableArchive(targetNode)
               ? `<button type="button" data-ctx="expand">Expand</button>`
               : '',
+            `<button type="button" data-ctx="download">Download Zip</button>`,
             canPreview ? `<button type="button" data-ctx="preview">Preview…</button>` : '',
             `<button type="button" data-ctx="rename">Rename</button>`,
             `<button type="button" data-ctx="delete">Delete…</button>`,
@@ -4861,6 +4863,10 @@ export class FinderWindow extends HTMLElement {
     switch (action) {
       case 'expand':
         await this.expandArchive(targetId);
+        break;
+      case 'download':
+        if (targetId != null) this.selectedId = targetId;
+        await this.onDownload();
         break;
       case 'preview':
         await this.openPreview(targetId);
