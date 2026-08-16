@@ -9,6 +9,7 @@ import {
   writeFork,
   readFork,
   parseEnumerate,
+  parseSrvrParms,
   setFileDirParms,
   parseServerInfo,
   getSrvrMsg,
@@ -63,6 +64,43 @@ describe('AFP client FPWrite / FPRead headers', () => {
     expect(h.length).toBe(14);
     expect(h[12]).toBe(0);
     expect(h[13]).toBe(0);
+  });
+});
+
+describe('AFP client parseSrvrParms', () => {
+  function packSrvrParms(vols: { flags: number; name: string }[]): Uint8Array {
+    const out: number[] = [0xde, 0xad, 0xbe, 0xef, vols.length];
+    for (const v of vols) {
+      const name = encodeMacRoman(v.name);
+      out.push(v.flags, name.length, ...name);
+    }
+    return new Uint8Array(out);
+  }
+
+  it('packs flags + Pascal names with no padding (ClassicStack golden)', () => {
+    // deadbeef | 2 vols | flags=1 "Macintosh HD" | flags=0 "Public"
+    const hex = 'deadbeef02010c4d6163696e746f736820484400065075626c6963';
+    const b = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    const parsed = parseSrvrParms(b);
+    expect(parsed.volumes.map((v) => v.name)).toEqual(['Macintosh HD', 'Public']);
+    expect(parsed.volumes[0]!.flags).toBe(1);
+    expect(parsed.volumes[1]!.flags).toBe(0);
+  });
+
+  it('keeps the first character of a volume after an even-length name', () => {
+    const parsed = parseSrvrParms(
+      packSrvrParms([
+        { flags: 0, name: 'Public' },
+        { flags: 0, name: 'OpenRetroSCSI 7.5.3' },
+      ]),
+    );
+    expect(parsed.volumes.map((v) => v.name)).toEqual(['Public', 'OpenRetroSCSI 7.5.3']);
+  });
+
+  it('parses a single odd-length volume name', () => {
+    const parsed = parseSrvrParms(packSrvrParms([{ flags: 0, name: 'OpenRetroSCSI 7.5.3' }]));
+    expect(parsed.volumes).toEqual([{ flags: 0, name: 'OpenRetroSCSI 7.5.3' }]);
   });
 });
 

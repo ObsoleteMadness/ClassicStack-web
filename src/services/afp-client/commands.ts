@@ -139,12 +139,16 @@ export function parseSrvrParms(b: Uint8Array): { serverTime: number; volumes: { 
   const count = b[4]!;
   const volumes: { flags: number; name: string }[] = [];
   let o = 5;
-  for (let i = 0; i < count && o < b.length; i++) {
+  // AFP 2.x: each volume is flags(1) + Pascal VolName, packed with no padding
+  // (Inside AppleTalk). Padding here skips the next volume's flags byte, so its
+  // first name character is read as the length — e.g. "OpenRetroSCSI 7.5.3"
+  // becomes "penRetroSCSI 7.5.3" and FPOpenVol fails.
+  for (let i = 0; i < count && o + 2 <= b.length; i++) {
     const flags = b[o++]!;
     const len = b[o++]!;
-    const name = decodeMacRoman(b.subarray(o, o + len));
-    o += len;
-    if ((1 + len) % 2) o++; // pad after odd-length Pascal name
+    const n = Math.min(len, b.length - o);
+    const name = decodeMacRoman(b.subarray(o, o + n));
+    o += n;
     volumes.push({ flags, name });
   }
   return { serverTime, volumes };
