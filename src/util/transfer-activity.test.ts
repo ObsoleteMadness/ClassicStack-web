@@ -65,4 +65,40 @@ describe('transferActivity', () => {
     expect(transferActivity.aggregateProgress().running).toBe(false);
     transferActivity.clearFinished();
   });
+
+  it('resets a parent job so extraction progress replaces archive-read bytes', () => {
+    const parent = transferActivity.start({ name: 'Pack.sit', kind: 'file', bytesTotal: 80 });
+    transferActivity.addBytes(parent, 80);
+    transferActivity.setBytes(parent, 0, 200, 'Expanding');
+    const job = transferActivity.list().find((j) => j.id === parent)!;
+    expect(job.bytesDone).toBe(0);
+    expect(job.bytesTotal).toBe(200);
+    expect(job.detail).toBe('Expanding');
+    expect(job.rate).toBe(0);
+    transferActivity.addBytes(parent, 50);
+    expect(transferActivity.aggregateProgress().pct).toBe(25);
+    transferActivity.finish(parent);
+    transferActivity.clearFinished();
+  });
+
+  it('queues nested extract jobs and begins them later', () => {
+    const parent = transferActivity.start({ name: 'Pack.sit', kind: 'file', bytesTotal: 80 });
+    const [a, b] = transferActivity.startMany([
+      { name: 'A', kind: 'file', bytesTotal: 4, parentId: parent, queued: true },
+      { name: 'Folder/B', kind: 'file', bytesTotal: 5, parentId: parent, queued: true },
+    ]);
+    const jobs = transferActivity.list();
+    expect(jobs.filter((j) => j.parentId === parent).map((j) => j.status)).toEqual(['queued', 'queued']);
+    expect(jobs.find((j) => j.id === a)?.detail).toBe('Queued');
+    expect(transferActivity.hasRunning()).toBe(true);
+    transferActivity.begin(a!, 'Expanding');
+    expect(transferActivity.list().find((j) => j.id === a)?.status).toBe('running');
+    expect(transferActivity.list().find((j) => j.id === b)?.status).toBe('queued');
+    transferActivity.fail(parent, 'stopped');
+    transferActivity.failQueued(parent, 'stopped');
+    expect(transferActivity.list().find((j) => j.id === b)?.status).toBe('error');
+    transferActivity.finish(a!);
+    transferActivity.clearFinished();
+    expect(transferActivity.list().some((j) => j.id === parent)).toBe(false);
+  });
 });

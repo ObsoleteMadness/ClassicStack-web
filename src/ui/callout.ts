@@ -3,7 +3,8 @@
 export function positionCallout(el: HTMLElement, anchor: HTMLElement): void {
   const pad = 8;
   const ar = anchor.getBoundingClientRect();
-  el.style.visibility = 'hidden';
+  const first = !el.style.left;
+  if (first) el.style.visibility = 'hidden';
   el.hidden = false;
   const er = el.getBoundingClientRect();
   let left = ar.left;
@@ -14,5 +15,5 @@ export function positionCallout(el: HTMLElement, anchor: HTMLElement): void {
   if (top < pad) top = pad;
   el.style.left = `${Math.round(left)}px`;
   el.style.top = `${Math.round(top)}px`;
-  el.style.visibility = '';
+  if (first) el.style.visibility = '';
 }

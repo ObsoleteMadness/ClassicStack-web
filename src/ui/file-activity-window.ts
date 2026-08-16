@@ -1,5 +1,5 @@
 import { transferActivity } from '../util/transfer-activity';
-import { transferListHtml } from './transfer-list';
+import { paintTransferList } from './transfer-list';
 
 /**
  * Optional expanded File Transfers surface. The Finder toolbar callout is the
@@ -72,7 +72,7 @@ export class FileActivityWindow extends HTMLElement {
 
   private refresh(): void {
     const root = this.querySelector('[data-role="rows"]');
-    if (root) root.innerHTML = transferListHtml();
+    if (root) paintTransferList(root);
   }
 
   private onClick(e: MouseEvent): void {

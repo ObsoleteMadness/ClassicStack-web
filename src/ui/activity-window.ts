@@ -1,7 +1,7 @@
 import type { AfpServer } from '../services/afp-server/server';
 import type { TrafficStats } from '../util/traffic-stats';
 import { formatBytes, formatBytesPerSec } from './format-bytes';
-import { positionCallout } from './callout';
+import { enableWindowMove, enableWindowResize } from './window-resize';
 
 export interface ActivityHost {
   traffic: TrafficStats;
@@ -21,26 +21,24 @@ function userLabel(userName: string, loggedIn: boolean): string {
   return loggedIn ? 'Guest' : '(connecting)';
 }
 
-/** AFP / LocalTalk activity monitor shown as a callout from Advanced. */
+/** Floating AFP / LocalTalk activity monitor. */
 export class ActivityWindow extends HTMLElement {
   private host: ActivityHost | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private anchor: HTMLElement | null = null;
 
   connectedCallback(): void {
-    this.classList.add('activity-window', 'is-callout');
+    this.classList.add('activity-window');
     this.renderShell();
+    enableWindowResize(this, { minWidth: 320, minHeight: 240 });
+    enableWindowMove(this, '.activity-window__chrome');
     this.addEventListener('click', (e) => this.onClick(e));
-    window.addEventListener('pointerdown', this.onDocPointer, true);
     window.addEventListener('keydown', this.onKey);
-    window.addEventListener('resize', this.onReposition);
+    this.applyDefaultPosition();
   }
 
   disconnectedCallback(): void {
     this.stopTimer();
-    window.removeEventListener('pointerdown', this.onDocPointer, true);
     window.removeEventListener('keydown', this.onKey);
-    window.removeEventListener('resize', this.onReposition);
   }
 
   bind(host: ActivityHost): void {
@@ -49,15 +47,9 @@ export class ActivityWindow extends HTMLElement {
   }
 
   show(): void {
-    this.showCallout(this.anchor);
-  }
-
-  showCallout(anchor: HTMLElement | null): void {
-    this.anchor = anchor;
     this.hidden = false;
     this.refresh();
     this.startTimer();
-    this.reposition();
   }
 
   hide(): void {
@@ -65,25 +57,16 @@ export class ActivityWindow extends HTMLElement {
     this.stopTimer();
   }
 
-  toggleCallout(anchor: HTMLElement | null): void {
-    if (!this.hidden) this.hide();
-    else this.showCallout(anchor);
+  toggle(): void {
+    if (this.hidden) this.show();
+    else this.hide();
   }
 
-  private reposition = (): void => {
-    if (this.hidden || !this.anchor) return;
-    positionCallout(this, this.anchor);
-  };
-
-  private onReposition = (): void => this.reposition();
-
-  private onDocPointer = (e: PointerEvent): void => {
-    if (this.hidden) return;
-    const t = e.target as Node;
-    if (this.contains(t)) return;
-    if (this.anchor?.contains(t)) return;
-    this.hide();
-  };
+  private applyDefaultPosition(): void {
+    if (this.style.left || this.style.top) return;
+    this.style.left = '56px';
+    this.style.top = '72px';
+  }
 
   private onKey = (e: KeyboardEvent): void => {
     if (e.key === 'Escape' && !this.hidden) this.hide();

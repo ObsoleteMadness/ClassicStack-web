@@ -30,7 +30,10 @@ export function isCustomFolderIconName(name: string): boolean {
 const ICON_CACHE_DB = 'classicstack-icon-cache';
 /** Bump when decoded-icon preference or extract rules change so stale BW PNGs are dropped. */
 const ICON_CACHE_DB_VERSION = 3;
-const HAS_CUSTOM_ICON = 0x0400;
+/** Finder FileInfo/DInfo: custom icon (Icon\\r or id -16455). */
+export const HAS_CUSTOM_ICON = 0x0400;
+/** Finder FileInfo: BNDL resources in the file's resource fork. */
+export const HAS_BUNDLE = 0x2000;
 /** Finder FileInfo/DInfo flag: item is invisible (AppleDouble FinderInfo). */
 export const FINDER_IS_INVISIBLE = 0x4000;
 
@@ -82,6 +85,34 @@ const CDEV_STYLE_TYPES = new Set(['cdev', 'INIT', 'rdev', 'adev', 'ddev', 'sdev'
 
 export function isCdevStyleType(type: string): boolean {
   return CDEV_STYLE_TYPES.has(padOsType(type));
+}
+
+/** True when this file's own resource fork (not a type/creator cache) may hold a Finder icon. */
+export function shouldReadIconFork(
+  finderInfo: Uint8Array,
+  type: string,
+  cached?: IconUrls | null,
+): boolean {
+  const flags = finderFlags(finderInfo);
+  if ((flags & HAS_CUSTOM_ICON) !== 0) return true;
+  if (cached) return false;
+  const t = padOsType(type);
+  return (flags & HAS_BUNDLE) !== 0 || t === 'APPL' || isCdevStyleType(t);
+}
+
+/** Ids / extract rules for a ranged AFP resource-fork read. */
+export function iconForkLoadOptions(node: VNode): FinderIconForkOpts {
+  const { type } = readTypeCreator(node.finderInfo);
+  const flags = finderFlags(node.finderInfo);
+  const extraIds: number[] = [];
+  if (isCdevStyleType(type)) extraIds.push(CDEV_ICON_ID);
+  if ((flags & HAS_CUSTOM_ICON) !== 0 || isCustomFolderIconName(node.name)) extraIds.push(CUSTOM_ICON_ID);
+  const fid = finderIconId(node.finderInfo);
+  if (fid) extraIds.push(fid);
+  return {
+    extraIds,
+    includeAllIcons: isCustomFolderIconName(node.name),
+  };
 }
 
 function isSystemIconUrls(urls: IconUrls): boolean {
@@ -204,6 +235,8 @@ export class IconCache {
   private memory = new Map<string, IconUrls>();
   private bundleCache = new Map<string, BundleCacheEntry>();
   private dirMemory = new Map<string, IconUrls>();
+  private typeInflight = new Map<string, Promise<IconUrls>>();
+  private dirInflight = new Map<string, Promise<IconUrls>>();
   private db: IDBPDatabase | null = null;
   private initPromise: Promise<void> | null = null;
   private systemReady: Promise<void> | null = null;
@@ -241,6 +274,8 @@ export class IconCache {
     this.memory.clear();
     this.bundleCache.clear();
     this.dirMemory.clear();
+    this.typeInflight.clear();
+    this.dirInflight.clear();
     await this.init();
     if (!this.db) return;
     await this.clearStore('typeIcons');
@@ -249,6 +284,7 @@ export class IconCache {
   /** Drop cached folder icons (e.g. after VirtualFS mutations / Icon\\r changes). */
   clearDirectoryCache(): void {
     this.dirMemory.clear();
+    this.dirInflight.clear();
   }
 
   private async clearStore(store: string): Promise<void> {
@@ -293,8 +329,36 @@ export class IconCache {
       return this.getForDirectory(String(node.id), node, findChild, loadIconFork);
     }
     const { type, creator } = readTypeCreator(node.finderInfo);
+    const key = cacheKey(creator, type);
+    const cached = this.memory.get(key) ?? (await this.loadPersisted(key));
+    if (cached) this.memory.set(key, cached);
+    const custom = (finderFlags(node.finderInfo) & HAS_CUSTOM_ICON) !== 0;
+    if (cached && !custom) return cached;
+
+    if (!custom) {
+      const pending = this.typeInflight.get(key);
+      if (pending) return pending;
+    }
+
+    const work = this.resolveFileNode(node, type, creator, cached, loadIconFork);
+    if (!custom) {
+      this.typeInflight.set(key, work);
+      void work.finally(() => {
+        if (this.typeInflight.get(key) === work) this.typeInflight.delete(key);
+      });
+    }
+    return work;
+  }
+
+  private async resolveFileNode(
+    node: VNode,
+    type: string,
+    creator: string,
+    cached: IconUrls | null,
+    loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
+  ): Promise<IconUrls> {
     let fork: ResourceFork | null = null;
-    if (node.resource.length < 16 && loadIconFork) {
+    if (node.resource.length < 16 && loadIconFork && shouldReadIconFork(node.finderInfo, type, cached)) {
       try {
         fork = await loadIconFork(node);
       } catch {
@@ -315,6 +379,8 @@ export class IconCache {
   async getForTypeCreator(type: string, creator: string): Promise<IconUrls> {
     await this.ensureDefaults();
     const key = cacheKey(creator, type);
+    const pending = this.typeInflight.get(key);
+    if (pending) return pending;
     const cached = this.memory.get(key) ?? (await this.loadPersisted(key));
     if (cached) {
       this.memory.set(key, cached);
@@ -332,6 +398,36 @@ export class IconCache {
     pathKey: string,
     node: VNode,
     findChild?: (parentId: number, name: string) => Promise<VNode | undefined>,
+    loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
+  ): Promise<IconUrls> {
+    const hit = this.dirMemory.get(pathKey);
+    if (hit) return hit;
+
+    // Only probe Icon\\r / the directory fork when the caller listed this
+    // folder (findChild). Closed folders keep the default glyph until opened.
+    if (!findChild) {
+      return (
+        this.defaultFolder ?? {
+          small: systemIconUrl('DIR16.png'),
+          large: systemIconUrl('DIR32.png'),
+        }
+      );
+    }
+
+    const pending = this.dirInflight.get(pathKey);
+    if (pending) return pending;
+    const work = this.probeDirectory(pathKey, node, findChild, loadIconFork);
+    this.dirInflight.set(pathKey, work);
+    void work.finally(() => {
+      if (this.dirInflight.get(pathKey) === work) this.dirInflight.delete(pathKey);
+    });
+    return work;
+  }
+
+  private async probeDirectory(
+    pathKey: string,
+    node: VNode,
+    findChild: (parentId: number, name: string) => Promise<VNode | undefined>,
     loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
   ): Promise<IconUrls> {
     const hit = this.dirMemory.get(pathKey);
@@ -374,7 +470,7 @@ export class IconCache {
       small: systemIconUrl('DIR16.png'),
       large: systemIconUrl('DIR32.png'),
     };
-    // Do not cache defaults — allows Icon\r added later to be picked up.
+    this.dirMemory.set(pathKey, urls);
     return urls;
   }
 
@@ -419,13 +515,18 @@ export class IconCache {
   }): Promise<IconUrls> {
     const key = cacheKey(args.creator, args.type);
     const rf = forkFromNode(args.resource, args.data, args.fork ?? null);
+    const custom = (finderFlags(args.finderInfo) & HAS_CUSTOM_ICON) !== 0;
     const cached = this.memory.get(key) ?? (await this.loadPersisted(key));
-    if (cached && !(rf && isSystemIconUrls(cached))) {
+    if (cached && !custom) {
       this.memory.set(key, cached);
       return cached;
     }
 
     if (!rf) {
+      if (cached) {
+        this.memory.set(key, cached);
+        return cached;
+      }
       const urls: IconUrls = {
         small: await resolveSystemIcon(args.type, 16),
         large: await resolveSystemIcon(args.type, 32),
@@ -443,8 +544,10 @@ export class IconCache {
       if (set) {
         const urls = await iconSetToUrls(set);
         if (urls) {
-          this.memory.set(key, urls);
-          await this.persist(key, urls);
+          if (!custom) {
+            this.memory.set(key, urls);
+            await this.persist(key, urls);
+          }
           return urls;
         }
       }

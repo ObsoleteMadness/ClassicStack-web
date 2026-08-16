@@ -238,13 +238,17 @@ async function importOneWelcomeFile(
         isDir: expanded.length === 1 && first?.kind === 'dir',
         bytesTotal: file.data.length,
       });
+      const toImport: ExpandedNode[] = [];
       for (const node of expanded) {
         if (await fs.lookup(parentId, node.name)) {
           result.skipped++;
           continue;
         }
-        await importExpandedTree(fs, parentId, [node], track);
-        result.imported++;
+        toImport.push(node);
+      }
+      if (toImport.length) {
+        await importExpandedTree(fs, parentId, toImport, track);
+        result.imported += toImport.length;
       }
       await discardWelcomeArchive(fs, parentId, item.name, expanded);
       track?.onDone?.();

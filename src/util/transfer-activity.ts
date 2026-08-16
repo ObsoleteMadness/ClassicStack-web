@@ -2,6 +2,8 @@
 
 export type TransferKind = 'file' | 'folder';
 
+export type TransferStatus = 'queued' | 'running' | 'done' | 'error';
+
 export interface TransferJob {
   id: string;
   name: string;
@@ -9,7 +11,7 @@ export interface TransferJob {
   bytesDone: number;
   bytesTotal: number;
   rate: number;
-  status: 'running' | 'done' | 'error';
+  status: TransferStatus;
   error?: string;
   iconSrc: string;
   /** When set, this row is a nested subtask of another job (e.g. auto-expand). */
@@ -25,6 +27,7 @@ export interface TransferStart {
   iconSrc?: string;
   parentId?: string;
   detail?: string;
+  queued?: boolean;
 }
 
 type Listener = () => void;
@@ -48,7 +51,7 @@ class TransferActivity {
 
   hasRunning(): boolean {
     for (const j of this.jobs.values()) {
-      if (j.status === 'running') return true;
+      if (j.status === 'running' || j.status === 'queued') return true;
     }
     return false;
   }
@@ -71,25 +74,39 @@ class TransferActivity {
   }
 
   start(spec: TransferStart): string {
-    const id = `t${this.seq++}`;
-    const now = performance.now();
-    this.jobs.set(id, {
-      id,
-      name: spec.name,
-      kind: spec.kind,
-      bytesDone: 0,
-      bytesTotal: spec.bytesTotal ?? 0,
-      rate: 0,
-      status: 'running',
-      iconSrc: spec.iconSrc ?? (spec.kind === 'folder' ? '' : FILE_ICON),
-      parentId: spec.parentId,
-      detail: spec.detail,
-      lastBytes: 0,
-      lastTick: now,
-    });
-    this.order.push(id);
+    const id = this.insert(spec);
     this.emit();
     return id;
+  }
+
+  /** Queue several nested jobs and notify listeners once. */
+  startMany(specs: TransferStart[]): string[] {
+    const ids = specs.map((spec) => this.insert(spec));
+    if (ids.length) this.emit();
+    return ids;
+  }
+
+  /** Move a queued job to running (e.g. the next extracted file). */
+  begin(id: string, detail?: string): void {
+    const j = this.jobs.get(id);
+    if (!j || j.status !== 'queued') return;
+    j.status = 'running';
+    j.lastTick = performance.now();
+    if (detail !== undefined) j.detail = detail;
+    this.emit();
+  }
+
+  /** Fail queued children when the parent extract aborts. */
+  failQueued(parentId: string, error: string): void {
+    let any = false;
+    for (const j of this.jobs.values()) {
+      if (j.parentId !== parentId || j.status !== 'queued') continue;
+      j.status = 'error';
+      j.error = error;
+      j.rate = 0;
+      any = true;
+    }
+    if (any) this.emit();
   }
 
   setIcon(id: string, iconSrc: string): void {
@@ -101,14 +118,30 @@ class TransferActivity {
 
   setTotal(id: string, n: number): void {
     const j = this.jobs.get(id);
-    if (!j || j.status !== 'running') return;
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
     j.bytesTotal = Math.max(n, j.bytesDone);
+    this.emit();
+  }
+
+  /** Replace progress (e.g. switch from reading an archive to writing extracted files). */
+  setBytes(id: string, done: number, total: number, detail?: string): void {
+    const j = this.jobs.get(id);
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    if (j.status === 'queued') j.status = 'running';
+    j.bytesDone = Math.max(0, done);
+    j.bytesTotal = Math.max(total, j.bytesDone);
+    j.rate = 0;
+    j.lastBytes = j.bytesDone;
+    j.lastTick = performance.now();
+    if (detail !== undefined) j.detail = detail;
     this.emit();
   }
 
   addBytes(id: string, n: number): void {
     const j = this.jobs.get(id);
-    if (!j || j.status !== 'running' || n <= 0) return;
+    if (!j || n <= 0) return;
+    if (j.status === 'queued') j.status = 'running';
+    if (j.status !== 'running') return;
     j.bytesDone += n;
     if (j.bytesTotal > 0 && j.bytesDone > j.bytesTotal) j.bytesTotal = j.bytesDone;
     const now = performance.now();
@@ -143,12 +176,33 @@ class TransferActivity {
   clearFinished(): void {
     for (const id of [...this.order]) {
       const j = this.jobs.get(id);
-      if (j && j.status !== 'running') {
+      if (j && j.status !== 'running' && j.status !== 'queued') {
         this.jobs.delete(id);
         this.order = this.order.filter((x) => x !== id);
       }
     }
     this.emit();
+  }
+
+  private insert(spec: TransferStart): string {
+    const id = `t${this.seq++}`;
+    const now = performance.now();
+    this.jobs.set(id, {
+      id,
+      name: spec.name,
+      kind: spec.kind,
+      bytesDone: 0,
+      bytesTotal: spec.bytesTotal ?? 0,
+      rate: 0,
+      status: spec.queued ? 'queued' : 'running',
+      iconSrc: spec.iconSrc ?? (spec.kind === 'folder' ? '' : FILE_ICON),
+      parentId: spec.parentId,
+      detail: spec.detail ?? (spec.queued ? 'Queued' : undefined),
+      lastBytes: 0,
+      lastTick: now,
+    });
+    this.order.push(id);
+    return id;
   }
 
   private emit(): void {

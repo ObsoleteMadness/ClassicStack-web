@@ -8,8 +8,8 @@ import { be32 } from '../protocol/binary';
 import type { Catalog, VNode, VfsChangeListener } from './virtual-fs';
 import { importDataTransferInto, type ImportProgress } from './import-transfer';
 import { finderInfoFromName } from './extension-map';
-import { loadResourceForkPartial, ResourceFork } from './resource-fork';
-import { SUPPORTED_ICON_TYPES } from './resource-types/icon-decoder';
+import { loadFinderIconFork, ResourceFork } from './resource-fork';
+import { iconForkLoadOptions } from './icon-cache';
 
 const EMPTY = new Uint8Array();
 
@@ -94,13 +94,12 @@ export class RemoteVfs implements Catalog {
     if (node.resource.length >= 16) return ResourceFork.fromBytes(node.resource);
     const rsrcLen = node.resourceBytes ?? 0;
     if (rsrcLen < 16) return null;
-    const types = new Set<string>([...SUPPORTED_ICON_TYPES, 'BNDL', 'FREF']);
     try {
       return await this.client.withForkReader(
         node.name,
         node.parentId,
         true,
-        (read) => loadResourceForkPartial(read, (type) => types.has(type)),
+        (read) => loadFinderIconFork(read, iconForkLoadOptions(node)),
         this.volId,
       );
     } catch {

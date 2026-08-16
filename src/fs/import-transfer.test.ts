@@ -133,6 +133,97 @@ describe('importExpandedTree', () => {
     expect(fromMacTime(image!.createDate).getUTCFullYear()).toBe(2023);
     expect(fromMacTime(image!.modDate).getUTCFullYear()).toBe(2023);
   });
+
+  it('resets parent progress to extracted size and credits parent as files are written', async () => {
+    const { fs } = mockCatalog();
+    const parentBytes: number[] = [];
+    let parentTotal = -1;
+    const childBytes: number[] = [];
+    await importExpandedTree(
+      fs,
+      2,
+      [
+        {
+          kind: 'file',
+          name: 'A',
+          data: Uint8Array.of(1, 2, 3, 4),
+          resource: new Uint8Array(),
+          finderInfo: makeFinderInfo('TEXT', 'ttxt'),
+        },
+        {
+          kind: 'dir',
+          name: 'Folder',
+          children: [
+            {
+              kind: 'file',
+              name: 'B',
+              data: Uint8Array.of(5, 6),
+              resource: Uint8Array.of(7, 8, 9),
+              finderInfo: makeFinderInfo('TEXT', 'ttxt'),
+            },
+          ],
+        },
+      ],
+      {
+        onBytes: (n) => parentBytes.push(n),
+        onExpandBegin: (total) => {
+          parentTotal = total;
+        },
+        onExpand: () => ({
+          onBytes: (n) => childBytes.push(n),
+        }),
+      },
+    );
+    expect(parentTotal).toBe(9);
+    expect(parentBytes.reduce((a, b) => a + b, 0)).toBe(9);
+    expect(childBytes.reduce((a, b) => a + b, 0)).toBe(9);
+  });
+
+  it('announces every extracted file before writes start', async () => {
+    const { fs } = mockCatalog();
+    let queued: { name: string; path: string; bytesTotal: number }[] = [];
+    const started: string[] = [];
+    await importExpandedTree(
+      fs,
+      2,
+      [
+        {
+          kind: 'file',
+          name: 'A',
+          data: Uint8Array.of(1, 2, 3, 4),
+          resource: new Uint8Array(),
+          finderInfo: makeFinderInfo('TEXT', 'ttxt'),
+        },
+        {
+          kind: 'dir',
+          name: 'Folder',
+          children: [
+            {
+              kind: 'file',
+              name: 'B',
+              data: Uint8Array.of(5, 6),
+              resource: Uint8Array.of(7, 8, 9),
+              finderInfo: makeFinderInfo('TEXT', 'ttxt'),
+            },
+          ],
+        },
+      ],
+      {
+        onExpandBegin: (_total, files) => {
+          queued = files.map((f) => ({ name: f.name, path: f.path, bytesTotal: f.bytesTotal }));
+        },
+        onExpand: (item) => {
+          started.push(item.path);
+          return {};
+        },
+      },
+    );
+    expect(queued).toEqual([
+      { name: 'A', path: 'A', bytesTotal: 4 },
+      { name: 'B', path: 'Folder/B', bytesTotal: 5 },
+    ]);
+    expect(started).toEqual(['A', 'Folder/B']);
+  });
 });
 
 describe('hfsTimeToAfp', () => {

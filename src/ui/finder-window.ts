@@ -15,7 +15,7 @@ import {
 } from '../fs/icon-cache';
 import { expandArchiveFile, expandFailureMessage, isExpandableArchive, type ExpandedNode } from '../fs/expand-incoming';
 import type { WelcomePackProgress } from '../fs/welcome-pack';
-import { importExpandedTree } from '../fs/import-transfer';
+import { importExpandedTree, type ImportItemTrack } from '../fs/import-transfer';
 import { filenameExtension } from '../fs/extension-map';
 import { loadPrefs, savePrefs } from '../util/prefs';
 import { log } from '../util/logger';
@@ -24,7 +24,7 @@ import { enableWindowResize } from './window-resize';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
 import { isCompactUi, onLayoutModeChange } from './layout-mode';
 import { positionCallout } from './callout';
-import { transferListHtml } from './transfer-list';
+import { paintTransferList } from './transfer-list';
 import {
   transferActivity,
   TRANSFER_FILE_ICON,
@@ -206,6 +206,7 @@ export class FinderWindow extends HTMLElement {
   private unsubTransfer: (() => void) | null = null;
   private unsubLayout: (() => void) | null = null;
   private transferIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  private transferRaf = 0;
   private lastTransferPct = 0;
   private transferBtnVisible = false;
   private resourceExplorer: ResourceForkExplorer | null = null;
@@ -339,6 +340,7 @@ export class FinderWindow extends HTMLElement {
     window.removeEventListener('pointerup', this.onColumnResizeUp);
     window.removeEventListener('pointercancel', this.onColumnResizeUp);
     if (this.transferIdleTimer) clearTimeout(this.transferIdleTimer);
+    if (this.transferRaf) cancelAnimationFrame(this.transferRaf);
     if (this.vfsRefreshTimer) {
       clearTimeout(this.vfsRefreshTimer);
       this.vfsRefreshTimer = null;
@@ -442,29 +444,55 @@ export class FinderWindow extends HTMLElement {
     return id;
   }
 
-  private trackImportItem(item: { name: string; isDir: boolean; bytesTotal: number }): {
+  private trackImportItem(item: { name: string; isDir: boolean; bytesTotal: number }): ImportItemTrack & {
     onBytes: (n: number) => void;
     onDone: (err?: Error) => void;
-    onExpand: (sub: {
-      name: string;
-      isDir: boolean;
-      bytesTotal: number;
-      finderInfo?: Uint8Array;
-    }) => { onBytes: (n: number) => void; onDone: (err?: Error) => void };
   } {
     const id = this.startTransfer(item.name, item.isDir, item.bytesTotal);
+    const queuedByPath = new Map<string, string>();
     const bind = (jobId: string) => ({
       onBytes: (n: number) => transferActivity.addBytes(jobId, n),
       onDone: (err?: Error) => {
-        if (err) transferActivity.fail(jobId, err.message);
-        else transferActivity.finish(jobId);
+        if (err) {
+          transferActivity.fail(jobId, err.message);
+          transferActivity.failQueued(jobId, err.message);
+        } else transferActivity.finish(jobId);
       },
     });
     return {
       ...bind(id),
+      onExpandBegin: (bytesTotal, files) => {
+        transferActivity.setBytes(id, 0, bytesTotal, 'Expanding');
+        const childIds = transferActivity.startMany(
+          files.map((f) => ({
+            name: f.path,
+            kind: 'file' as const,
+            bytesTotal: f.bytesTotal,
+            iconSrc: TRANSFER_FILE_ICON,
+            parentId: id,
+            detail: 'Queued',
+            queued: true,
+          })),
+        );
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i]!;
+          const childId = childIds[i]!;
+          queuedByPath.set(f.path, childId);
+          if (!f.finderInfo || f.finderInfo.length < 8) continue;
+          const { type, creator } = readTypeCreator(f.finderInfo);
+          void iconCache.getForTypeCreator(type, creator).then((urls) => {
+            transferActivity.setIcon(childId, urls.small);
+          });
+        }
+      },
       onExpand: (sub) => {
-        const childId = this.startTransfer(sub.name, sub.isDir, sub.bytesTotal, sub.finderInfo, id, 'Expanding');
-        return bind(childId);
+        const childId = queuedByPath.get(sub.path);
+        if (childId) {
+          transferActivity.begin(childId, 'Expanding');
+          return bind(childId);
+        }
+        const started = this.startTransfer(sub.name, false, sub.bytesTotal, sub.finderInfo, id, 'Expanding');
+        return bind(started);
       },
     };
   }
@@ -510,7 +538,13 @@ export class FinderWindow extends HTMLElement {
     window.addEventListener('popstate', (e) => void this.onPopState(e));
     window.addEventListener('keydown', (e) => void this.onKeyDown(e));
     window.addEventListener('pointerdown', this.onWinPointer, true);
-    this.unsubTransfer = transferActivity.subscribe(() => this.syncTransferButton());
+    this.unsubTransfer = transferActivity.subscribe(() => {
+      if (this.transferRaf) return;
+      this.transferRaf = requestAnimationFrame(() => {
+        this.transferRaf = 0;
+        this.syncTransferButton();
+      });
+    });
     this.unsubLayout = onLayoutModeChange(() => this.applyCompactView());
     this.ensureRenameBlur();
   }
@@ -1275,11 +1309,20 @@ export class FinderWindow extends HTMLElement {
   }
 
   private iconLookup(node: VNode): Promise<IconUrls> {
+    const probeFolder = node.isDir && this.folderContentsVisible(node.id);
     return iconCache.getForNode(
       node,
-      (id, name) => this.vfs.lookup(id, name),
+      probeFolder ? (id, name) => this.vfs.lookup(id, name) : undefined,
       (n) => this.vfs.loadIconResources?.(n) ?? Promise.resolve(null),
     );
+  }
+
+  /** True when this folder's children are on screen (cwd, column path, or expanded list). */
+  private folderContentsVisible(id: number): boolean {
+    if (id === this.cwd) return true;
+    if (this.expandedIds.has(id)) return true;
+    if (this.view === 'column' && this.pathStack.some((p) => p.id === id)) return true;
+    return false;
   }
 
   /** Kick off icon resolution for visible items; patches DOM when ready. */
@@ -2430,17 +2473,28 @@ export class FinderWindow extends HTMLElement {
     row.insertAdjacentHTML('afterend', html);
     this.setDiscloseState(row.querySelector('[data-disclose]'), 'open');
     if (this.dragDepth > 0 || this.dragNodeId != null) this.paintDropTarget(folderId, false);
-    this.prefetchIcons(
-      kids.map((n) => ({
-        key: String(n.id),
-        name: n.name,
-        isDir: n.isDir,
-        size: nodeByteSize(n),
-        mod: fromMacTime(n.modDate),
-        node: n,
-        finderInfo: n.finderInfo,
-      })),
-    );
+    const folder = this.findNodeAnywhere(folderId);
+    const items: ListItem[] = kids.map((n) => ({
+      key: String(n.id),
+      name: n.name,
+      isDir: n.isDir,
+      size: nodeByteSize(n),
+      mod: fromMacTime(n.modDate),
+      node: n,
+      finderInfo: n.finderInfo,
+    }));
+    if (folder) {
+      items.unshift({
+        key: String(folder.id),
+        name: folder.name,
+        isDir: true,
+        size: nodeByteSize(folder),
+        mod: fromMacTime(folder.modDate),
+        node: folder,
+        finderInfo: folder.finderInfo,
+      });
+    }
+    this.prefetchIcons(items);
   }
 
   /** Navigate into a folder in icon view; park drag source so the gesture survives. */
@@ -3417,7 +3471,24 @@ export class FinderWindow extends HTMLElement {
     btn.textContent = agg.indeterminate ? '…' : `${pct}%`;
     btn.setAttribute('aria-label', label);
     btn.title = label;
-    if (this.openCallout === 'transfers') this.renderCallouts();
+    if (this.openCallout === 'transfers') this.paintTransferCallout();
+  }
+
+  private paintTransferCallout(): void {
+    const root = this.querySelector('.callout-root');
+    if (!root) return;
+    let el = root.querySelector('.callout--transfers') as HTMLElement | null;
+    const created = !el;
+    if (!el) {
+      root.innerHTML = `<div class="callout callout--transfers"></div>`;
+      el = root.querySelector('.callout--transfers') as HTMLElement;
+    }
+    if (!el) return;
+    const rebuilt = paintTransferList(el);
+    const anchor = this.querySelector('[data-act="transfers"]') as HTMLElement | null;
+    if (anchor && (created || rebuilt)) {
+      positionCallout(el, anchor);
+    }
   }
 
   private renderCallouts(): void {
@@ -3428,10 +3499,7 @@ export class FinderWindow extends HTMLElement {
       return;
     }
     if (this.openCallout === 'transfers') {
-      root.innerHTML = `<div class="callout callout--transfers">${transferListHtml()}</div>`;
-      const el = root.querySelector('.callout') as HTMLElement;
-      const anchor = this.querySelector('[data-act="transfers"]') as HTMLElement | null;
-      if (el && anchor) positionCallout(el, anchor);
+      this.paintTransferCallout();
       return;
     }
     if (this.openCallout === 'share') {

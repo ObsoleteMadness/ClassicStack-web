@@ -1,82 +1,127 @@
 import { describe, expect, it } from 'vitest';
-import { ResourceFork, loadResourceForkPartial } from './resource-fork';
+import { ResourceFork, loadFinderIconFork, loadResourceForkPartial } from './resource-fork';
 import { decodeIcon, decodeICNHash, type DecodedIcon } from './resource-types/icon-decoder';
 import { IconSet, IconSize } from './resource-types/icon-set';
 
-/** Build a minimal resource fork containing a single ICN# id 128 (bitmap+mask). */
-function buildForkWithICN(): Uint8Array {
-  const iconData = new Uint8Array(256);
-  // Simple diagonal pattern in first plane; full mask in second
-  for (let i = 0; i < 128; i++) iconData[i] = 0xaa;
-  for (let i = 128; i < 256; i++) iconData[i] = 0xff;
+function writeAscii4(buf: Uint8Array, o: number, s: string): void {
+  for (let i = 0; i < 4; i++) buf[o + i] = s.charCodeAt(i) ?? 0x20;
+}
 
-  // Resource data block: 4-byte length + data
-  const dataBlock = new Uint8Array(4 + 256);
-  dataBlock[0] = 0;
-  dataBlock[1] = 0;
-  dataBlock[2] = 1;
-  dataBlock[3] = 0; // length 256
-  dataBlock.set(iconData, 4);
+/** Classic resource fork with the given payloads (empty name list). */
+function buildResourceFork(resources: { type: string; id: number; data: Uint8Array }[]): Uint8Array {
+  const byType = new Map<string, { id: number; dataBlockOffset: number }[]>();
+  const dataParts: Uint8Array[] = [];
+  let dataOff = 0;
+  for (const r of resources) {
+    const block = new Uint8Array(4 + r.data.length);
+    new DataView(block.buffer).setUint32(0, r.data.length);
+    block.set(r.data, 4);
+    const list = byType.get(r.type) ?? [];
+    list.push({ id: r.id, dataBlockOffset: dataOff });
+    byType.set(r.type, list);
+    dataParts.push(block);
+    dataOff += block.length;
+  }
+  const dataSection = new Uint8Array(dataOff);
+  let p = 0;
+  for (const part of dataParts) {
+    dataSection.set(part, p);
+    p += part.length;
+  }
 
-  // Map layout (classic):
-  // 0..15 reserved header copy
-  // 16..19 next map
-  // 20..21 file ref
-  // 22..23 attributes
-  // 24..25 type list offset (from start of map)
-  // 26..27 name list offset
-  // type list at offset 28: numTypes-1, then type entries
+  const types = [...byType.keys()];
   const typeListOffset = 28;
-  const nameListOffset = 28 + 2 + 8 + 12; // after type count + 1 type entry + 1 ref
-  const mapLen = nameListOffset; // empty name list
-  const dataOffset = 16;
-  const mapOffset = dataOffset + dataBlock.length;
-
-  const map = new Uint8Array(mapLen);
-  // type list offset / name list offset
+  const typeListHeader = 2;
+  const typeEntriesSize = types.length * 8;
+  const nameListOffset = typeListOffset + typeListHeader + typeEntriesSize + resources.length * 12;
+  const map = new Uint8Array(nameListOffset);
   map[24] = (typeListOffset >> 8) & 0xff;
   map[25] = typeListOffset & 0xff;
   map[26] = (nameListOffset >> 8) & 0xff;
   map[27] = nameListOffset & 0xff;
+  const numTypesM1 = types.length - 1;
+  map[typeListOffset] = (numTypesM1 >> 8) & 0xff;
+  map[typeListOffset + 1] = numTypesM1 & 0xff;
 
-  // num types - 1 = 0
-  map[typeListOffset] = 0;
-  map[typeListOffset + 1] = 0;
-  // type 'ICN#'
-  map[typeListOffset + 2] = 0x49; // I
-  map[typeListOffset + 3] = 0x43; // C
-  map[typeListOffset + 4] = 0x4e; // N
-  map[typeListOffset + 5] = 0x23; // #
-  // num refs - 1 = 0
-  map[typeListOffset + 6] = 0;
-  map[typeListOffset + 7] = 0;
-  // ref list offset from type list start = 2 + 8 = 10
-  map[typeListOffset + 8] = 0;
-  map[typeListOffset + 9] = 10;
+  let refCursor = typeListHeader + typeEntriesSize;
+  types.forEach((type, i) => {
+    const entryOff = typeListOffset + 2 + i * 8;
+    writeAscii4(map, entryOff, type);
+    const refs = byType.get(type)!;
+    const nM1 = refs.length - 1;
+    map[entryOff + 4] = (nM1 >> 8) & 0xff;
+    map[entryOff + 5] = nM1 & 0xff;
+    map[entryOff + 6] = (refCursor >> 8) & 0xff;
+    map[entryOff + 7] = refCursor & 0xff;
+    let rl = typeListOffset + refCursor;
+    for (const ref of refs) {
+      const id = ref.id & 0xffff;
+      map[rl] = (id >> 8) & 0xff;
+      map[rl + 1] = id & 0xff;
+      map[rl + 2] = 0xff;
+      map[rl + 3] = 0xff;
+      map[rl + 4] = 0;
+      map[rl + 5] = (ref.dataBlockOffset >> 16) & 0xff;
+      map[rl + 6] = (ref.dataBlockOffset >> 8) & 0xff;
+      map[rl + 7] = ref.dataBlockOffset & 0xff;
+      rl += 12;
+      refCursor += 12;
+    }
+  });
 
-  const refOff = typeListOffset + 10;
-  // id 128
-  map[refOff] = 0;
-  map[refOff + 1] = 128;
-  // name offset -1
-  map[refOff + 2] = 0xff;
-  map[refOff + 3] = 0xff;
-  map[refOff + 4] = 0; // attrs
-  // data block offset (3 bytes) = 0 relative to data section
-  map[refOff + 5] = 0;
-  map[refOff + 6] = 0;
-  map[refOff + 7] = 0;
-
-  const out = new Uint8Array(mapOffset + mapLen);
-  // header
+  const dataOffset = 16;
+  const mapOffset = dataOffset + dataSection.length;
+  const out = new Uint8Array(mapOffset + map.length);
   const view = new DataView(out.buffer);
   view.setUint32(0, dataOffset);
   view.setUint32(4, mapOffset);
-  view.setUint32(8, dataBlock.length);
-  view.setUint32(12, mapLen);
-  out.set(dataBlock, dataOffset);
+  view.setUint32(8, dataSection.length);
+  view.setUint32(12, map.length);
+  out.set(dataSection, dataOffset);
   out.set(map, mapOffset);
   return out;
+}
+
+function icnPayload(): Uint8Array {
+  const iconData = new Uint8Array(256);
+  for (let i = 0; i < 128; i++) iconData[i] = 0xaa;
+  for (let i = 128; i < 256; i++) iconData[i] = 0xff;
+  return iconData;
+}
+
+function buildForkWithICN(): Uint8Array {
+  return buildResourceFork([{ type: 'ICN#', id: 128, data: icnPayload() }]);
+}
+
+function applBndl(): Uint8Array {
+  const bndl = new Uint8Array(8 + 2 * 10);
+  bndl.set([0x41, 0x50, 0x50, 0x4c], 0);
+  bndl[5] = 128;
+  bndl[7] = 1;
+  let p = 8;
+  bndl.set([0x46, 0x52, 0x45, 0x46], p);
+  p += 4;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 128;
+  bndl.set([0x49, 0x43, 0x4e, 0x23], p);
+  p += 4;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 0;
+  bndl[p++] = 128;
+  return bndl;
+}
+
+function applFref(): Uint8Array {
+  const fref = new Uint8Array(6);
+  fref.set([0x41, 0x50, 0x50, 0x4c], 0);
+  return fref;
 }
 
 describe('resource fork + icon decode', () => {
@@ -166,5 +211,34 @@ describe('resource fork + icon decode', () => {
     expect(reads.some((r) => r.offset === 0 && r.count === fork.length)).toBe(false);
     expect(reads[0]).toEqual({ offset: 0, count: 16 });
     expect(total).toBeGreaterThan(16);
+  });
+
+  it('does not pull unmapped ICN# payloads when loading Finder icons', async () => {
+    const noise = new Uint8Array(256);
+    noise.fill(0x11);
+    const fork = buildResourceFork([
+      { type: 'BNDL', id: 128, data: applBndl() },
+      { type: 'FREF', id: 128, data: applFref() },
+      { type: 'ICN#', id: 128, data: icnPayload() },
+      { type: 'ICN#', id: 999, data: noise },
+    ]);
+    const parsed = ResourceFork.fromBytes(fork);
+    const extra = parsed.findById('ICN#', 999)!;
+    const extraStart = extra.dataOffset;
+    const extraEnd = extra.dataOffset + extra.length;
+
+    const reads: { offset: number; count: number }[] = [];
+    const rf = await loadFinderIconFork(async (offset, count) => {
+      reads.push({ offset, count });
+      return fork.subarray(offset, offset + count);
+    });
+    expect(rf?.findById('ICN#', 128)?.length).toBe(256);
+    expect(rf?.findById('ICN#', 999)).toBeUndefined();
+    expect(rf?.findById('BNDL', 128)).toBeTruthy();
+    const payloadReads = reads.filter(
+      (r) => r.offset < extraEnd && r.offset + r.count > extraStart,
+    );
+    expect(payloadReads).toEqual([]);
+    expect(reads.reduce((n, r) => n + r.count, 0)).toBeLessThan(fork.length);
   });
 });

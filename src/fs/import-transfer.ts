@@ -13,16 +13,21 @@ import {
   type PlacementPlan,
 } from './name-conflict';
 
+export type ExpandTrackFile = {
+  name: string;
+  /** Archive-relative path, unique among siblings of the same parent job. */
+  path: string;
+  bytesTotal: number;
+  finderInfo?: Uint8Array;
+};
+
 export type ImportItemTrack = {
   onBytes?: (n: number) => void;
   onDone?: (err?: Error) => void;
+  /** Reset the parent job and announce every extracted file (queued) before writes start. */
+  onExpandBegin?: (bytesTotal: number, files: ExpandTrackFile[]) => void;
   /** Nested job while a dropped wrapper is decoded (BinHex / MacBinary / later StuffIt). */
-  onExpand?: (item: {
-    name: string;
-    isDir: boolean;
-    bytesTotal: number;
-    finderInfo?: Uint8Array;
-  }) => ImportItemTrack | undefined;
+  onExpand?: (item: ExpandTrackFile) => ImportItemTrack | undefined;
 };
 
 export type ImportProgress = {
@@ -280,6 +285,27 @@ function shouldTryExpand(name: string): boolean {
   return isExpandableArchive(name);
 }
 
+function expandedFiles(nodes: ExpandedNode[], prefix = ''): ExpandTrackFile[] {
+  const out: ExpandTrackFile[] = [];
+  for (const node of nodes) {
+    const path = prefix ? `${prefix}/${node.name}` : node.name;
+    if (node.kind === 'dir') out.push(...expandedFiles(node.children, path));
+    else {
+      out.push({
+        name: node.name,
+        path,
+        bytesTotal: node.data.length + node.resource.length,
+        finderInfo: node.finderInfo,
+      });
+    }
+  }
+  return out;
+}
+
+function expandedByteTotal(files: ExpandTrackFile[]): number {
+  return files.reduce((n, f) => n + f.bytesTotal, 0);
+}
+
 /** Write expanded Mac files/folders through Catalog.createFile / put (forks, Finder info, dates). */
 export async function importExpandedTree(
   fs: Pick<Catalog, 'ensureDir' | 'createFile' | 'put'>,
@@ -287,14 +313,27 @@ export async function importExpandedTree(
   nodes: ExpandedNode[],
   track?: ImportItemTrack,
 ): Promise<void> {
+  const files = expandedFiles(nodes);
+  track?.onExpandBegin?.(expandedByteTotal(files), files);
+  await writeExpandedNodes(fs, parentId, nodes, track);
+}
+
+async function writeExpandedNodes(
+  fs: Pick<Catalog, 'ensureDir' | 'createFile' | 'put'>,
+  parentId: number,
+  nodes: ExpandedNode[],
+  track?: ImportItemTrack,
+  prefix = '',
+): Promise<void> {
   for (const node of nodes) {
+    const path = prefix ? `${prefix}/${node.name}` : node.name;
     if (node.kind === 'dir') {
       const dir = await fs.ensureDir(parentId, node.name);
       await stampExpandedMeta(fs, dir, node, true);
-      await importExpandedTree(fs, dir.id, node.children, track);
+      await writeExpandedNodes(fs, dir.id, node.children, track, path);
       continue;
     }
-    await importExpandedFile(fs, parentId, node, track);
+    await importExpandedFile(fs, parentId, node, track, path);
   }
 }
 
@@ -303,21 +342,26 @@ async function importExpandedFile(
   parentId: number,
   node: ExpandedFile,
   track?: ImportItemTrack,
+  path = node.name,
 ): Promise<void> {
   const bytesTotal = node.data.length + node.resource.length;
   const child = track?.onExpand?.({
     name: node.name,
-    isDir: false,
+    path,
     bytesTotal,
     finderInfo: node.finderInfo,
   });
+  const credit = (n: number): void => {
+    child?.onBytes?.(n);
+    track?.onBytes?.(n);
+  };
   let wrote = 0;
   try {
     const vnode = await fs.createFile(parentId, node.name, node.data, node.resource, node.finderInfo, (n) => {
       wrote += n;
-      child?.onBytes?.(n);
+      credit(n);
     });
-    if (wrote === 0 && bytesTotal > 0) child?.onBytes?.(bytesTotal);
+    if (wrote === 0 && bytesTotal > 0) credit(bytesTotal);
     await stampExpandedMeta(fs, vnode, node, false);
     child?.onDone?.();
   } catch (err) {

@@ -1280,7 +1280,8 @@ finder-window {
 
 .app-menubar {
   flex: none;
-  z-index: 40;
+  position: relative;
+  z-index: 90;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #2e353e 0%, #262c33 100%);
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04);
@@ -1359,7 +1360,7 @@ finder-window {
   flex-direction: column;
   gap: 1px;
   animation: fadein 120ms ease;
-  z-index: 50;
+  z-index: 91;
 }
 
 .app-menu__dropdown[hidden] {
@@ -1435,6 +1436,14 @@ log-panel[hidden],
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #2c333b, #262c33);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+.log-panel.is-dragging .log-panel__chrome,
+.activity-window.is-dragging .activity-window__chrome {
+  cursor: grabbing;
 }
 
 .log-panel__title {
@@ -1560,6 +1569,9 @@ activity-window[hidden],
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #2c333b, #262c33);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
 }
 
 .activity-window__title {
@@ -2047,6 +2059,14 @@ img.file-transfer__icon {
 
 .file-transfer--error .file-transfer__bar-fill {
   background: var(--danger);
+}
+
+.file-transfer--queued {
+  opacity: 0.62;
+}
+
+.file-transfer--queued .file-transfer__bar {
+  opacity: 0.45;
 }
 
 .file-transfer__meta {
@@ -2587,7 +2607,7 @@ extension-editor-dialog[hidden],
   flex: 1;
 }
 
-/* —— Callouts (transfers, actions, Advanced log/activity) —— */
+/* —— Callouts (transfers, actions, Locations) —— */
 
 .callout {
   position: fixed;
@@ -2647,16 +2667,6 @@ extension-editor-dialog[hidden],
   margin: 4px 6px;
 }
 
-log-panel.is-callout,
-.activity-window.is-callout {
-  min-width: min(320px, calc(100vw - 16px));
-  min-height: 0;
-  width: min(420px, calc(100vw - 16px));
-  height: min(70vh, 420px);
-}
-
-log-panel.is-callout .window-resize-handle,
-.activity-window.is-callout .window-resize-handle,
 .file-activity-window .window-resize-handle {
   display: none;
 }
@@ -2721,7 +2731,7 @@ html.compact-ui #app {
 }
 
 html.compact-ui .app-menubar {
-  z-index: 40;
+  z-index: 90;
   padding-top: env(safe-area-inset-top);
 }
 
@@ -2908,8 +2918,10 @@ html.compact-ui .callout {
   max-width: none;
 }
 
-html.compact-ui log-panel.is-callout,
-html.compact-ui .activity-window.is-callout,
+html.compact-ui log-panel,
+html.compact-ui .log-panel,
+html.compact-ui activity-window,
+html.compact-ui .activity-window,
 html.compact-ui .rsrc-explorer {
   width: calc(100vw - 16px);
   max-width: none;

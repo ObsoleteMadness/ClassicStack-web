@@ -4,6 +4,9 @@
 
 import { be16, be32 } from '../protocol/binary';
 import { decodeMacRoman } from '../protocol/macroman';
+import { parseBndl } from './resource-types/bndl';
+import { SUPPORTED_ICON_TYPES } from './resource-types/icon-decoder';
+import { CDEV_ICON_ID, CUSTOM_ICON_ID, DEFAULT_ICON_ID } from './resource-types/icon-set';
 
 export interface ResourceEntry {
   name: string | null;
@@ -215,50 +218,155 @@ export type ForkByteReader = (offset: number, count: number) => Promise<Uint8Arr
 const MAX_MAP_BYTES = 64 * 1024;
 const MAX_RESOURCE_BYTES = 128 * 1024;
 
+const ICON_TYPE_SET = new Set<string>(SUPPORTED_ICON_TYPES);
+
+/** Typical on-disk sizes; skip map entries that claim a huge payload. */
+const PAYLOAD_MAX: Record<string, number> = {
+  BNDL: 8 * 1024,
+  FREF: 256,
+  'ICN#': 256,
+  ICON: 128,
+  'ics#': 64,
+  'icm#': 48,
+  'ich#': 576,
+  icl8: 1024,
+  ics8: 256,
+  icm8: 192,
+  ich8: 2304,
+  icl4: 512,
+  ics4: 128,
+  icm4: 96,
+  ich4: 1152,
+  cicn: 32 * 1024,
+};
+
+export interface FinderIconForkOpts {
+  /** Resource ids to fetch in addition to BNDL-mapped Finder icons. */
+  extraIds?: number[];
+  /** Icon\\r files: pull every icon type in the map (those forks are small). */
+  includeAllIcons?: boolean;
+}
+
+interface ForkMap {
+  dataOffset: number;
+  mapOffset: number;
+  mapLength: number;
+  dataLength: number;
+  mapped: MappedResource[];
+}
+
+async function readForkMap(read: ForkByteReader): Promise<ForkMap | null> {
+  const hdr = await read(0, 16);
+  if (hdr.length < 16) return null;
+  const dataOffset = be32(hdr, 0);
+  const mapOffset = be32(hdr, 4);
+  const dataLength = be32(hdr, 8);
+  const mapLength = be32(hdr, 12);
+  if (mapLength < 30 || mapLength > MAX_MAP_BYTES) return null;
+  const mapBuf = await read(mapOffset, mapLength);
+  if (mapBuf.length < 30) return null;
+  return {
+    dataOffset,
+    mapOffset,
+    mapLength,
+    dataLength,
+    mapped: listMappedResources(mapBuf),
+  };
+}
+
+async function loadMappedPayloads(
+  read: ForkByteReader,
+  dataOffset: number,
+  mapped: MappedResource[],
+  want: (type: string, id: number) => boolean,
+): Promise<ResourceEntry[]> {
+  const entries: ResourceEntry[] = [];
+  for (const item of mapped) {
+    if (!want(item.type, item.id)) continue;
+    const pos = dataOffset + item.dataBlockOffset;
+    const lenBuf = await read(pos, 4);
+    if (lenBuf.length < 4) continue;
+    const dataLen = be32(lenBuf, 0);
+    const cap = PAYLOAD_MAX[item.type] ?? MAX_RESOURCE_BYTES;
+    if (dataLen <= 0 || dataLen > cap) continue;
+    const payload = await read(pos + 4, dataLen);
+    entries.push({
+      name: item.name,
+      type: item.type,
+      id: item.id,
+      length: payload.length,
+      attributes: item.attributes,
+      dataOffset: 0,
+      payload,
+    });
+  }
+  return entries;
+}
+
+function forkFromSparse(map: ForkMap, entries: ResourceEntry[]): ResourceFork | null {
+  if (!entries.length) return null;
+  const rf = ResourceFork.fromEntries(entries);
+  rf.fileHeader = {
+    dataOffset: map.dataOffset,
+    mapOffset: map.mapOffset,
+    dataLength: map.dataLength,
+    mapLength: map.mapLength,
+  };
+  return rf;
+}
+
 /**
  * Read a resource fork through ranged fetches: 16-byte header, the map, then
  * only resources accepted by `want` (icon types/ids). Does not pull the rest
- * of the data fork image.
+ * of the fork image.
  */
 export async function loadResourceForkPartial(
   read: ForkByteReader,
   want: (type: string, id: number) => boolean,
 ): Promise<ResourceFork | null> {
-  const hdr = await read(0, 16);
-  if (hdr.length < 16) return null;
-  const dataOffset = be32(hdr, 0);
-  const mapOffset = be32(hdr, 4);
-  const mapLength = be32(hdr, 12);
-  if (mapLength < 30 || mapLength > MAX_MAP_BYTES) return null;
-  const mapBuf = await read(mapOffset, mapLength);
-  if (mapBuf.length < 30) return null;
+  const map = await readForkMap(read);
+  if (!map) return null;
+  const entries = await loadMappedPayloads(read, map.dataOffset, map.mapped, want);
+  return forkFromSparse(map, entries);
+}
 
-  const entries: ResourceEntry[] = [];
-  for (const mapped of listMappedResources(mapBuf)) {
-    if (!want(mapped.type, mapped.id)) continue;
-    const pos = dataOffset + mapped.dataBlockOffset;
-    const lenBuf = await read(pos, 4);
-    if (lenBuf.length < 4) continue;
-    const dataLen = be32(lenBuf, 0);
-    if (dataLen <= 0 || dataLen > MAX_RESOURCE_BYTES) continue;
-    const payload = await read(pos + 4, dataLen);
-    entries.push({
-      name: mapped.name,
-      type: mapped.type,
-      id: mapped.id,
-      length: payload.length,
-      attributes: mapped.attributes,
-      dataOffset: 0,
-      payload,
-    });
+/**
+ * Header + map, then BNDL/FREF (to learn Finder icon ids), then only those
+ * icon families. Skips other resources in the same fork (CODE, extra ICN#, …).
+ */
+export async function loadFinderIconFork(
+  read: ForkByteReader,
+  opts?: FinderIconForkOpts,
+): Promise<ResourceFork | null> {
+  const map = await readForkMap(read);
+  if (!map) return null;
+
+  const extraIds = new Set<number>(opts?.extraIds ?? []);
+  const meta = await loadMappedPayloads(
+    read,
+    map.dataOffset,
+    map.mapped,
+    (type) => type === 'BNDL' || type === 'FREF',
+  );
+  const ids = new Set<number>();
+  const bndl = parseBndl(ResourceFork.fromEntries(meta));
+  if (bndl) {
+    for (const sect of bndl.sections) {
+      if (!ICON_TYPE_SET.has(sect.code)) continue;
+      for (const mapping of sect.mappings) ids.add(mapping.resourceId);
+    }
   }
-  if (!entries.length) return null;
-  const rf = ResourceFork.fromEntries(entries);
-  rf.fileHeader = {
-    dataOffset,
-    mapOffset,
-    dataLength: be32(hdr, 8),
-    mapLength,
-  };
-  return rf;
+  for (const id of extraIds) ids.add(id);
+  if (!ids.size) {
+    ids.add(DEFAULT_ICON_ID);
+    ids.add(CDEV_ICON_ID);
+    ids.add(CUSTOM_ICON_ID);
+  }
+
+  const icons = await loadMappedPayloads(read, map.dataOffset, map.mapped, (type, id) => {
+    if (!ICON_TYPE_SET.has(type)) return false;
+    if (opts?.includeAllIcons) return true;
+    return ids.has(id);
+  });
+  return forkFromSparse(map, [...meta, ...icons]);
 }

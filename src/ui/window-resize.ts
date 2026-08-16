@@ -1,16 +1,25 @@
-/** Bottom-right resize grip for Finder and floating diagnostic windows. */
+/** Bottom-right resize grip and title-bar move for Finder and floating windows. */
 
 interface ResizeOpts {
   minWidth?: number;
   minHeight?: number;
 }
 
-const bound = new WeakSet<HTMLElement>();
+const resizeBound = new WeakSet<HTMLElement>();
+const moveBound = new WeakSet<HTMLElement>();
 const optsMap = new WeakMap<HTMLElement, { minWidth: number; minHeight: number }>();
 
-type DragState = { el: HTMLElement; w: number; h: number; x: number; y: number };
-let drag: DragState | null = null;
+type ResizeDrag = { el: HTMLElement; w: number; h: number; x: number; y: number };
+type MoveDrag = { el: HTMLElement; left: number; top: number; x: number; y: number };
+let resize: ResizeDrag | null = null;
+let move: MoveDrag | null = null;
 let listening = false;
+let floatZ = 63;
+
+function raiseFloatingWindow(el: HTMLElement): void {
+  floatZ = Math.min(floatZ + 1, 89);
+  el.style.zIndex = String(floatZ);
+}
 
 function ensureHandle(el: HTMLElement): void {
   if (el.querySelector(':scope > .window-resize-handle')) return;
@@ -21,26 +30,39 @@ function ensureHandle(el: HTMLElement): void {
   el.appendChild(handle);
 }
 
-function onMove(e: PointerEvent): void {
-  if (!drag) return;
+function onPointerMove(e: PointerEvent): void {
+  if (resize) {
+    e.preventDefault();
+    const { minWidth, minHeight } = optsMap.get(resize.el) ?? { minWidth: 280, minHeight: 160 };
+    const w = Math.max(minWidth, resize.w + (e.clientX - resize.x));
+    const h = Math.max(minHeight, resize.h + (e.clientY - resize.y));
+    resize.el.style.width = `${Math.round(w)}px`;
+    resize.el.style.height = `${Math.round(h)}px`;
+    return;
+  }
+  if (!move) return;
   e.preventDefault();
-  const { minWidth, minHeight } = optsMap.get(drag.el) ?? { minWidth: 280, minHeight: 160 };
-  const w = Math.max(minWidth, drag.w + (e.clientX - drag.x));
-  const h = Math.max(minHeight, drag.h + (e.clientY - drag.y));
-  drag.el.style.width = `${Math.round(w)}px`;
-  drag.el.style.height = `${Math.round(h)}px`;
+  const pad = 8;
+  const left = Math.max(pad, Math.min(window.innerWidth - 40, move.left + (e.clientX - move.x)));
+  const top = Math.max(pad, Math.min(window.innerHeight - 40, move.top + (e.clientY - move.y)));
+  move.el.style.left = `${Math.round(left)}px`;
+  move.el.style.top = `${Math.round(top)}px`;
 }
 
-function onUp(): void {
-  drag = null;
+function onPointerUp(): void {
+  resize = null;
+  if (move) {
+    move.el.classList.remove('is-dragging');
+    move = null;
+  }
 }
 
 function ensureListeners(): void {
   if (listening || typeof window === 'undefined') return;
   listening = true;
-  window.addEventListener('pointermove', onMove);
-  window.addEventListener('pointerup', onUp);
-  window.addEventListener('pointercancel', onUp);
+  window.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup', onPointerUp);
+  window.addEventListener('pointercancel', onPointerUp);
 }
 
 export function enableWindowResize(el: HTMLElement, opts: ResizeOpts = {}): void {
@@ -50,15 +72,35 @@ export function enableWindowResize(el: HTMLElement, opts: ResizeOpts = {}): void
   });
   ensureHandle(el);
   ensureListeners();
-  if (bound.has(el)) return;
-  bound.add(el);
+  if (resizeBound.has(el)) return;
+  resizeBound.add(el);
   el.addEventListener('pointerdown', (e) => {
     const t = e.target as HTMLElement;
     if (!t.closest('.window-resize-handle')) return;
     e.preventDefault();
     e.stopPropagation();
     const r = el.getBoundingClientRect();
-    drag = { el, w: r.width, h: r.height, x: e.clientX, y: e.clientY };
+    resize = { el, w: r.width, h: r.height, x: e.clientX, y: e.clientY };
     t.setPointerCapture?.(e.pointerId);
+  });
+}
+
+/** Drag a floating window by its title chrome (ignores buttons and fields). */
+export function enableWindowMove(el: HTMLElement, chromeSelector: string): void {
+  ensureListeners();
+  if (moveBound.has(el)) return;
+  moveBound.add(el);
+  el.addEventListener('pointerdown', (e) => {
+    raiseFloatingWindow(el);
+    const t = e.target as HTMLElement;
+    if (t.closest('.window-resize-handle')) return;
+    const chrome = t.closest(chromeSelector);
+    if (!chrome || !el.contains(chrome)) return;
+    if (t.closest('button, select, label, input, a')) return;
+    e.preventDefault();
+    const r = el.getBoundingClientRect();
+    move = { el, left: r.left, top: r.top, x: e.clientX, y: e.clientY };
+    el.classList.add('is-dragging');
+    el.setPointerCapture?.(e.pointerId);
   });
 }

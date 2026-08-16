@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { ResourceFork, type ResourceEntry } from './resource-fork';
-import { iconSetForFile, isCdevStyleType } from './icon-cache';
-import { CDEV_ICON_ID, IconSize } from './resource-types/icon-set';
+import {
+  HAS_BUNDLE,
+  HAS_CUSTOM_ICON,
+  IconCache,
+  iconForkLoadOptions,
+  iconSetForFile,
+  isCdevStyleType,
+  shouldReadIconFork,
+} from './icon-cache';
+import { CDEV_ICON_ID, CUSTOM_ICON_ID, IconSize } from './resource-types/icon-set';
+import type { VNode } from './virtual-fs';
 
 function entry(type: string, id: number, payload: Uint8Array): ResourceEntry {
   return {
@@ -22,12 +31,14 @@ function icn(): Uint8Array {
   return data;
 }
 
-function finder(type: string, creator: string): Uint8Array {
+function finder(type: string, creator: string, flags = 0): Uint8Array {
   const fi = new Uint8Array(32);
   for (let i = 0; i < 4; i++) {
     fi[i] = type.charCodeAt(i) ?? 0x20;
     fi[4 + i] = creator.charCodeAt(i) ?? 0x20;
   }
+  fi[8] = (flags >> 8) & 0xff;
+  fi[9] = flags & 0xff;
   return fi;
 }
 
@@ -90,5 +101,71 @@ describe('iconSetForFile', () => {
     ]);
     const set = iconSetForFile(rf, 'APPL', finder('APPL', 'TEST'));
     expect(set?.getIconBySize(IconSize.Large, true, false)?.typeCode).toBe('icl8');
+  });
+});
+
+describe('shouldReadIconFork', () => {
+  it('skips ordinary documents with no bundle or custom-icon flag', () => {
+    expect(shouldReadIconFork(finder('TEXT', 'ttxt'), 'TEXT')).toBe(false);
+  });
+
+  it('reads APPL, cdev, bundle-bit, and custom-icon files', () => {
+    expect(shouldReadIconFork(finder('APPL', 'TEST'), 'APPL')).toBe(true);
+    expect(shouldReadIconFork(finder('cdev', 'Rver'), 'cdev')).toBe(true);
+    expect(shouldReadIconFork(finder('TEXT', 'ttxt', HAS_BUNDLE), 'TEXT')).toBe(true);
+    expect(shouldReadIconFork(finder('TEXT', 'ttxt', HAS_CUSTOM_ICON), 'TEXT')).toBe(true);
+  });
+
+  it('skips a bundled app once its type/creator is cached', () => {
+    const cached = { small: 'data:image/png,x', large: 'data:image/png,x' };
+    expect(shouldReadIconFork(finder('APPL', 'TEST'), 'APPL', cached)).toBe(false);
+    expect(
+      shouldReadIconFork(finder('APPL', 'TEST'), 'APPL', {
+        small: '/icons/APPL16.png',
+        large: '/icons/APPL32.png',
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('iconForkLoadOptions', () => {
+  it('asks for the custom-icon family on Icon\\r files', () => {
+    const node: VNode = {
+      id: 1,
+      parentId: 2,
+      name: 'Icon\r',
+      isDir: false,
+      data: new Uint8Array(),
+      resource: new Uint8Array(),
+      finderInfo: finder('icon', 'MACS', HAS_CUSTOM_ICON),
+      createDate: 0,
+      modDate: 0,
+    };
+    const opts = iconForkLoadOptions(node);
+    expect(opts.includeAllIcons).toBe(true);
+    expect(opts.extraIds).toContain(CUSTOM_ICON_ID);
+  });
+});
+
+describe('IconCache.getForNode', () => {
+  it('does not look up Icon\\r inside a closed folder', async () => {
+    const cache = new IconCache();
+    let probes = 0;
+    const dir: VNode = {
+      id: 4,
+      parentId: 2,
+      name: 'Folder',
+      isDir: true,
+      data: new Uint8Array(),
+      resource: new Uint8Array(),
+      finderInfo: new Uint8Array(32),
+      createDate: 0,
+      modDate: 0,
+    };
+    await cache.getForNode(dir, undefined, async () => {
+      probes += 1;
+      return null;
+    });
+    expect(probes).toBe(0);
   });
 });

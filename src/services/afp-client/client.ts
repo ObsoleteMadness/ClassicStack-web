@@ -9,6 +9,10 @@ import { desEncryptBlock } from '../../hash/des';
 import { encodeMacRoman, decodeMacRoman } from '../../protocol/macroman';
 import { be16, be32 } from '../../protocol/binary';
 import { log } from '../../util/logger';
+import { AsyncSemaphore } from '../../util/async-semaphore';
+
+/** Keep OpenFork sessions (and other long AFP tasks) from flooding a classic server. */
+const MAX_PARALLEL_TASKS = 3;
 
 export type AfpCredentials =
   | { kind: 'guest' }
@@ -52,6 +56,7 @@ export class AfpClient {
   private pendingNotices: AfpServerNotice[] = [];
   private sawShutdown = false;
   private inFlight = 0;
+  private readonly tasks = new AsyncSemaphore(MAX_PARALLEL_TASKS);
 
   private constructor(sess: AspSession) {
     this.sess = sess;
@@ -410,6 +415,10 @@ export class AfpClient {
   }
 
   async list(dirId = C.CNIDRoot, path = '', volId?: number): Promise<cmd.DirEntry[]> {
+    return this.tasks.run(() => this.listUnlocked(dirId, path, volId));
+  }
+
+  private async listUnlocked(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry[]> {
     const vol = this.vid(volId);
     if (!vol) return [];
     const all: cmd.DirEntry[] = [];
@@ -440,6 +449,10 @@ export class AfpClient {
   }
 
   async stat(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry | undefined> {
+    return this.tasks.run(() => this.statUnlocked(dirId, path, volId));
+  }
+
+  private async statUnlocked(dirId: number, path: string, volId?: number): Promise<cmd.DirEntry | undefined> {
     const vol = this.vid(volId);
     if (!vol) return undefined;
     const r = await this.fp(
@@ -455,6 +468,34 @@ export class AfpClient {
   }
 
   /**
+   * Open a fork, run `fn`, then FPCloseFork. Close always runs after a successful
+   * OpenFork (even when `fn` throws) so classic servers do not leak fork slots.
+   */
+  private async withOpenFork<T>(
+    openCmd: Uint8Array,
+    fn: (forkRef: number) => Promise<T>,
+  ): Promise<T> {
+    const open = await this.fp(openCmd);
+    if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
+    const { forkRef } = cmd.parseOpenFork(open.data);
+    try {
+      return await fn(forkRef);
+    } finally {
+      try {
+        const closed = await this.fp(cmd.closeFork(forkRef));
+        if (closed.result !== C.NoErr) {
+          log.trace(`FPCloseFork ${forkRef} ${C.afpResultName(closed.result)}`, 'afp');
+        }
+      } catch (err) {
+        log.trace(
+          `FPCloseFork ${forkRef} error ${err instanceof Error ? err.message : String(err)}`,
+          'afp',
+        );
+      }
+    }
+  }
+
+  /**
    * Open a fork and run ranged FPReads (header / map / selected resources).
    */
   async withForkReader<T>(
@@ -464,24 +505,30 @@ export class AfpClient {
     fn: (read: (offset: number, count: number) => Promise<Uint8Array>) => Promise<T>,
     volId?: number,
   ): Promise<T> {
+    return this.tasks.run(() => this.withForkReaderUnlocked(path, dirId, resource, fn, volId));
+  }
+
+  private async withForkReaderUnlocked<T>(
+    path: string,
+    dirId: number,
+    resource: boolean,
+    fn: (read: (offset: number, count: number) => Promise<Uint8Array>) => Promise<T>,
+    volId?: number,
+  ): Promise<T> {
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
-    const open = await this.fp(
+    return this.withOpenFork(
       cmd.openFork(this.vid(volId), dirId, 0, C.AccessRead, flag, path),
+      async (forkRef) => {
+        const read = async (offset: number, count: number): Promise<Uint8Array> => {
+          const bitmap = count <= 578 ? 0x01 : 0xff;
+          const rr = await this.fp(cmd.readFork(forkRef, offset, count), { bitmap });
+          if (rr.result === C.ErrEOFErr) return rr.data;
+          if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
+          return rr.data;
+        };
+        return await fn(read);
+      },
     );
-    if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
-    const { forkRef } = cmd.parseOpenFork(open.data);
-    try {
-      const read = async (offset: number, count: number): Promise<Uint8Array> => {
-        const bitmap = count <= 578 ? 0x01 : 0xff;
-        const rr = await this.fp(cmd.readFork(forkRef, offset, count), { bitmap });
-        if (rr.result === C.ErrEOFErr) return rr.data;
-        if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
-        return rr.data;
-      };
-      return await fn(read);
-    } finally {
-      await this.fp(cmd.closeFork(forkRef));
-    }
   }
 
   async mkdir(name: string, dirId = C.CNIDRoot, volId?: number): Promise<void> {
@@ -519,42 +566,59 @@ export class AfpClient {
     volId?: number,
     onBytes?: (n: number) => void,
   ): Promise<Uint8Array> {
+    return this.tasks.run(() => this.readFileUnlocked(path, dirId, resource, volId, onBytes));
+  }
+
+  private async readFileUnlocked(
+    path: string,
+    dirId: number,
+    resource: boolean,
+    volId?: number,
+    onBytes?: (n: number) => void,
+  ): Promise<Uint8Array> {
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
-    const open = await this.fp(
-      cmd.openFork(this.vid(volId), dirId, C.FileBitmapDataForkLen | C.FileBitmapRsrcForkLen, C.AccessRead, flag, path),
-    );
-    if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
-    const { forkRef } = cmd.parseOpenFork(open.data);
-    const chunks: Uint8Array[] = [];
-    let offset = 0;
-    try {
-      for (;;) {
-        const rr = await this.fp(cmd.readFork(forkRef, offset, 4096), { bitmap: 0xff });
-        if (rr.result === C.ErrEOFErr) {
-          if (rr.data.length) {
-            chunks.push(rr.data);
-            onBytes?.(rr.data.length);
+    // ClassicStack client/afp: ask only for the length bit of the fork being
+    // opened. System 7.5 PFS returns kFPBitmapErr if a data-fork open also
+    // requests the resource-fork length bit (and vice versa).
+    const lenBit = resource ? C.FileBitmapRsrcForkLen : C.FileBitmapDataForkLen;
+    return this.withOpenFork(
+      cmd.openFork(
+        this.vid(volId),
+        dirId,
+        lenBit,
+        C.AccessRead,
+        flag,
+        path,
+      ),
+      async (forkRef) => {
+        const chunks: Uint8Array[] = [];
+        let offset = 0;
+        for (;;) {
+          const rr = await this.fp(cmd.readFork(forkRef, offset, 4096), { bitmap: 0xff });
+          if (rr.result === C.ErrEOFErr) {
+            if (rr.data.length) {
+              chunks.push(rr.data);
+              onBytes?.(rr.data.length);
+            }
+            break;
           }
-          break;
+          if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
+          if (rr.data.length === 0) break;
+          chunks.push(rr.data);
+          onBytes?.(rr.data.length);
+          offset += rr.data.length;
+          if (rr.data.length < 4096) break;
         }
-        if (rr.result !== C.NoErr) throw new Error(`FPRead ${rr.result}`);
-        if (rr.data.length === 0) break;
-        chunks.push(rr.data);
-        onBytes?.(rr.data.length);
-        offset += rr.data.length;
-        if (rr.data.length < 4096) break;
-      }
-    } finally {
-      await this.fp(cmd.closeFork(forkRef));
-    }
-    const total = chunks.reduce((n, c) => n + c.length, 0);
-    const out = new Uint8Array(total);
-    let o = 0;
-    for (const c of chunks) {
-      out.set(c, o);
-      o += c.length;
-    }
-    return out;
+        const total = chunks.reduce((n, c) => n + c.length, 0);
+        const out = new Uint8Array(total);
+        let o = 0;
+        for (const c of chunks) {
+          out.set(c, o);
+          o += c.length;
+        }
+        return out;
+      },
+    );
   }
 
   async writeFile(
@@ -565,33 +629,40 @@ export class AfpClient {
     volId?: number,
     onBytes?: (n: number) => void,
   ): Promise<void> {
+    return this.tasks.run(() => this.writeFileUnlocked(path, data, dirId, resource, volId, onBytes));
+  }
+
+  private async writeFileUnlocked(
+    path: string,
+    data: Uint8Array,
+    dirId: number,
+    resource: boolean,
+    volId?: number,
+    onBytes?: (n: number) => void,
+  ): Promise<void> {
     const vol = this.vid(volId);
     const cr = await this.fp(cmd.createFile(vol, dirId, path, 0));
     if (cr.result !== C.NoErr && cr.result !== C.ErrObjectExists) {
       throw new Error(`FPCreateFile ${cr.result}`);
     }
     const flag = resource ? C.ForkFlagResource : C.ForkFlagData;
-    const open = await this.fp(
+    await this.withOpenFork(
       cmd.openFork(vol, dirId, 0, C.AccessRead | C.AccessWrite, flag, path),
+      async (forkRef) => {
+        // ASP Write quantum; keep under ATP multi-packet budget (ClassicStack QuantumSize).
+        const chunkSize = 4096;
+        let offset = 0;
+        while (offset < data.length) {
+          const chunk = data.subarray(offset, Math.min(offset + chunkSize, data.length));
+          const wr = await this.fpWrite(cmd.writeFork(forkRef, offset, chunk.length), chunk);
+          if (wr.result !== C.NoErr) throw new Error(`FPWrite ${wr.result}`);
+          const last = cmd.parseWriteReply(wr.data);
+          const next = last > offset ? last : offset + chunk.length;
+          onBytes?.(next - offset);
+          offset = next;
+        }
+      },
     );
-    if (open.result !== C.NoErr) throw new Error(`FPOpenFork ${open.result}`);
-    const { forkRef } = cmd.parseOpenFork(open.data);
-    try {
-      // ASP Write quantum; keep under ATP multi-packet budget (ClassicStack QuantumSize).
-      const chunkSize = 4096;
-      let offset = 0;
-      while (offset < data.length) {
-        const chunk = data.subarray(offset, Math.min(offset + chunkSize, data.length));
-        const wr = await this.fpWrite(cmd.writeFork(forkRef, offset, chunk.length), chunk);
-        if (wr.result !== C.NoErr) throw new Error(`FPWrite ${wr.result}`);
-        const last = cmd.parseWriteReply(wr.data);
-        const next = last > offset ? last : offset + chunk.length;
-        onBytes?.(next - offset);
-        offset = next;
-      }
-    } finally {
-      await this.fp(cmd.closeFork(forkRef));
-    }
   }
 
   async setFinderInfo(

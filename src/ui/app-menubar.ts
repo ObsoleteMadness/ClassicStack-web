@@ -74,6 +74,8 @@ export class AppMenuBar extends HTMLElement {
   private render(): void {
     const capturing = this.host?.pcap.capturing ?? false;
     const count = this.host?.pcap.packetCount ?? 0;
+    const logOpen = this.host ? !this.host.logPanel.hidden : false;
+    const activityOpen = this.host ? !this.host.activityWindow.hidden : false;
     const showHidden = this.host?.finder?.getShowHiddenFiles?.() ?? false;
     const autoExpand = this.host?.finder?.getAutoExpandFiles?.() ?? false;
     const zipStyle = loadPrefs().zipExportStyle;
@@ -114,13 +116,13 @@ export class AppMenuBar extends HTMLElement {
                 <span class="app-menu__check"></span>
                 Netboot…
               </button>
-              <button type="button" role="menuitem" data-act="show-log" class="app-menu__item">
-                <span class="app-menu__check"></span>
+              <button type="button" role="menuitemcheckbox" aria-checked="${logOpen}" data-act="show-log" class="app-menu__item">
+                <span class="app-menu__check">${logOpen ? '✓' : ''}</span>
                 Show Log
               </button>
-              <button type="button" role="menuitem" data-act="show-activity" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Activity…
+              <button type="button" role="menuitemcheckbox" aria-checked="${activityOpen}" data-act="show-activity" class="app-menu__item">
+                <span class="app-menu__check">${activityOpen ? '✓' : ''}</span>
+                Activity
               </button>
               <hr />
               <button type="button" role="menuitemcheckbox" aria-checked="${showHidden}" data-act="toggle-show-hidden" class="app-menu__item">
@@ -180,10 +182,6 @@ export class AppMenuBar extends HTMLElement {
   private closeMenus(): void {
     this.openMenu = null;
     this.render();
-  }
-
-  private advancedTrigger(): HTMLElement | null {
-    return this.querySelector('[data-act="toggle-advanced"]');
   }
 
   private onClick(e: MouseEvent): void {
@@ -246,15 +244,13 @@ export class AppMenuBar extends HTMLElement {
 
     if (act === 'show-log') {
       this.closeMenus();
-      this.host.activityWindow.hide();
-      this.host.logPanel.toggleCallout(this.advancedTrigger());
+      this.host.logPanel.toggle();
       return;
     }
 
     if (act === 'show-activity') {
       this.closeMenus();
-      this.host.logPanel.hide();
-      this.host.activityWindow.toggleCallout(this.advancedTrigger());
+      this.host.activityWindow.toggle();
       return;
     }
 
