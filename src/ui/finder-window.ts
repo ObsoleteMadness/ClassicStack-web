@@ -1536,7 +1536,7 @@ export class FinderWindow extends HTMLElement {
     type Crumb = { name: string; id?: number; index: number };
     const crumbs: Crumb[] = this.pathStack.map((p, i) => ({
       name:
-        i === 0 && this.source === 'remote' && this.remoteNbpName
+        i === 0 && this.source === 'remote' && this.remoteNbpName && this.remoteEndpoint?.kind !== 'local'
           ? `${this.remoteNbpName}:${p.name}`
           : p.name || this.localShareTitle(),
       id: p.id,
@@ -2650,11 +2650,21 @@ export class FinderWindow extends HTMLElement {
       if (!s) return;
       if (this.remoteBusy) return;
       if (this.remoteLoggedIn && this.remoteNbpName === s.id) {
-        this.renderSidebar();
+        if (this.remoteOpen) {
+          this.closeSidebar();
+          await this.reload();
+          this.render();
+        } else {
+          this.renderSidebar();
+        }
         return;
       }
       await this.connectServerWithLogin(s);
       this.closeSidebar();
+      if (this.remoteOpen) {
+        await this.reload();
+        this.syncHistory();
+      }
       this.render();
       return;
     }
@@ -4031,7 +4041,9 @@ export class FinderWindow extends HTMLElement {
     if (!cat) throw new Error(`Couldn’t open volume “${name}”`);
     this.mountCatalog(cat, 'remote', name);
     this.remoteOpen = true;
-    this.setStatus(`Mounted ${this.remoteNbpName}:${name}`);
+    this.setStatus(
+      this.remoteEndpoint?.kind === 'local' ? `Opened ${name}` : `Mounted ${this.remoteNbpName}:${name}`,
+    );
   }
 
   private async ejectRemote(): Promise<void> {
