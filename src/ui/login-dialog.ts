@@ -42,11 +42,13 @@ export class LoginDialog extends HTMLElement {
   }
 
   close(): void {
+    const done = this.pending;
     this.busy = false;
     this.pending = null;
     this.hidden = true;
     this.opts = null;
     this.password = '';
+    done?.(null);
   }
 
   private finish(value: LoginCredentials | null): void {
