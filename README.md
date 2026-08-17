@@ -48,6 +48,8 @@ Finder UI (`src/ui/finder-window.ts`) must stay independent of archive and resou
 
 The Finder sidebar layout is owned by the host: set `RemoteEndpoint.group` / `badge` and implement `FinderHost.sidebarGroups()`. ClassicStack groups local shares vs AppleTalk / SMB / NetWare / EtherDFS clients; the TashTalk PWA keeps a single LocalTalk list.
 
+The extension→type/creator editor is shared (`ExtensionEditorDialog`). Persistence is a pluggable `ExtensionMapStore`: the PWA uses browser localStorage; ClassicStack’s SPA uses the Go `/extmap` API (Netatalk `extmap.conf`).
+
 Register with `registerArchiveCodec`, `registerResourceDecompressor`, `registerResourceTypeDecoder`, or `registerRezCodec`. Re-registering the bundled ids (`sit`, `binhex`, `macbinary`, `zip`, `applesingle`, `dcmp`) replaces the default implementation.
 
 ## Credits

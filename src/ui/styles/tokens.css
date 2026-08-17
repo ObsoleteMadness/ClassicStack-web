@@ -2942,6 +2942,12 @@ extension-editor-dialog[hidden],
   color: var(--text-muted);
 }
 
+.extension-editor__error {
+  margin: 0 20px 8px;
+  font-size: 13px;
+  color: var(--danger);
+}
+
 .extension-editor__footer {
   align-items: center;
 }
