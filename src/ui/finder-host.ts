@@ -29,6 +29,12 @@ export type SidebarGroup = {
   hideWhenEmpty?: boolean;
 };
 
+/** One item in a sidebar-row context menu (Configure, Mount, …). */
+export type SidebarAction = {
+  id: string;
+  label: string;
+};
+
 /** One discoverable server or local volume the Finder can open. */
 export interface RemoteEndpoint {
   /** Opaque id (NBP name, SMB server, `local:afp:Mac HD`, …). */
@@ -73,7 +79,11 @@ export interface CredentialPromptOptions {
 export interface FinderHost {
   isConnected(): boolean;
   nodeLabel(): string;
-  refreshNetwork(): Promise<RemoteEndpoint[]>;
+  /**
+   * Rediscover endpoints. `scope` is a `SidebarGroup.id` so a heading’s scan
+   * button can refresh only that service; omitted means all groups.
+   */
+  refreshNetwork(scope?: string): Promise<RemoteEndpoint[]>;
   beginRemote(ep: RemoteEndpoint): Promise<SessionInfo>;
   loginRemote(creds: Credentials): Promise<string[]>;
   openVolume(name: string): Promise<Catalog>;
@@ -93,6 +103,9 @@ export interface FinderHost {
    * Omitted: a single LocalTalk/Network section (plus the IndexedDB local share).
    */
   sidebarGroups?(): SidebarGroup[];
+  /** Context-menu items for a sidebar server (and optional volume child). */
+  sidebarContextMenu?(ep: RemoteEndpoint, volume?: string): SidebarAction[];
+  onSidebarAction?(ep: RemoteEndpoint, action: string, volume?: string): void | Promise<void>;
   /** Display name for the local catalog (default “Browser Share”). */
   localTitle?(): string;
   dismissLogin?(): void;

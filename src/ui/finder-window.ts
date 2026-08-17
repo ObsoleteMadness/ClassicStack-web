@@ -5,6 +5,7 @@ import type {
   FinderHost,
   RemoteEndpoint,
   SessionInfo,
+  SidebarAction,
   SidebarBadge,
   SidebarGroup,
 } from './finder-host';
@@ -66,6 +67,7 @@ import { decodePict, pictToSvg } from '../fs/pict/pict';
 import { previewKindFor, previewMime, type FilePreviewKind } from './file-preview';
 import {
   SIDEBAR_GROUP_NETWORK,
+  assignSidebarGroup,
   badgeText,
   badgeTitle,
   endpointsByGroup,
@@ -185,7 +187,13 @@ export class FinderWindow extends HTMLElement {
     sourceIds: number[];
   } | null = null;
   private catalogs = new Map<string, Catalog>();
-  private contextMenu: { x: number; y: number; targetId: number | null; local?: boolean } | null = null;
+  private contextMenu: {
+    x: number;
+    y: number;
+    targetId: number | null;
+    local?: boolean;
+    sidebar?: { index: number; volume?: string; actions: SidebarAction[] };
+  } | null = null;
   /** Show Finder-invisible / Icon\\r items (persisted via prefs). */
   private showHiddenFiles = loadPrefs().showHiddenFiles;
   /** Decode dropped BinHex / MacBinary (persisted via prefs). */
@@ -229,7 +237,8 @@ export class FinderWindow extends HTMLElement {
   private navListAbort: AbortController | null = null;
   /** Per-folder list-view disclose listings; aborted on collapse or navigation. */
   private expandListAbort = new Map<number, AbortController>();
-  private networkScanning = false;
+  /** Sidebar group id being scanned, or `'*'` for a full refresh. */
+  private networkScanning: string | null = null;
   private preview: {
     id: number;
     name: string;
@@ -658,11 +667,8 @@ export class FinderWindow extends HTMLElement {
   }
 
   setNetworkScanning(busy: boolean): void {
-    this.networkScanning = busy;
-    const btn = this.querySelector('.side-refresh');
-    if (!btn) return;
-    btn.classList.toggle('spinning', busy);
-    btn.setAttribute('aria-busy', String(busy));
+    this.networkScanning = busy ? '*' : null;
+    this.renderSidebar();
   }
 
   setServers(list: RemoteEndpoint[]): void {
@@ -1437,8 +1443,9 @@ export class FinderWindow extends HTMLElement {
             )
             .join('') ||
           `<div class="side-item"><span class="dot off"></span><span>${this.escape(g.empty || 'None')}</span></div>`;
+        const scanning = this.networkScanning === '*' || this.networkScanning === g.id;
         const refresh = g.refresh
-          ? `<button type="button" class="side-refresh${this.networkScanning ? ' spinning' : ''}" data-act="refresh" aria-label="Refresh network" aria-busy="${this.networkScanning}" ${refreshEnabled ? '' : 'disabled'}>${uiIcons.refresh}</button>`
+          ? `<button type="button" class="side-refresh${scanning ? ' spinning' : ''}" data-act="refresh" data-refresh="${this.escape(g.id)}" aria-label="Scan ${this.escape(g.title)}" aria-busy="${scanning}" ${refreshEnabled ? '' : 'disabled'}>${uiIcons.refresh}</button>`
           : '';
         return `
       <div class="side-label${g.refresh ? ' side-label--with-action' : ''}">
@@ -1495,9 +1502,10 @@ export class FinderWindow extends HTMLElement {
     },
   ): string {
     const connected = this.remoteLoggedIn && s.id === opts.connectedId;
-    const serverSel = opts.viewingServer && connected ? 'selected' : '';
+    const localShare = s.kind === 'local';
+    const serverSel = connected && (localShare ? this.source === 'remote' : opts.viewingServer) ? 'selected' : '';
     const kids =
-      connected && opts.volumes.length
+      connected && !localShare && opts.volumes.length
         ? opts.volumes
             .map(
               (v, vi) => `
@@ -1508,9 +1516,10 @@ export class FinderWindow extends HTMLElement {
             )
             .join('')
         : '';
-    const eject = connected
-      ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
-      : '';
+    const eject =
+      connected && !localShare
+        ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
+        : '';
     const subtitle = s.subtitle ? ` title="${this.escape(s.subtitle)}"` : '';
     return `
       <div class="side-item ${serverSel}" data-server="${i}"${subtitle}>
@@ -2532,8 +2541,14 @@ export class FinderWindow extends HTMLElement {
       e.preventDefault();
       const action = ctxItem.getAttribute('data-ctx')!;
       const ctxTarget = this.contextMenu?.targetId ?? null;
+      const sidebar = this.contextMenu?.sidebar;
       this.contextMenu = null;
       this.renderContextMenu();
+      if (sidebar) {
+        const ep = this.servers[sidebar.index];
+        if (ep) await this.host.onSidebarAction?.(ep, action, sidebar.volume);
+        return;
+      }
       await this.handleContextAction(action, ctxTarget);
       return;
     }
@@ -2578,6 +2593,10 @@ export class FinderWindow extends HTMLElement {
       e.stopPropagation();
       const jobId = actEl?.getAttribute('data-job');
       if (jobId) transferActivity.cancel(jobId);
+      return;
+    }
+    if (act === 'refresh') {
+      await this.onRefresh(actEl?.getAttribute('data-refresh') || undefined);
       return;
     }
     if (act) {
@@ -4027,15 +4046,39 @@ export class FinderWindow extends HTMLElement {
     this.render();
   }
 
-  private async onRefresh(): Promise<void> {
-    this.setStatus(this.hasTransport() ? 'Looking up AFPServer…' : 'Looking up servers…');
+  private async onRefresh(groupId?: string): Promise<void> {
+    const groups = this.sidebarGroups();
+    const title = groupId ? groups.find((g) => g.id === groupId)?.title : undefined;
+    this.networkScanning = groupId || '*';
+    this.renderSidebar();
+    this.setStatus(
+      title
+        ? `Scanning ${title}…`
+        : this.hasTransport()
+          ? 'Looking up AFPServer…'
+          : 'Looking up servers…',
+    );
     try {
-      const list = await this.host.refreshNetwork();
+      const list = await this.host.refreshNetwork(groupId);
       this.setServers(list);
-      const n = list.filter((s) => s.kind !== 'local').length;
-      this.setStatus(n ? `Found ${n} server(s)` : 'No servers');
+      const scoped = groupId
+        ? list.filter((s) => assignSidebarGroup(s, groups) === groupId && s.kind !== 'local')
+        : list.filter((s) => s.kind !== 'local');
+      const n = scoped.length;
+      this.setStatus(
+        title
+          ? n
+            ? `${title}: found ${n} server(s)`
+            : `${title}: none`
+          : n
+            ? `Found ${n} server(s)`
+            : 'No servers',
+      );
     } catch (e) {
       this.setStatus(`Lookup failed: ${(e as Error).message}`);
+    } finally {
+      this.networkScanning = null;
+      this.renderSidebar();
     }
   }
 
@@ -4870,6 +4913,30 @@ export class FinderWindow extends HTMLElement {
       this.renderContextMenu();
       return;
     }
+    const volEl = t.closest('[data-vol]');
+    const serverEl = t.closest('[data-server]');
+    if (volEl || serverEl) {
+      let index = -1;
+      let volume: string | undefined;
+      if (volEl) {
+        index = this.servers.findIndex((s) => s.id === (this.remoteEndpoint?.id || this.remoteNbpName));
+        volume = this.remoteVolumes[Number(volEl.getAttribute('data-vol'))];
+      } else if (serverEl) {
+        index = Number(serverEl.getAttribute('data-server'));
+      }
+      const ep = this.servers[index];
+      const actions = ep ? (this.host.sidebarContextMenu?.(ep, volume) ?? []) : [];
+      if (!ep || !actions.length) return;
+      e.preventDefault();
+      this.contextMenu = {
+        x: e.clientX,
+        y: e.clientY,
+        targetId: null,
+        sidebar: { index, volume, actions },
+      };
+      this.renderContextMenu();
+      return;
+    }
     const content = this.querySelector('.content');
     if (!content?.contains(e.target as Node)) return;
     e.preventDefault();
@@ -4895,38 +4962,40 @@ export class FinderWindow extends HTMLElement {
       root.innerHTML = '';
       return;
     }
-    const { x, y, targetId, local } = this.contextMenu;
+    const { x, y, targetId, local, sidebar } = this.contextMenu;
     const targetNode = targetId != null ? this.findNodeAnywhere(targetId) : null;
     const canPreview = this.isPreviewable(targetNode);
-    const items = local
-      ? [
-          `<button type="button" data-ctx="welcome-pack">Add Welcome Pack Items</button>`,
-          `<hr/>`,
-          `<button type="button" data-ctx="erase-local">Erase All Items…</button>`,
-        ]
-      : targetId != null
+    const items = sidebar
+      ? sidebar.actions.map((a) => `<button type="button" data-ctx="${this.escape(a.id)}">${this.escape(a.label)}</button>`)
+      : local
         ? [
-            this.isExpandableArchive(targetNode)
-              ? `<button type="button" data-ctx="expand">Expand</button>`
-              : '',
-            `<button type="button" data-ctx="download">Download Zip</button>`,
-            canPreview ? `<button type="button" data-ctx="preview">Preview…</button>` : '',
-            `<button type="button" data-ctx="rename">Rename</button>`,
-            `<button type="button" data-ctx="delete">Delete…</button>`,
-            `<button type="button" data-ctx="props">Get Info…</button>`,
-            targetNode && !targetNode.isDir
-              ? `<button type="button" data-ctx="resources">Resources…</button>`
-              : '',
+            `<button type="button" data-ctx="welcome-pack">Add Welcome Pack Items</button>`,
             `<hr/>`,
-            `<button type="button" data-ctx="cut">Cut</button>`,
-            `<button type="button" data-ctx="copy">Copy</button>`,
-            this.clipboard ? `<button type="button" data-ctx="paste">Paste</button>` : '',
+            `<button type="button" data-ctx="erase-local">Erase All Items…</button>`,
           ]
-        : [
-            `<button type="button" data-ctx="mkdir">New Folder</button>`,
-            this.clipboard ? `<button type="button" data-ctx="paste">Paste</button>` : '',
-            `<button type="button" data-ctx="props-blank">Get Info</button>`,
-          ];
+        : targetId != null
+          ? [
+              this.isExpandableArchive(targetNode)
+                ? `<button type="button" data-ctx="expand">Expand</button>`
+                : '',
+              `<button type="button" data-ctx="download">Download Zip</button>`,
+              canPreview ? `<button type="button" data-ctx="preview">Preview…</button>` : '',
+              `<button type="button" data-ctx="rename">Rename</button>`,
+              `<button type="button" data-ctx="delete">Delete…</button>`,
+              `<button type="button" data-ctx="props">Get Info…</button>`,
+              targetNode && !targetNode.isDir
+                ? `<button type="button" data-ctx="resources">Resources…</button>`
+                : '',
+              `<hr/>`,
+              `<button type="button" data-ctx="cut">Cut</button>`,
+              `<button type="button" data-ctx="copy">Copy</button>`,
+              this.clipboard ? `<button type="button" data-ctx="paste">Paste</button>` : '',
+            ]
+          : [
+              `<button type="button" data-ctx="mkdir">New Folder</button>`,
+              this.clipboard ? `<button type="button" data-ctx="paste">Paste</button>` : '',
+              `<button type="button" data-ctx="props-blank">Get Info</button>`,
+            ];
     root.innerHTML = `<div class="ctx-menu" style="left:${x}px;top:${y}px">${items.filter(Boolean).join('')}</div>`;
   }
 
