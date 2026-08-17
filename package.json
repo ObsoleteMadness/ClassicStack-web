@@ -14,7 +14,16 @@
     "./ui/get-info": "./src/ui/get-info-window.ts",
     "./ui/resource-explorer": "./src/ui/resource-fork-explorer.ts",
     "./fs/catalog": "./src/fs/virtual-fs.ts",
-    "./fs/empty-catalog": "./src/fs/empty-catalog.ts"
+    "./fs/empty-catalog": "./src/fs/empty-catalog.ts",
+    "./fs/codecs": "./src/fs/codecs.ts",
+    "./fs/expand": "./src/fs/expand-incoming.ts",
+    "./fs/stuffit": "./src/fs/stuffit.ts",
+    "./fs/binhex": "./src/fs/binhex.ts",
+    "./fs/macbinary": "./src/fs/macbinary.ts",
+    "./fs/zip": "./src/fs/zip.ts",
+    "./fs/resource-fork": "./src/fs/resource-fork.ts",
+    "./fs/resource-compress": "./src/fs/resource-compress.ts",
+    "./fs/appledouble": "./src/fs/appledouble.ts"
   },
   "scripts": {
     "dev": "vite",

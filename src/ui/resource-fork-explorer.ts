@@ -5,6 +5,7 @@
 
 import type { Catalog, VNode } from '../fs/virtual-fs';
 import { ResourceFork, resourceFetchCap, type ResourceEntry } from '../fs/resource-fork';
+import { decompileRez, decodeResourceType } from '../fs/codecs';
 import {
   decodeFref,
   describeBndl,
@@ -397,6 +398,15 @@ export class ResourceForkExplorer extends HTMLElement {
             </table>
           </div>`);
       }
+    }
+
+    const decoded = decodeResourceType(sel.entry.type, sel.entry.id, bytes);
+    if (typeof decoded === 'string' && decoded) {
+      parts.push(`<pre class="rsrc-explorer__decoded">${escapeHtml(decoded)}</pre>`);
+    }
+    const rez = decompileRez(sel.entry.type, sel.entry.id, bytes);
+    if (rez) {
+      parts.push(`<pre class="rsrc-explorer__rez">${escapeHtml(rez)}</pre>`);
     }
 
     const dump = hexDump(bytes);
