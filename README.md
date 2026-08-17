@@ -46,6 +46,8 @@ Protocol codecs mirror [ClassicStack](https://github.com/ObsoleteMadness/Classic
 
 Finder UI (`src/ui/finder-window.ts`) must stay independent of archive and resource-fork codecs. StuffIt, BinHex, MacBinary, ZIP, Apple compressed resources (`dcmp`), icon/BNDL decoders, and any future **rez** decompiler live under `src/fs/` and register through `src/fs/codecs.ts` (`classicstack-web/fs/codecs`). When this repo splits into packages, those modules become their own packages (`@classicstack/finder-ui`, `@classicstack/expand`, `@classicstack/stuffit`, `@classicstack/resource-fork`, …) so a third party can ship a replacement SIT expander or rez decoder without forking the PWA.
 
+The Finder sidebar layout is owned by the host: set `RemoteEndpoint.group` / `badge` and implement `FinderHost.sidebarGroups()`. ClassicStack groups local shares vs AppleTalk / SMB / NetWare / EtherDFS clients; the TashTalk PWA keeps a single LocalTalk list.
+
 Register with `registerArchiveCodec`, `registerResourceDecompressor`, `registerResourceTypeDecoder`, or `registerRezCodec`. Re-registering the bundled ids (`sit`, `binhex`, `macbinary`, `zip`, `applesingle`, `dcmp`) replaces the default implementation.
 
 ## Credits

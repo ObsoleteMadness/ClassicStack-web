@@ -7,6 +7,28 @@ import type { WelcomePackProgress } from '../fs/welcome-pack';
 /** File-sharing scheme a sidebar endpoint was discovered on (or this host’s own volumes). */
 export type ShareKind = 'local' | 'afp' | 'smb' | 'ncp' | 'etherdfs';
 
+/** Short pill on a sidebar row (AFP, TCP, NBP, …). */
+export type SidebarBadge = {
+  text: string;
+  title?: string;
+};
+
+/**
+ * One heading in the Finder sidebar. The host owns titles and order;
+ * FinderWindow only renders. Unknown `RemoteEndpoint.group` values fall through
+ * to the `network` group, or the first group with `refresh`.
+ */
+export type SidebarGroup = {
+  id: string;
+  title: string;
+  /** Show the network-refresh control on this heading. */
+  refresh?: boolean;
+  /** Placeholder when the group has no endpoints. */
+  empty?: string;
+  /** Omit the heading when this group has no endpoints. */
+  hideWhenEmpty?: boolean;
+};
+
 /** One discoverable server or local volume the Finder can open. */
 export interface RemoteEndpoint {
   /** Opaque id (NBP name, SMB server, `local:afp:Mac HD`, …). */
@@ -14,6 +36,14 @@ export interface RemoteEndpoint {
   kind: ShareKind;
   title: string;
   subtitle?: string;
+  /** Sidebar section id from `FinderHost.sidebarGroups`. */
+  group?: string;
+  /** Share-type or transport pill (AFP, SMB, TCP, DDP, …). */
+  badge?: string | SidebarBadge;
+  /** File protocol for local shares (`afp`, `smb`, `ncp`, `etherdfs`). */
+  protocol?: string;
+  /** How this client was reached (`tcp`, `ddp`, `ipx`, `nbp`, `etherdfs`). */
+  transport?: string;
 }
 
 /** Result of contacting a remote (or local) endpoint before / after login. */
@@ -58,6 +88,11 @@ export interface FinderHost {
     suggestedName: string;
   }): Promise<NameConflictChoice>;
 
+  /**
+   * Sidebar headings in display order. Endpoints set `group` to one of these ids.
+   * Omitted: a single LocalTalk/Network section (plus the IndexedDB local share).
+   */
+  sidebarGroups?(): SidebarGroup[];
   /** Display name for the local catalog (default “Browser Share”). */
   localTitle?(): string;
   dismissLogin?(): void;

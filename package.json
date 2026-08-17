@@ -7,6 +7,7 @@
   "exports": {
     "./ui/finder": "./src/ui/finder-window.ts",
     "./ui/finder-host": "./src/ui/finder-host.ts",
+    "./ui/finder-sidebar": "./src/ui/finder-sidebar.ts",
     "./ui/styles": "./src/ui/styles/tokens.css",
     "./ui/login": "./src/ui/login-dialog.ts",
     "./ui/alert": "./src/ui/alert-dialog.ts",

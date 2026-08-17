@@ -200,6 +200,8 @@ async function main(): Promise<void> {
       kind: 'afp',
       title: s.object,
       subtitle: s.zone && s.zone !== '*' ? s.zone : `${s.network}.${s.node}`,
+      badge: 'NBP',
+      transport: 'nbp',
     };
   }
 

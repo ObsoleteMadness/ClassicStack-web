@@ -395,6 +395,24 @@ finder-window.is-dragging .titlebar {
   background: var(--text-muted);
 }
 
+.side-badge {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.side-item.selected .side-badge {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--text);
+}
+
 .main {
   display: flex;
   flex-direction: column;

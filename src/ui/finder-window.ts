@@ -5,6 +5,8 @@ import type {
   FinderHost,
   RemoteEndpoint,
   SessionInfo,
+  SidebarBadge,
+  SidebarGroup,
 } from './finder-host';
 import { fromMacTime } from '../protocol/afp/constants';
 import { decodeMacRoman } from '../protocol/macroman';
@@ -62,6 +64,13 @@ import {
 } from '../fs/name-conflict';
 import { decodePict, pictToSvg } from '../fs/pict/pict';
 import { previewKindFor, previewMime, type FilePreviewKind } from './file-preview';
+import {
+  SIDEBAR_GROUP_NETWORK,
+  badgeText,
+  badgeTitle,
+  endpointsByGroup,
+  visibleSidebarGroups,
+} from './finder-sidebar';
 
 export type ViewMode = 'icon' | 'list' | 'column';
 export type SortKey = 'name' | 'modified' | 'size';
@@ -69,7 +78,14 @@ export type SortKey = 'name' | 'modified' | 'size';
 /** Finder file types that open in the Quick Look overlay. */
 const PREVIEW_TEXT_MAX_BYTES = 512 * 1024;
 
-export type { Credentials, FinderHost, RemoteEndpoint, SessionInfo } from './finder-host';
+export type {
+  Credentials,
+  FinderHost,
+  RemoteEndpoint,
+  SessionInfo,
+  SidebarBadge,
+  SidebarGroup,
+} from './finder-host';
 
 interface ListItem {
   key: string;
@@ -1402,32 +1418,34 @@ export class FinderWindow extends HTMLElement {
     const viewingLocal = this.source === 'local' && this.hasLocalShare();
     const openVol = this.source === 'remote' ? this.pathStack[0]?.name || '' : '';
     const viewingServer = this.source === 'remote' && !this.remoteOpen;
-    const servers = this.servers
-      .map((s, i) => {
-        const connected = this.remoteLoggedIn && s.id === connectedId;
-        const serverSel = viewingServer && connected ? 'selected' : '';
-        const kids =
-          connected && volumes.length
-            ? volumes
-                .map(
-                  (v, vi) => `
-      <div class="side-item side-item--child ${!viewingLocal && openVol === v ? 'selected' : ''}" data-vol="${vi}">
-        <span class="dot"></span>
-        <span class="side-item-label" aria-label="${this.escape(v)}">${this.escape(v)}</span>
-      </div>`,
-                )
-                .join('')
-            : '';
-        const eject = connected
-          ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
+    const groups = this.sidebarGroups();
+    const byGroup = endpointsByGroup(this.servers, groups);
+    const refreshEnabled = this.host?.isConnected() || !this.hasTransport();
+    const groupBlocks = visibleSidebarGroups(groups, byGroup)
+      .map((g) => {
+        const rows = byGroup.get(g.id) ?? [];
+        const items =
+          rows
+            .map(({ ep: s, index: i }) =>
+              this.sidebarEndpointHtml(s, i, {
+                connectedId,
+                volumes,
+                viewingLocal,
+                openVol,
+                viewingServer,
+              }),
+            )
+            .join('') ||
+          `<div class="side-item"><span class="dot off"></span><span>${this.escape(g.empty || 'None')}</span></div>`;
+        const refresh = g.refresh
+          ? `<button type="button" class="side-refresh${this.networkScanning ? ' spinning' : ''}" data-act="refresh" aria-label="Refresh network" aria-busy="${this.networkScanning}" ${refreshEnabled ? '' : 'disabled'}>${uiIcons.refresh}</button>`
           : '';
-        const subtitle = s.subtitle ? ` title="${this.escape(s.subtitle)}"` : '';
         return `
-      <div class="side-item ${serverSel}" data-server="${i}"${subtitle}>
-        <span class="dot"></span>
-        <span class="side-item-label" aria-label="${this.escape(s.title)}">${this.escape(s.title)}</span>
-        ${eject}
-      </div>${kids}`;
+      <div class="side-label${g.refresh ? ' side-label--with-action' : ''}">
+        <span>${this.escape(g.title)}</span>
+        ${refresh}
+      </div>
+      ${items}`;
       })
       .join('');
     const localBlock = this.hasLocalShare()
@@ -1438,17 +1456,69 @@ export class FinderWindow extends HTMLElement {
         <button type="button" class="side-more" data-act="share-actions" aria-label="Share actions" title="Share actions">${uiIcons.more}</button>
       </div>`
       : '';
-    const netLabel = this.hasTransport() ? 'LocalTalk' : 'Network';
-    const emptyNet = this.hasTransport() ? 'No AFP servers' : 'No servers';
-    const refreshEnabled = this.host?.isConnected() || !this.hasTransport();
     side.innerHTML = `
       ${localBlock}
-      <div class="side-label side-label--with-action">
-        <span>${netLabel}</span>
-        <button type="button" class="side-refresh${this.networkScanning ? ' spinning' : ''}" data-act="refresh" aria-label="Refresh network" aria-busy="${this.networkScanning}" ${refreshEnabled ? '' : 'disabled'}>${uiIcons.refresh}</button>
-      </div>
-      ${servers || `<div class="side-item"><span class="dot off"></span><span>${emptyNet}</span></div>`}
+      ${groupBlocks}
     `;
+  }
+
+  private sidebarGroups(): SidebarGroup[] {
+    const custom = this.host?.sidebarGroups?.();
+    if (custom?.length) return custom;
+    return [
+      {
+        id: SIDEBAR_GROUP_NETWORK,
+        title: this.hasTransport() ? 'LocalTalk' : 'Network',
+        refresh: true,
+        empty: this.hasTransport() ? 'No AFP servers' : 'No servers',
+      },
+    ];
+  }
+
+  private sidebarBadgeHtml(badge: string | SidebarBadge | undefined): string {
+    const text = badgeText(badge);
+    if (!text) return '';
+    const title = badgeTitle(badge);
+    const tip = title ? ` title="${this.escape(title)}"` : '';
+    return `<span class="side-badge"${tip}>${this.escape(text)}</span>`;
+  }
+
+  private sidebarEndpointHtml(
+    s: RemoteEndpoint,
+    i: number,
+    opts: {
+      connectedId: string;
+      volumes: string[];
+      viewingLocal: boolean;
+      openVol: string;
+      viewingServer: boolean;
+    },
+  ): string {
+    const connected = this.remoteLoggedIn && s.id === opts.connectedId;
+    const serverSel = opts.viewingServer && connected ? 'selected' : '';
+    const kids =
+      connected && opts.volumes.length
+        ? opts.volumes
+            .map(
+              (v, vi) => `
+      <div class="side-item side-item--child ${!opts.viewingLocal && opts.openVol === v ? 'selected' : ''}" data-vol="${vi}">
+        <span class="dot"></span>
+        <span class="side-item-label" aria-label="${this.escape(v)}">${this.escape(v)}</span>
+      </div>`,
+            )
+            .join('')
+        : '';
+    const eject = connected
+      ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
+      : '';
+    const subtitle = s.subtitle ? ` title="${this.escape(s.subtitle)}"` : '';
+    return `
+      <div class="side-item ${serverSel}" data-server="${i}"${subtitle}>
+        <span class="dot"></span>
+        <span class="side-item-label" aria-label="${this.escape(s.title)}">${this.escape(s.title)}</span>
+        ${this.sidebarBadgeHtml(s.badge)}
+        ${eject}
+      </div>${kids}`;
   }
 
   private renderPath(): void {
@@ -3962,7 +4032,8 @@ export class FinderWindow extends HTMLElement {
     try {
       const list = await this.host.refreshNetwork();
       this.setServers(list);
-      this.setStatus(`Found ${list.length} server(s)`);
+      const n = list.filter((s) => s.kind !== 'local').length;
+      this.setStatus(n ? `Found ${n} server(s)` : 'No servers');
     } catch (e) {
       this.setStatus(`Lookup failed: ${(e as Error).message}`);
     }
