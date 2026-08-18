@@ -1,6 +1,9 @@
-# ClassicStackWeb
+# ClassicStack-Web
+AppleTalk / AFP stack over **WebSerial → TashTalk → LocalTalk** in your **browser**.
 
-Browser AppleTalk / AFP stack over **WebSerial → TashTalk → LocalTalk**.
+> ## Need more features?
+> Checkout [ClassicStack](https://github.com/ObsoleteMadness/ClassicStack) - a full-featured Apple File Server, 
+> IPX/NetBeui SMB and Netware Server and Client for Windows, MacOS and Linux.
 
 ## Features
 

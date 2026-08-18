@@ -50,6 +50,11 @@ export interface RemoteEndpoint {
   protocol?: string;
   /** How this client was reached (`tcp`, `ddp`, `ipx`, `nbp`, `etherdfs`). */
   transport?: string;
+  /**
+   * `volume` is a mounted share (eject on this row). Default `server` lists
+   * volumes as children after login and shows Disconnect on this row.
+   */
+  role?: 'server' | 'volume';
 }
 
 /** Result of contacting a remote (or local) endpoint before / after login. */
@@ -69,6 +74,8 @@ export interface CredentialPromptOptions {
   uams: string[];
   error?: string;
   allowGuest: boolean;
+  /** File-sharing scheme; omitted on the in-browser AFP host (UAMs). */
+  kind?: ShareKind;
 }
 
 /**
@@ -84,10 +91,29 @@ export interface FinderHost {
    * button can refresh only that service; omitted means all groups.
    */
   refreshNetwork(scope?: string): Promise<RemoteEndpoint[]>;
+  /**
+   * Last successful scan from the host (no network wait). FinderWindow paints
+   * this immediately on load/reload, then awaits `refreshNetwork` for new servers.
+   */
+  cachedNetwork?(scope?: string): Promise<RemoteEndpoint[]>;
+  /**
+   * Resolves once currently-open volumes (FUSE/WinFsp mounts and live sessions)
+   * are known. FinderWindow waits on this before restoring a URL path so it does
+   * not bounce to “server isn’t connected” while `/finder/mounted` is in flight.
+   */
+  readyMounted?(): Promise<void>;
   beginRemote(ep: RemoteEndpoint): Promise<SessionInfo>;
   loginRemote(creds: Credentials): Promise<string[]>;
   openVolume(name: string): Promise<Catalog>;
   closeRemote(): Promise<void>;
+  /** Close one opened volume (FPCloseVol / host unmount); stay logged in. */
+  closeVolume?(name: string): Promise<void>;
+  /**
+   * Open a catalog for a sidebar endpoint without changing the Finder’s
+   * current viewed session. Used when dropping onto a ClassicStack share or a
+   * FUSE-mounted volume while another catalog is on screen.
+   */
+  openEndpointCatalog?(ep: RemoteEndpoint): Promise<Catalog>;
   /** IndexedDB Browser Share on the web PWA; null in the Go SPA. */
   localCatalog(): Catalog | null;
   promptCredentials(opts: CredentialPromptOptions): Promise<Credentials | null>;

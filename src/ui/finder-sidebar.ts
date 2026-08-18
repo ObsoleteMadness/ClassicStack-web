@@ -68,3 +68,56 @@ export function visibleSidebarGroups(
   }
   return out;
 }
+
+/** PWA IndexedDB Browser Share. */
+export const LOCAL_SHARE_KEY = 'local';
+
+/**
+ * True when the sidebar row is itself a catalog (ClassicStack live share or a
+ * FUSE/WinFsp mounted volume), not a server that lists volumes as children.
+ */
+export function isCatalogEndpoint(ep: RemoteEndpoint): boolean {
+  return ep.kind === 'local' || ep.role === 'volume';
+}
+
+/** Stable Finder catalog key for an endpoint and optional volume child. */
+export function shareKeyForEndpoint(ep: RemoteEndpoint, volume?: string): string {
+  if (isCatalogEndpoint(ep)) return `endpoint:${ep.id}`;
+  if (volume) return `${ep.id}:${volume}`;
+  return `endpoint:${ep.id}`;
+}
+
+/**
+ * True when the on-screen Finder catalog is already this ClassicStack share
+ * or FUSE/WinFsp mount. Clicking the row must still switch catalogs when
+ * another remote volume is open — id/name matches are not enough.
+ */
+export function viewingCatalogEndpoint(
+  ep: RemoteEndpoint,
+  currentId: string | undefined,
+  source: 'local' | 'remote',
+  remoteOpen: boolean,
+): boolean {
+  return isCatalogEndpoint(ep) && source === 'remote' && remoteOpen && currentId === ep.id;
+}
+
+export type ShareDrop = { key: string; name: string };
+
+/**
+ * Sidebar drop target under the pointer. ClassicStack shares and mounted
+ * volumes use `data-share-key`; Browser Share uses `data-local`.
+ */
+export function shareDropFromElement(target: EventTarget | null, sidebar: Element | null): ShareDrop | null {
+  const t = target instanceof Element ? target : null;
+  if (!t || !sidebar) return null;
+  if (t.closest('[data-eject], [data-eject-endpoint], [data-disconnect]')) return null;
+  const el = t.closest('[data-share-key], [data-local]') as HTMLElement | null;
+  if (!el || !sidebar.contains(el)) return null;
+  const key = el.getAttribute('data-share-key') || (el.hasAttribute('data-local') ? LOCAL_SHARE_KEY : '');
+  if (!key) return null;
+  const name =
+    el.getAttribute('data-share-name') ||
+    el.querySelector('.side-item-label')?.getAttribute('aria-label') ||
+    '';
+  return { key, name };
+}

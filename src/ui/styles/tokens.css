@@ -2415,6 +2415,337 @@ img.file-transfer__icon {
   color: var(--danger);
 }
 
+/* —— Settings window —— */
+
+settings-window,
+.settings-window {
+  position: fixed;
+  inset: 0;
+  z-index: 75;
+  display: grid;
+  place-items: center;
+}
+
+settings-window[hidden],
+.settings-window[hidden] {
+  display: none !important;
+}
+
+.settings-shell__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 12, 16, 0.55);
+  animation: fadein 160ms ease;
+}
+
+.settings-shell__card {
+  position: relative;
+  width: min(760px, calc(100vw - 32px));
+  height: min(560px, calc(100vh - 48px));
+  min-width: 520px;
+  min-height: 400px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  animation: rise 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.settings-shell__card .window-resize-handle {
+  z-index: 2;
+}
+
+.settings-shell__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #2c333b, #262c33);
+  flex-shrink: 0;
+}
+
+.settings-shell__header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.settings-shell__body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(180px, 220px) 1fr;
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 8px;
+  border-right: 1px solid var(--border);
+  background: #22272e;
+  overflow: auto;
+}
+
+.settings-nav__item {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: 500 13px var(--font);
+  text-align: left;
+  padding: 9px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  transition: background 140ms ease;
+}
+
+.settings-nav__item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.settings-nav__item.is-selected {
+  background: var(--accent-soft);
+}
+
+.settings-nav__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.settings-nav__item.is-selected .settings-nav__icon {
+  color: var(--accent);
+}
+
+.settings-nav__icon svg {
+  display: block;
+}
+
+.settings-nav__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-panel {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 20px 24px;
+  background: var(--bg-pane);
+}
+
+.settings-panel__title {
+  margin: 0 0 14px;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.settings-panel__lead {
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.settings-panel__lead code {
+  font-size: 0.92em;
+}
+
+.settings-group {
+  margin-bottom: 22px;
+}
+
+.settings-group:last-child {
+  margin-bottom: 0;
+}
+
+.settings-group__title {
+  margin: 0 0 8px;
+  padding: 0 14px;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(58, 66, 76, 0.35);
+}
+
+.settings-group .settings-row + .settings-row {
+  margin-top: 8px;
+}
+
+.settings-row__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-row__label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-row__desc,
+.settings-row__hint {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  max-width: 360px;
+}
+
+.settings-row__hint {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.settings-select {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: #323943;
+  color: var(--text);
+  font: 500 12px var(--font);
+  padding: 6px 28px 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+  min-width: 140px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+    linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - 12px) 55%,
+    calc(100% - 7px) 55%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.settings-switch {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.settings-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.settings-switch__track {
+  position: relative;
+  display: block;
+  width: 44px;
+  height: 26px;
+  border-radius: 999px;
+  background: #3a424c;
+  transition: background 160ms ease;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.15);
+}
+
+.settings-switch__track::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: transform 160ms ease;
+}
+
+.settings-switch input:checked + .settings-switch__track {
+  background: var(--ok);
+}
+
+.settings-switch input:checked + .settings-switch__track::after {
+  transform: translateX(18px);
+}
+
+.settings-switch input:disabled + .settings-switch__track {
+  opacity: 0.45;
+}
+
+.settings-badge {
+  display: inline-block;
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
+.settings-file-btn {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+html.compact-ui .settings-shell__card {
+  width: calc(100vw - 16px);
+  height: min(calc(100dvh - 24px), 640px);
+  min-width: 0;
+  min-height: 320px;
+  border-radius: 12px;
+}
+
+html.compact-ui .settings-shell__body {
+  grid-template-columns: 1fr;
+  grid-template-rows: auto 1fr;
+}
+
+html.compact-ui .settings-nav {
+  flex-direction: row;
+  overflow-x: auto;
+  border-right: 0;
+  border-bottom: 1px solid var(--border);
+  padding: 8px;
+}
+
+html.compact-ui .settings-nav__item {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+html.compact-ui .settings-panel__title {
+  font-size: 18px;
+}
+
 /* —— Netboot dialog —— */
 
 netboot-dialog,
@@ -2866,7 +3197,7 @@ extension-editor-dialog,
 .extension-editor-dialog {
   position: fixed;
   inset: 0;
-  z-index: 80;
+  z-index: 85;
   display: grid;
   place-items: center;
 }

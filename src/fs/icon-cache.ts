@@ -606,10 +606,15 @@ export class IconCache {
     const hit = this.dirMemory.get(pathKey);
     if (hit) return hit;
 
-    // Named Icon\\r lookup only when the caller supplies findChild (Finder does
-    // this for folders in the current view). Do not enumerate the directory.
-    if (!findChild) {
-      return this.defaultFolder ?? DEFAULT_FOLDER_ICONS;
+    // Named Icon\\r lookup only when the folder has the custom-icon flag and
+    // the caller supplies findChild (Finder does this for on-screen folders).
+    // Do not enumerate the directory, and do not probe folders that are only
+    // using the default glyph.
+    const custom = (finderFlags(node.finderInfo) & HAS_CUSTOM_ICON) !== 0;
+    if (!custom || !findChild) {
+      const urls = this.defaultFolder ?? DEFAULT_FOLDER_ICONS;
+      this.dirMemory.set(pathKey, urls);
+      return urls;
     }
 
     const pending = this.dirInflight.get(pathKey);

@@ -18,9 +18,9 @@ const EMPTY = new Uint8Array();
 
 export class RemoteVfs implements Catalog {
   readonly reportsChunkedBytes = true;
-  private client: AfpClient;
-  private volumeName: string;
-  private volId: number;
+  readonly client: AfpClient;
+  readonly volumeName: string;
+  readonly volId: number;
   private nodes = new Map<number, VNode>();
   private forksLoaded = new Set<number>();
   private listeners = new Set<VfsChangeListener>();

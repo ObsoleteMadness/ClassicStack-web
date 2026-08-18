@@ -228,7 +228,7 @@ describe('iconForkLoadOptions', () => {
 });
 
 describe('IconCache.getForNode', () => {
-  function folderNode(): VNode {
+  function folderNode(flags = 0): VNode {
     return {
       id: 4,
       parentId: 2,
@@ -236,7 +236,7 @@ describe('IconCache.getForNode', () => {
       isDir: true,
       data: new Uint8Array(),
       resource: new Uint8Array(),
-      finderInfo: new Uint8Array(32),
+      finderInfo: flags ? finder('fold', 'MACS', flags) : new Uint8Array(32),
       createDate: 0,
       modDate: 0,
     };
@@ -245,17 +245,27 @@ describe('IconCache.getForNode', () => {
   it('does not look up Icon\\r without a named findChild', async () => {
     const cache = new IconCache();
     let probes = 0;
-    await cache.getForNode(folderNode(), undefined, async () => {
+    await cache.getForNode(folderNode(HAS_CUSTOM_ICON), undefined, async () => {
       probes += 1;
       return null;
     });
     expect(probes).toBe(0);
   });
 
+  it('does not look up Icon\\r without the custom-icon flag', async () => {
+    const cache = new IconCache();
+    const names: string[] = [];
+    await cache.getForNode(folderNode(), async (_id, name) => {
+      names.push(name);
+      return undefined;
+    });
+    expect(names).toEqual([]);
+  });
+
   it('probes Icon\\r by name and does not list the directory', async () => {
     const cache = new IconCache();
     const names: string[] = [];
-    const urls = await cache.getForNode(folderNode(), async (_id, name) => {
+    const urls = await cache.getForNode(folderNode(HAS_CUSTOM_ICON), async (_id, name) => {
       names.push(name);
       return undefined;
     });

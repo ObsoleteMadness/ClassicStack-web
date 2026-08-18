@@ -65,12 +65,18 @@ import {
 } from '../fs/name-conflict';
 import { decodePict, pictToSvg } from '../fs/pict/pict';
 import { previewKindFor, previewMime, type FilePreviewKind } from './file-preview';
+import { isCatalogWithBackend } from '../finder/api';
 import {
   SIDEBAR_GROUP_NETWORK,
   assignSidebarGroup,
   badgeText,
   badgeTitle,
   endpointsByGroup,
+  isCatalogEndpoint,
+  LOCAL_SHARE_KEY,
+  shareDropFromElement,
+  shareKeyForEndpoint,
+  viewingCatalogEndpoint,
   visibleSidebarGroups,
 } from './finder-sidebar';
 
@@ -143,9 +149,14 @@ export class FinderWindow extends HTMLElement {
   private welcomePackBusy = false;
   private showProps = false;
   private remoteOpen = false;
-  /** True after AFP login; volumes listed under the server until eject. */
+  /** True after AFP login; volumes listed under the server until disconnect. */
   private remoteLoggedIn = false;
   private remoteVolumes: string[] = [];
+  /** Volumes enumerated for a server stay in the sidebar after switching rows. */
+  private knownVolumes = new Map<string, string[]>();
+  private loggedInEndpoints = new Set<string>();
+  /** Share keys of volumes the user has opened (eject is hidden until then). */
+  private openedVolumeKeys = new Set<string>();
   private remoteBusy = false;
   private remoteNbpName = '';
   private remoteEndpoint: RemoteEndpoint | null = null;
@@ -325,6 +336,16 @@ export class FinderWindow extends HTMLElement {
     return this.readFinderIcons;
   }
 
+  getDefaultView(): ViewMode {
+    return loadPrefs().defaultView;
+  }
+
+  /** Persist default Finder view for new sessions (does not change the current view). */
+  setDefaultView(view: ViewMode): void {
+    if (view !== 'icon' && view !== 'list' && view !== 'column') return;
+    savePrefs({ defaultView: view });
+  }
+
   /** Toggle Icon\\r / resource-fork icon reads; persists and refreshes glyphs. */
   setReadFinderIcons(read: boolean): void {
     if (this.readFinderIcons === read) return;
@@ -337,7 +358,7 @@ export class FinderWindow extends HTMLElement {
     this.host = host;
     this.localVfs = vfs ?? host.localCatalog();
     if (this.localVfs) {
-      this.catalogs.set('local', this.localVfs);
+      this.catalogs.set(LOCAL_SHARE_KEY, this.localVfs);
       this.attachCatalog(this.localVfs);
     } else {
       this.attachCatalog(new EmptyCatalog());
@@ -386,17 +407,27 @@ export class FinderWindow extends HTMLElement {
 
   private dropRemoteCatalogs(nbp?: string): void {
     const prefix = nbp ? `${nbp}:` : null;
+    const endpointKey = nbp ? `endpoint:${nbp}` : null;
     for (const key of [...this.catalogs.keys()]) {
-      if (key === 'local') continue;
-      if (prefix && !key.startsWith(prefix)) continue;
+      if (key === LOCAL_SHARE_KEY) continue;
+      if (prefix) {
+        if (key !== endpointKey && !key.startsWith(prefix)) continue;
+      }
       const cat = this.catalogs.get(key);
       if (this.clipboard && this.clipboard.source === cat) this.clipboard.source = null;
       this.catalogs.delete(key);
     }
   }
 
+  private catalogKeyForVolume(name: string): string {
+    if (this.remoteEndpoint && isCatalogEndpoint(this.remoteEndpoint)) {
+      return shareKeyForEndpoint(this.remoteEndpoint);
+    }
+    return `${this.remoteNbpName}:${name}`;
+  }
+
   private mountCatalog(cat: Catalog, source: 'local' | 'remote', rootName: string): void {
-    const key = source === 'local' ? 'local' : `${this.remoteNbpName}:${rootName}`;
+    const key = source === 'local' ? LOCAL_SHARE_KEY : this.catalogKeyForVolume(rootName);
     this.catalogs.set(key, cat);
     this.attachCatalog(cat);
     this.source = source;
@@ -418,6 +449,9 @@ export class FinderWindow extends HTMLElement {
     this.remoteNbpName = '';
     this.remoteEndpoint = null;
     this.dropRemoteCatalogs();
+    this.knownVolumes.clear();
+    this.loggedInEndpoints.clear();
+    this.openedVolumeKeys.clear();
     if (status) this.setStatus(status);
     void this.reload().then(() => {
       this.syncHistory();
@@ -511,6 +545,37 @@ export class FinderWindow extends HTMLElement {
     await this.applyHistoryState(this.stateFromLocation());
     this.syncHistory(true);
     this.render();
+  }
+
+  /** Sidebar endpoint named by a restored `?share=` / `?vol=` URL. */
+  private findNavEndpoint(share: string, vol: string): RemoteEndpoint | undefined {
+    const shareKey = share.toLowerCase();
+    const volKey = vol.toLowerCase();
+    return this.servers.find((s) => {
+      if (s.id.toLowerCase() === shareKey) return true;
+      if ((s.title || '').toLowerCase() === shareKey) return true;
+      if (s.role === 'volume' && (s.title || '').toLowerCase() === volKey) {
+        const sub = (s.subtitle || '').toLowerCase();
+        return !shareKey || sub === shareKey || s.id.toLowerCase() === shareKey;
+      }
+      return false;
+    });
+  }
+
+  /**
+   * Wait for open mounts (and the cached sidebar), then connect so a URL path
+   * can resolve against a live catalog.
+   */
+  private async ensureRemoteForHistory(
+    state: ReturnType<FinderWindow['historySnapshot']>,
+  ): Promise<boolean> {
+    if (this.remoteServerConnected(state.share)) return true;
+    if (this.host.readyMounted) await this.host.readyMounted();
+    if (this.host.cachedNetwork) await this.refreshSidebarEndpoints();
+    if (this.remoteServerConnected(state.share)) return true;
+    const ep = this.findNavEndpoint(state.share, state.vol);
+    if (!ep) return false;
+    return this.connectServerWithLogin(ep);
   }
 
   setStatus(msg: string, opts?: { busy?: boolean }): void {
@@ -748,7 +813,9 @@ export class FinderWindow extends HTMLElement {
     const params = new URLSearchParams(location.search);
     const viewParam = params.get('view');
     const view: ViewMode =
-      viewParam === 'list' || viewParam === 'column' || viewParam === 'icon' ? viewParam : 'icon';
+      viewParam === 'list' || viewParam === 'column' || viewParam === 'icon'
+        ? viewParam
+        : loadPrefs().defaultView;
     const share = params.get('share') ?? '';
     const vol = params.get('vol') ?? '';
     const pathRaw = params.get('path') ?? '';
@@ -864,7 +931,7 @@ export class FinderWindow extends HTMLElement {
           await this.reload();
           return;
         }
-        if (!this.host.isConnected() || !this.remoteServerConnected(state.share)) {
+        if (!this.host.isConnected() || !(await this.ensureRemoteForHistory(state))) {
           bounceToLocal = true;
           this.bounceRemoteNavigation(
             `Cannot navigate to “${target}” — that server isn’t connected.`,
@@ -1457,7 +1524,7 @@ export class FinderWindow extends HTMLElement {
       .join('');
     const localBlock = this.hasLocalShare()
       ? `<div class="side-label">Local</div>
-      <div class="side-item ${viewingLocal ? 'selected' : ''}" data-local>
+      <div class="side-item ${viewingLocal ? 'selected' : ''}" data-local data-share-key="${LOCAL_SHARE_KEY}" data-share-name="${this.escape(this.localShareTitle())}">
         <span class="dot"></span>
         <span class="side-item-label" aria-label="${this.escape(this.localShareTitle())}">${this.escape(this.localShareTitle())}</span>
         <button type="button" class="side-more" data-act="share-actions" aria-label="Share actions" title="Share actions">${uiIcons.more}</button>
@@ -1490,6 +1557,46 @@ export class FinderWindow extends HTMLElement {
     return `<span class="side-badge"${tip}>${this.escape(text)}</span>`;
   }
 
+  private volumesFor(s: RemoteEndpoint): string[] {
+    const cached = this.knownVolumes.get(s.id);
+    if (cached?.length) return cached;
+    const current = this.remoteNbpName || this.remoteEndpoint?.id || '';
+    if (this.remoteLoggedIn && s.id === current) return this.remoteVolumes;
+    return [];
+  }
+
+  /** True when the on-screen catalog is already this sidebar endpoint. */
+  private viewingEndpoint(s: RemoteEndpoint): boolean {
+    const currentId = this.remoteEndpoint?.id || this.remoteNbpName;
+    if (isCatalogEndpoint(s)) {
+      return viewingCatalogEndpoint(s, currentId, this.source, this.remoteOpen);
+    }
+    if (this.source !== 'remote' || !this.remoteOpen || currentId !== s.id) return false;
+    const openName = this.pathStack[0]?.name;
+    return !!openName && this.volumesFor(s).includes(openName);
+  }
+
+  private async openCatalogVolume(s: RemoteEndpoint): Promise<void> {
+    const name = this.volumesFor(s)[0] || this.remoteVolumes[0] || s.title;
+    if (!name) throw new Error(`Couldn’t open “${s.title}”`);
+    await this.mountRemoteVolume(name);
+  }
+
+  private forgetEndpoint(id: string): void {
+    if (!id) return;
+    this.knownVolumes.delete(id);
+    this.loggedInEndpoints.delete(id);
+    for (const k of [...this.openedVolumeKeys]) {
+      if (k === `endpoint:${id}` || k.startsWith(`${id}:`)) this.openedVolumeKeys.delete(k);
+    }
+  }
+
+  private volumeIsOpen(s: RemoteEndpoint, volume?: string): boolean {
+    if (s.role === 'volume') return true;
+    if (!volume) return false;
+    return this.openedVolumeKeys.has(shareKeyForEndpoint(s, volume));
+  }
+
   private sidebarEndpointHtml(
     s: RemoteEndpoint,
     i: number,
@@ -1501,32 +1608,49 @@ export class FinderWindow extends HTMLElement {
       viewingServer: boolean;
     },
   ): string {
-    const connected = this.remoteLoggedIn && s.id === opts.connectedId;
+    const connected = this.loggedInEndpoints.has(s.id) || (this.remoteLoggedIn && s.id === opts.connectedId);
     const localShare = s.kind === 'local';
-    const serverSel = connected && (localShare ? this.source === 'remote' : opts.viewingServer) ? 'selected' : '';
+    const volumeRow = s.role === 'volume';
+    const isCurrent = s.id === opts.connectedId;
+    const serverSel = isCurrent && (localShare ? this.source === 'remote' : opts.viewingServer) ? 'selected' : '';
+    const volumes = this.volumesFor(s);
     const kids =
-      connected && !localShare && opts.volumes.length
-        ? opts.volumes
-            .map(
-              (v, vi) => `
-      <div class="side-item side-item--child ${!opts.viewingLocal && opts.openVol === v ? 'selected' : ''}" data-vol="${vi}">
+      !localShare && !volumeRow && volumes.length
+        ? volumes
+            .map((v, vi) => {
+              const shareKey = shareKeyForEndpoint(s, v);
+              const selected = isCurrent && !opts.viewingLocal && opts.openVol === v ? 'selected' : '';
+              const eject = this.volumeIsOpen(s, v)
+                ? `<button type="button" class="side-eject" data-eject="${vi}" data-vol-name="${this.escape(v)}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
+                : '';
+              return `
+      <div class="side-item side-item--child ${selected}" data-vol="${vi}" data-vol-name="${this.escape(v)}" data-server-parent="${i}" data-share-key="${this.escape(shareKey)}" data-share-name="${this.escape(v)}">
         <span class="dot"></span>
         <span class="side-item-label" aria-label="${this.escape(v)}">${this.escape(v)}</span>
-      </div>`,
-            )
+        ${eject}
+      </div>`;
+            })
             .join('')
         : '';
-    const eject =
-      connected && !localShare
-        ? `<button type="button" class="side-eject" data-eject="${i}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
+    const ejectSelf =
+      volumeRow && !localShare
+        ? `<button type="button" class="side-eject" data-eject-endpoint="${i}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
+        : '';
+    const disconnect =
+      connected && !localShare && !volumeRow
+        ? `<button type="button" class="side-eject" data-disconnect="${i}" title="Disconnect" aria-label="Disconnect">${uiIcons.disconnect}</button>`
         : '';
     const subtitle = s.subtitle ? ` title="${this.escape(s.subtitle)}"` : '';
+    const shareAttrs = isCatalogEndpoint(s)
+      ? ` data-share-key="${this.escape(shareKeyForEndpoint(s))}" data-share-name="${this.escape(s.title)}"`
+      : '';
     return `
-      <div class="side-item ${serverSel}" data-server="${i}"${subtitle}>
+      <div class="side-item ${serverSel}" data-server="${i}"${subtitle}${shareAttrs}>
         <span class="dot"></span>
         <span class="side-item-label" aria-label="${this.escape(s.title)}">${this.escape(s.title)}</span>
         ${this.sidebarBadgeHtml(s.badge)}
-        ${eject}
+        ${ejectSelf}
+        ${disconnect}
       </div>${kids}`;
   }
 
@@ -2546,6 +2670,21 @@ export class FinderWindow extends HTMLElement {
       this.renderContextMenu();
       if (sidebar) {
         const ep = this.servers[sidebar.index];
+        if (action === 'disconnect') {
+          if (ep && ep.id !== this.remoteEndpoint?.id && ep.id !== this.remoteNbpName) {
+            await this.host.onSidebarAction?.(ep, 'disconnect');
+            this.forgetEndpoint(ep.id);
+            this.renderSidebar();
+            return;
+          }
+          await this.disconnectRemote();
+          return;
+        }
+        if (action === 'eject' || action === 'unmount') {
+          if (sidebar.volume) await this.ejectVolume(sidebar.volume);
+          else if (ep) await this.ejectEndpoint(ep);
+          return;
+        }
         if (ep) await this.host.onSidebarAction?.(ep, action, sidebar.volume);
         return;
       }
@@ -2622,15 +2761,49 @@ export class FinderWindow extends HTMLElement {
     if (ejectEl) {
       e.preventDefault();
       e.stopPropagation();
-      await this.ejectRemote();
+      const name =
+        ejectEl.getAttribute('data-vol-name') ||
+        this.remoteVolumes[Number(ejectEl.getAttribute('data-eject'))];
+      if (name) await this.ejectVolume(name);
+      return;
+    }
+    const ejectEpEl = t.closest('[data-eject-endpoint]');
+    if (ejectEpEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      const i = Number(ejectEpEl.getAttribute('data-eject-endpoint'));
+      const ep = this.servers[i];
+      if (ep) await this.ejectEndpoint(ep);
+      return;
+    }
+    const disconnectEl = t.closest('[data-disconnect]');
+    if (disconnectEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      const i = Number(disconnectEl.getAttribute('data-disconnect'));
+      const ep = this.servers[i];
+      if (ep && ep.id !== this.remoteEndpoint?.id && ep.id !== this.remoteNbpName) {
+        await this.host.onSidebarAction?.(ep, 'disconnect');
+        this.forgetEndpoint(ep.id);
+        this.renderSidebar();
+        return;
+      }
+      await this.disconnectRemote();
       return;
     }
     const volEl = t.closest('[data-vol]');
     if (volEl) {
-      const vi = Number(volEl.getAttribute('data-vol'));
-      const name = this.remoteVolumes[vi];
+      const parentI = Number(volEl.getAttribute('data-server-parent'));
+      const parent = Number.isFinite(parentI) ? this.servers[parentI] : this.remoteEndpoint;
+      const name =
+        volEl.getAttribute('data-vol-name') ||
+        this.remoteVolumes[Number(volEl.getAttribute('data-vol'))];
       if (!name) return;
       try {
+        if (parent && parent.id !== this.remoteEndpoint?.id) {
+          const ok = await this.connectServerWithLogin(parent);
+          if (!ok) return;
+        }
         await this.mountRemoteVolume(name);
         this.closeSidebar();
         await this.reload();
@@ -2649,7 +2822,14 @@ export class FinderWindow extends HTMLElement {
       const s = this.servers[i];
       if (!s) return;
       if (this.remoteBusy) return;
-      if (this.remoteLoggedIn && this.remoteNbpName === s.id) {
+      if (this.viewingEndpoint(s)) {
+        this.closeSidebar();
+        await this.reload();
+        this.syncHistory();
+        this.render();
+        return;
+      }
+      if (!isCatalogEndpoint(s) && this.remoteLoggedIn && this.remoteNbpName === s.id) {
         if (this.remoteOpen) {
           this.closeSidebar();
           await this.reload();
@@ -3108,31 +3288,30 @@ export class FinderWindow extends HTMLElement {
   }
 
   private currentShareKey(): string {
-    return this.source === 'local' ? 'local' : `${this.remoteNbpName}:${this.pathStack[0]?.name ?? ''}`;
+    if (this.source === 'local') return LOCAL_SHARE_KEY;
+    if (this.remoteEndpoint && isCatalogEndpoint(this.remoteEndpoint)) {
+      return shareKeyForEndpoint(this.remoteEndpoint);
+    }
+    return `${this.remoteNbpName}:${this.pathStack[0]?.name ?? ''}`;
   }
 
-  /** Sidebar share under the pointer (Browser Share or a mounted/listed volume). */
+  /** Sidebar share under the pointer (Browser Share, ClassicStack share, or mounted volume). */
   private shareDropFromEvent(e: DragEvent): { key: string; name: string } | null {
-    const t = e.target as HTMLElement | null;
-    if (!t) return null;
-    if (t.closest('[data-eject]')) return null;
-    const side = this.querySelector('.sidebar');
-    if (!side) return null;
-    if (t.closest('[data-local]') && side.contains(t.closest('[data-local]')!)) {
-      return { key: 'local', name: this.localShareTitle() };
-    }
-    const volEl = t.closest('[data-vol]') as HTMLElement | null;
-    if (!volEl || !side.contains(volEl) || !this.remoteLoggedIn) return null;
-    const vi = Number(volEl.getAttribute('data-vol'));
-    const name = this.remoteVolumes[vi];
-    if (!name) return null;
-    return { key: `${this.remoteNbpName}:${name}`, name };
+    return shareDropFromElement(e.target, this.querySelector('.sidebar'));
   }
 
   private async ensureShareCatalog(key: string): Promise<Catalog | null> {
-    if (key === 'local') return this.localVfs ?? this.catalogs.get('local') ?? null;
+    if (key === LOCAL_SHARE_KEY) return this.localVfs ?? this.catalogs.get(LOCAL_SHARE_KEY) ?? null;
     const existing = this.catalogs.get(key);
     if (existing) return existing;
+    if (key.startsWith('endpoint:')) {
+      const id = key.slice('endpoint:'.length);
+      const ep = this.servers.find((s) => s.id === id);
+      if (!ep || !this.host.openEndpointCatalog) return null;
+      const cat = await this.host.openEndpointCatalog(ep);
+      this.catalogs.set(key, cat);
+      return cat;
+    }
     const prefix = `${this.remoteNbpName}:`;
     if (!this.remoteLoggedIn || !key.startsWith(prefix)) return null;
     const name = key.slice(prefix.length);
@@ -3150,7 +3329,7 @@ export class FinderWindow extends HTMLElement {
   } | null {
     const share = this.shareDropFromEvent(e);
     if (share) {
-      const cat = this.catalogs.get(share.key) ?? (share.key === 'local' ? (this.localVfs ?? null) : null);
+      const cat = this.catalogs.get(share.key) ?? (share.key === LOCAL_SHARE_KEY ? (this.localVfs ?? null) : null);
       return {
         catalog: cat,
         parentId: cat?.rootId() ?? 0,
@@ -3172,7 +3351,7 @@ export class FinderWindow extends HTMLElement {
     const share = this.shareDropFromEvent(e);
     if (share) {
       const destCat =
-        this.catalogs.get(share.key) ?? (share.key === 'local' ? (this.localVfs ?? null) : null);
+        this.catalogs.get(share.key) ?? (share.key === LOCAL_SHARE_KEY ? (this.localVfs ?? null) : null);
       if (this.isInternalDrag() && this.dragNodeId != null && destCat && destCat === this.dragCatalog) {
         if (!this.isValidMoveTarget(this.dragNodeId, destCat.rootId(), destCat)) {
           if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
@@ -3263,8 +3442,8 @@ export class FinderWindow extends HTMLElement {
     content?.classList.remove('drop-active');
 
     if (shareKey != null) {
-      const sel = shareKey === 'local' ? '[data-local]' : this.shareVolumeSelector(shareKey);
-      if (sel) this.querySelector(`.sidebar ${sel}`)?.classList.add('drop-target');
+      const sel = `[data-share-key="${CSS.escape(shareKey)}"]`;
+      this.querySelector(`.sidebar ${sel}`)?.classList.add('drop-target');
       return;
     }
 
@@ -3292,14 +3471,6 @@ export class FinderWindow extends HTMLElement {
     content?.classList.add('drop-active');
   }
 
-  private shareVolumeSelector(shareKey: string): string | null {
-    const prefix = `${this.remoteNbpName}:`;
-    if (!shareKey.startsWith(prefix)) return null;
-    const name = shareKey.slice(prefix.length);
-    const vi = this.remoteVolumes.indexOf(name);
-    return vi >= 0 ? `[data-vol="${vi}"]` : null;
-  }
-
   private clearDropUi(): void {
     this.dropHoverFolderId = null;
     this.querySelectorAll('.drop-target').forEach((el) => el.classList.remove('drop-target'));
@@ -3320,9 +3491,13 @@ export class FinderWindow extends HTMLElement {
     this.springTimer = null;
     if (this.springShareKey !== key) return;
     if (this.currentShareKey() === key) return;
-    this.parkDragSource();
     try {
-      if (key === 'local') {
+      if (key.startsWith('endpoint:')) {
+        await this.ensureShareCatalog(key);
+        return;
+      }
+      this.parkDragSource();
+      if (key === LOCAL_SHARE_KEY) {
         this.showLocalShare();
       } else {
         const prefix = `${this.remoteNbpName}:`;
@@ -3682,6 +3857,26 @@ export class FinderWindow extends HTMLElement {
     const jobId = this.startTransfer(plan.destName, node.isDir, expected, node.finderInfo);
     transferActivity.setDest(jobId, dest, destParent, plan.destName);
     const signal = transferActivity.signal(jobId);
+    if (isCatalogWithBackend(src) && isCatalogWithBackend(dest) && src.api.backendId === dest.api.backendId) {
+      try {
+        await dest.copyFrom(src, id, destParent, {
+          destName: plan.destName,
+          replace: plan.replaceId != null,
+          replaceId: plan.replaceId,
+          signal,
+          onProgress: (p) => {
+            const cur = transferActivity.list().find((j) => j.id === jobId)?.bytesDone || 0;
+            if (typeof p.bytesTotal === 'number') transferActivity.setTotal(jobId, p.bytesTotal);
+            if (typeof p.bytesDone === 'number' && p.bytesDone > cur) transferActivity.addBytes(jobId, p.bytesDone - cur);
+          },
+        });
+        await transferActivity.settle(jobId);
+        return;
+      } catch (err) {
+        await transferActivity.settle(jobId, err);
+        throw err;
+      }
+    }
     await this.withOwnVfsMutation(async () => {
       dest.beginBatch();
       try {
@@ -3964,6 +4159,32 @@ export class FinderWindow extends HTMLElement {
 
   private async connectServerWithLogin(s: RemoteEndpoint): Promise<boolean> {
     if (this.remoteBusy) return false;
+    if (this.loggedInEndpoints.has(s.id)) {
+      const alreadyViewing = this.viewingEndpoint(s);
+      this.remoteEndpoint = s;
+      this.remoteNbpName = s.id;
+      this.remoteVolumes = this.volumesFor(s);
+      this.remoteLoggedIn = true;
+      try {
+        await this.host.beginRemote(s);
+      } catch {
+        /* keep cached volumes */
+      }
+      if (!alreadyViewing && isCatalogEndpoint(s)) {
+        try {
+          await this.openCatalogVolume(s);
+          return true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.error(`Open volume failed: ${msg}`, s.kind);
+          this.setStatus(`Open volume failed: ${msg}`);
+          return false;
+        }
+      }
+      this.remoteOpen = alreadyViewing;
+      this.renderSidebar();
+      return true;
+    }
     this.remoteBusy = true;
     try {
       this.setStatus(`Contacting ${s.title}…`, { busy: true });
@@ -3973,7 +4194,7 @@ export class FinderWindow extends HTMLElement {
       this.remoteOpen = false;
       if (this.source === 'remote') this.showLocalShare();
       const info: SessionInfo = await this.host.beginRemote(s);
-      this.dropRemoteCatalogs();
+      if (this.remoteNbpName === s.id) this.dropRemoteCatalogs(s.id);
       const uams = info.uams ?? [];
       const skipPrompt = info.allowGuest && uams.length === 0;
       this.setStatus(`Connected to ${info.serverName || s.title} — sign in`);
@@ -3986,6 +4207,7 @@ export class FinderWindow extends HTMLElement {
               uams,
               error,
               allowGuest: info.allowGuest,
+              kind: s.kind,
             });
         if (!creds) {
           await this.host.closeRemote().catch(() => undefined);
@@ -4002,6 +4224,8 @@ export class FinderWindow extends HTMLElement {
           this.remoteNbpName = s.id;
           this.remoteEndpoint = s;
           this.remoteOpen = false;
+          this.knownVolumes.set(s.id, [...this.remoteVolumes]);
+          this.loggedInEndpoints.add(s.id);
           this.setStatus(
             `Signed in to ${info.serverName || s.title} — ${this.remoteVolumes.length} volume(s)`,
           );
@@ -4036,26 +4260,89 @@ export class FinderWindow extends HTMLElement {
 
   private async mountRemoteVolume(name: string): Promise<void> {
     log.info(`Opening volume “${name}”`, 'afp');
-    const key = `${this.remoteNbpName}:${name}`;
+    const key = this.catalogKeyForVolume(name);
     const cat = await this.ensureShareCatalog(key);
     if (!cat) throw new Error(`Couldn’t open volume “${name}”`);
     this.mountCatalog(cat, 'remote', name);
     this.remoteOpen = true;
+    if (this.remoteEndpoint) this.openedVolumeKeys.add(shareKeyForEndpoint(this.remoteEndpoint, name));
     this.setStatus(
       this.remoteEndpoint?.kind === 'local' ? `Opened ${name}` : `Mounted ${this.remoteNbpName}:${name}`,
     );
   }
 
-  private async ejectRemote(): Promise<void> {
-    log.info(`Eject “${this.remoteNbpName || 'remote'}”`, 'afp');
+  private async disconnectRemote(): Promise<void> {
+    log.info(`Disconnect “${this.remoteNbpName || 'remote'}”`, 'afp');
     const nbp = this.remoteNbpName;
     await this.host.closeRemote().catch(() => undefined);
     this.dropRemoteCatalogs(nbp);
+    this.forgetEndpoint(nbp);
     this.resetToLocalShare();
     this.setStatus('Disconnected from server');
+    await this.refreshSidebarEndpoints();
     await this.reload();
     this.syncHistory();
     this.render();
+  }
+
+  private async ejectVolume(name: string): Promise<void> {
+    log.info(`Eject volume “${name}”`, 'afp');
+    const viewing = this.source === 'remote' && this.pathStack[0]?.name === name;
+    if (viewing) {
+      this.abortAllListings();
+      this.bumpIconLoadGen();
+    }
+    const key = this.catalogKeyForVolume(name);
+    const cat = this.catalogs.get(key);
+    if (this.clipboard && this.clipboard.source === cat) this.clipboard.source = null;
+    this.catalogs.delete(key);
+    if (this.remoteEndpoint) this.openedVolumeKeys.delete(shareKeyForEndpoint(this.remoteEndpoint, name));
+    if (viewing) {
+      this.showLocalShare();
+      this.remoteOpen = false;
+    }
+    await this.host.closeVolume?.(name).catch(() => undefined);
+    if (!this.host.closeVolume) {
+      const ep = this.remoteEndpoint;
+      if (ep) await this.host.onSidebarAction?.(ep, 'unmount', name);
+    }
+    this.setStatus(`Ejected ${name}`);
+    await this.refreshSidebarEndpoints();
+    await this.reload();
+    this.syncHistory();
+    this.render();
+  }
+
+  private async ejectEndpoint(ep: RemoteEndpoint): Promise<void> {
+    log.info(`Eject “${ep.title}”`, ep.kind);
+    const current = this.remoteLoggedIn && this.remoteEndpoint?.id === ep.id;
+    if (current) {
+      const nbp = this.remoteNbpName;
+      await this.host.closeRemote().catch(() => undefined);
+      this.dropRemoteCatalogs(nbp);
+      this.resetToLocalShare();
+    } else if (this.remoteLoggedIn && ep.role === 'volume' && this.remoteEndpoint?.role !== 'volume') {
+      await this.ejectVolume(ep.title);
+      return;
+    } else {
+      await this.host.onSidebarAction?.(ep, 'eject');
+    }
+    this.setStatus(`Ejected ${ep.title}`);
+    await this.refreshSidebarEndpoints();
+    await this.reload();
+    this.syncHistory();
+    this.render();
+  }
+
+  private async refreshSidebarEndpoints(): Promise<void> {
+    try {
+      const list = this.host.cachedNetwork
+        ? await this.host.cachedNetwork()
+        : await this.host.refreshNetwork();
+      this.setServers(list);
+    } catch {
+      this.renderSidebar();
+    }
   }
 
   private async onRefresh(groupId?: string): Promise<void> {
@@ -4071,6 +4358,13 @@ export class FinderWindow extends HTMLElement {
           : 'Looking up servers…',
     );
     try {
+      if (this.host.cachedNetwork) {
+        try {
+          this.setServers(await this.host.cachedNetwork(groupId));
+        } catch {
+          /* scan still runs */
+        }
+      }
       const list = await this.host.refreshNetwork(groupId);
       this.setServers(list);
       const scoped = groupId
@@ -4285,6 +4579,24 @@ export class FinderWindow extends HTMLElement {
     const track = this.trackImportItem({ name: node.name, isDir: false, bytesTotal }, this.vfs, node.parentId, false);
     this.setStatus(`Expanding “${node.name}”…`, { busy: true });
     try {
+      if (isCatalogWithBackend(this.vfs)) {
+        let last = 0;
+        await this.vfs.expandNode(id, {
+          signal: track.signal,
+          onProgress: (p) => {
+            const next = p.bytesDone || 0;
+            if (next > last) track.onBytes?.(next - last);
+            last = next;
+          },
+        });
+        track.onDone?.();
+        this.setStatus(`Expanded “${node.name}”`);
+        iconCache.clearDirectoryCache();
+        this.iconUrls.clear();
+        this.bumpIconLoadGen();
+        await this.refreshAfterMutation();
+        return;
+      }
       const inPlace = await expandSitInPlace(this.vfs, node, {
         fileSize: node.dataBytes ?? node.data.length,
         track,
@@ -4931,13 +5243,38 @@ export class FinderWindow extends HTMLElement {
       let index = -1;
       let volume: string | undefined;
       if (volEl) {
-        index = this.servers.findIndex((s) => s.id === (this.remoteEndpoint?.id || this.remoteNbpName));
-        volume = this.remoteVolumes[Number(volEl.getAttribute('data-vol'))];
+        index = Number(volEl.getAttribute('data-server-parent'));
+        if (!Number.isFinite(index) || index < 0) {
+          index = this.servers.findIndex((s) => s.id === (this.remoteEndpoint?.id || this.remoteNbpName));
+        }
+        const parent = this.servers[index];
+        volume =
+          volEl.getAttribute('data-vol-name') ||
+          (parent ? this.volumesFor(parent)[Number(volEl.getAttribute('data-vol'))] : undefined);
       } else if (serverEl) {
         index = Number(serverEl.getAttribute('data-server'));
       }
       const ep = this.servers[index];
-      const actions = ep ? (this.host.sidebarContextMenu?.(ep, volume) ?? []) : [];
+      const hostActions = ep ? (this.host.sidebarContextMenu?.(ep, volume) ?? []) : [];
+      const actions: SidebarAction[] = [];
+      if (ep && (volume || ep.role === 'volume')) {
+        actions.push({ id: 'info', label: 'Get Info…' });
+        if (this.volumeIsOpen(ep, volume) || ep.role === 'volume') {
+          actions.push({ id: 'eject', label: 'Eject' });
+        }
+      } else if (ep) {
+        actions.push({ id: 'info', label: 'Get Info…' });
+        if (ep.kind === 'afp' || ep.kind === 'smb') {
+          actions.push({ id: 'message', label: 'Send Message…' });
+        }
+        if (this.loggedInEndpoints.has(ep.id) || (this.remoteLoggedIn && (ep.id === this.remoteNbpName || ep.id === this.remoteEndpoint?.id))) {
+          actions.push({ id: 'disconnect', label: 'Disconnect' });
+        }
+      }
+      for (const a of hostActions) {
+        if (actions.some((x) => x.id === a.id)) continue;
+        actions.push(a);
+      }
       if (!ep || !actions.length) return;
       e.preventDefault();
       this.contextMenu = {

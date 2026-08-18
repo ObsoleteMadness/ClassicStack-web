@@ -2,6 +2,7 @@
 
 export const CmdCloseVol = 2;
 export const CmdCloseFork = 4;
+export const CmdCopyFile = 5;
 export const CmdCreateDir = 6;
 export const CmdCreateFile = 7;
 export const CmdDelete = 8;
@@ -50,6 +51,7 @@ export const IconTypeIcs8 = 6;
 const AFP_CMD_NAME: Record<number, string> = {
   [CmdCloseVol]: 'FPCloseVol',
   [CmdCloseFork]: 'FPCloseFork',
+  [CmdCopyFile]: 'FPCopyFile',
   [CmdCreateDir]: 'FPCreateDir',
   [CmdCreateFile]: 'FPCreateFile',
   [CmdDelete]: 'FPDelete',

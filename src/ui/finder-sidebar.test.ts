@@ -4,6 +4,9 @@ import {
   SIDEBAR_GROUP_NETWORK,
   assignSidebarGroup,
   endpointsByGroup,
+  isCatalogEndpoint,
+  shareKeyForEndpoint,
+  viewingCatalogEndpoint,
   visibleSidebarGroups,
 } from './finder-sidebar';
 
@@ -56,5 +59,29 @@ describe('visibleSidebarGroups', () => {
       classic,
     );
     expect(visibleSidebarGroups(classic, by).map((g) => g.id)).toEqual(['appletalk', 'smb', 'netware', 'etherdfs']);
+  });
+});
+
+describe('share keys and drop targets', () => {
+  it('treats ClassicStack shares and FUSE mounts as catalog rows', () => {
+    const share = ep({ id: 'local:afp:HD', title: 'HD', kind: 'local' });
+    const mounted = ep({ id: 'mounted:abc', title: 'SYS', kind: 'ncp', role: 'volume' });
+    const server = ep({ id: 'Mac', title: 'Mac' });
+    expect(isCatalogEndpoint(share)).toBe(true);
+    expect(isCatalogEndpoint(mounted)).toBe(true);
+    expect(isCatalogEndpoint(server)).toBe(false);
+    expect(shareKeyForEndpoint(share)).toBe('endpoint:local:afp:HD');
+    expect(shareKeyForEndpoint(mounted)).toBe('endpoint:mounted:abc');
+    expect(shareKeyForEndpoint(server, 'Mac HD')).toBe('Mac:Mac HD');
+  });
+
+  it('switches to a ClassicStack share when another remote catalog is on screen', () => {
+    const share = ep({ id: 'local:afp:HD', title: 'HD', kind: 'local' });
+    const remote = ep({ id: 'mounted:abc', title: 'SYS', kind: 'ncp', role: 'volume' });
+    const server = ep({ id: 'Mac', title: 'Mac' });
+    expect(viewingCatalogEndpoint(share, remote.id, 'remote', true)).toBe(false);
+    expect(viewingCatalogEndpoint(share, share.id, 'remote', true)).toBe(true);
+    expect(viewingCatalogEndpoint(share, share.id, 'remote', false)).toBe(false);
+    expect(viewingCatalogEndpoint(server, share.id, 'remote', true)).toBe(false);
   });
 });
