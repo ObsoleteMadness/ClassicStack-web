@@ -8,6 +8,7 @@ import {
   shareKeyForEndpoint,
   viewingCatalogEndpoint,
   visibleSidebarGroups,
+  volumesForEndpoint,
 } from './finder-sidebar';
 
 function ep(partial: Partial<RemoteEndpoint> & Pick<RemoteEndpoint, 'id' | 'title'>): RemoteEndpoint {
@@ -83,5 +84,19 @@ describe('share keys and drop targets', () => {
     expect(viewingCatalogEndpoint(share, share.id, 'remote', true)).toBe(true);
     expect(viewingCatalogEndpoint(share, share.id, 'remote', false)).toBe(false);
     expect(viewingCatalogEndpoint(server, share.id, 'remote', true)).toBe(false);
+  });
+});
+
+describe('volumesForEndpoint', () => {
+  it('keeps an empty share list instead of leaking another endpoint’s volumes', () => {
+    const win98 = ep({ id: 'smb://WIN98-1,nbipx/', title: 'WIN98-1', kind: 'smb' });
+    const known = new Map<string, string[]>([[win98.id, []]]);
+    expect(volumesForEndpoint(win98, known, win98.id, true, ['Test Volume'])).toEqual([]);
+  });
+
+  it('uses the live list only when this server has no cache yet', () => {
+    const win98 = ep({ id: 'smb://WIN98-1,nbipx/', title: 'WIN98-1', kind: 'smb' });
+    expect(volumesForEndpoint(win98, new Map(), win98.id, true, ['C'])).toEqual(['C']);
+    expect(volumesForEndpoint(win98, new Map(), 'other', true, ['C'])).toEqual([]);
   });
 });

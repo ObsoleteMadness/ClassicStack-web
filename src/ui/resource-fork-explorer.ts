@@ -4,6 +4,7 @@
  */
 
 import type { Catalog, VNode } from '../fs/virtual-fs';
+import { nodeRef } from '../fs/virtual-fs';
 import { ResourceFork, resourceFetchCap, type ResourceEntry } from '../fs/resource-fork';
 import { decompileRez, decodeResourceType } from '../fs/codecs';
 import {
@@ -23,6 +24,7 @@ import { decodeIcon, SUPPORTED_ICON_TYPES, decodedIconToDataUrl } from '../fs/re
 import { pictToSvgDataUrl } from '../fs/pict/pict';
 import { readTypeCreator } from '../fs/icon-cache';
 import { formatBytes } from './format-bytes';
+import { downloadBytes } from '../util/pcap';
 import { enableWindowMove, enableWindowResize, onWindowGeometryChange, raiseFloatingWindow } from './window-resize';
 import { defaultResourceFrame, persistWindow, restoreWindow } from './window-layout';
 
@@ -53,6 +55,7 @@ export class ResourceForkExplorer extends HTMLElement {
   private loading = false;
   private error: string | null = null;
   private rf: ResourceFork | null = null;
+  private previewOpen = false;
 
   connectedCallback(): void {
     this.classList.add('rsrc-explorer');
@@ -99,7 +102,13 @@ export class ResourceForkExplorer extends HTMLElement {
   }
 
   private onKey = (e: KeyboardEvent): void => {
-    if (e.key === 'Escape' && !this.hidden) this.hide();
+    if (e.key !== 'Escape' || this.hidden) return;
+    if (this.previewOpen) {
+      this.previewOpen = false;
+      this.paintPreviewOverlay();
+      return;
+    }
+    this.hide();
   };
 
   private renderShell(): void {
@@ -107,6 +116,10 @@ export class ResourceForkExplorer extends HTMLElement {
       <div class="rsrc-explorer__chrome">
         <div class="rsrc-explorer__title">Resource Fork</div>
         <div class="rsrc-explorer__file" data-role="file"></div>
+        <div class="rsrc-explorer__actions">
+          <button type="button" class="btn" data-act="preview-res" disabled>Preview</button>
+          <button type="button" class="btn" data-act="download-res" disabled>Download</button>
+        </div>
         <button type="button" class="btn log-panel__btn" data-act="close" aria-label="Close">✕</button>
       </div>
       <div class="rsrc-explorer__meta" data-role="meta"></div>
@@ -115,6 +128,7 @@ export class ResourceForkExplorer extends HTMLElement {
         <div class="rsrc-explorer__entries" data-role="entries"></div>
       </div>
       <div class="rsrc-explorer__detail" data-role="detail"></div>
+      <div class="rsrc-explorer__preview-overlay" data-role="preview-overlay" hidden></div>
     `;
   }
 
@@ -122,7 +136,8 @@ export class ResourceForkExplorer extends HTMLElement {
     if (
       !force &&
       node &&
-      this.node?.id === node.id &&
+      this.node &&
+      nodeRef(this.node) === nodeRef(node) &&
       this.catalog === catalog &&
       this.inspect &&
       !this.loading
@@ -221,6 +236,7 @@ export class ResourceForkExplorer extends HTMLElement {
     }
     this.paintEntries();
     this.paintDetail();
+    this.paintActions();
   }
 
   private async pullSelectedBytes(entry: ResourceEntry): Promise<Uint8Array> {
@@ -229,6 +245,8 @@ export class ResourceForkExplorer extends HTMLElement {
   }
 
   private paint(): void {
+    this.paintActions();
+    this.paintPreviewOverlay();
     this.paintFile();
     this.paintMeta();
     this.paintTypes();
@@ -417,6 +435,42 @@ export class ResourceForkExplorer extends HTMLElement {
     el.innerHTML = parts.join('');
   }
 
+
+  private selectedCanPreview(): boolean {
+    const sel = this.selectedEntry();
+    if (!sel) return false;
+    return ICON_TYPE_SET.has(sel.entry.type) || sel.entry.type === 'PICT';
+  }
+
+  private async downloadSelectedResource(): Promise<void> {
+    const sel = this.selectedEntry();
+    if (!sel || !this.rf) return;
+    const bytes = await this.pullSelectedBytes(sel.entry);
+    const type = sel.entry.type.trim().replace(/\s+/g, '_');
+    downloadBytes(bytes, `${type}_${sel.entry.id}.bin`, 'application/octet-stream');
+  }
+
+  private paintActions(): void {
+    const previewBtn = this.querySelector('[data-act="preview-res"]') as HTMLButtonElement | null;
+    const downloadBtn = this.querySelector('[data-act="download-res"]') as HTMLButtonElement | null;
+    const canPreview = this.selectedCanPreview() && !!this.previewUrl;
+    const hasSel = !!this.selectedEntry() && !!this.rf;
+    if (previewBtn) previewBtn.disabled = !canPreview;
+    if (downloadBtn) downloadBtn.disabled = !hasSel;
+  }
+
+  private paintPreviewOverlay(): void {
+    const el = this.querySelector('[data-role="preview-overlay"]') as HTMLElement | null;
+    if (!el) return;
+    if (!this.previewOpen || !this.previewUrl) {
+      el.hidden = true;
+      el.innerHTML = '';
+      return;
+    }
+    el.hidden = false;
+    el.innerHTML = `<button type="button" class="btn log-panel__btn" data-act="close-preview" aria-label="Close preview">✕</button><img alt="" src="${escapeHtml(this.previewUrl)}" />`;
+  }
+
   private onClick(e: MouseEvent): void {
     const t = (e.target as HTMLElement).closest('[data-act]') as HTMLElement | null;
     if (!t) return;
@@ -437,8 +491,25 @@ export class ResourceForkExplorer extends HTMLElement {
     if (act === 'res') {
       this.selectedKey = t.dataset.key ?? null;
       this.previewUrl = null;
+      this.previewOpen = false;
       this.paintEntries();
       void this.refreshPreview(this.loadGen);
+      return;
+    }
+    if (act === 'download-res') {
+      void this.downloadSelectedResource();
+      return;
+    }
+    if (act === 'preview-res') {
+      if (this.selectedCanPreview() && this.previewUrl) {
+        this.previewOpen = true;
+        this.paintPreviewOverlay();
+      }
+      return;
+    }
+    if (act === 'close-preview') {
+      this.previewOpen = false;
+      this.paintPreviewOverlay();
     }
   }
 }

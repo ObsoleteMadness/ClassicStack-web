@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clampFrame, parseFrame, parseWindowLayouts } from './window-layout';
+import { clampFrame, menubarMinTop, parseFrame, parseWindowLayouts } from './window-layout';
 
 describe('window layout', () => {
   it('parses stored frames and ignores junk', () => {
@@ -24,3 +24,15 @@ describe('window layout', () => {
     expect(clamped.height).toBe(160);
   });
 });
+
+  it('respects a custom minimum top when clamping', () => {
+    const clamped = clampFrame(
+      { left: 10, top: 0, width: 400, height: 300, maximized: false },
+      { width: 800, height: 600 },
+      280,
+      160,
+      48,
+    );
+    expect(clamped.top).toBe(48);
+    expect(menubarMinTop()).toBeGreaterThan(0);
+  });

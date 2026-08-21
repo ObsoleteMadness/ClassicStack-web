@@ -65,6 +65,7 @@ export const DEFAULT_EXTENSION_MAP: readonly ExtensionMapping[] = [
   { extension: 'jpeg', creator: 'ogle', type: 'JPEG', comment: 'JPEG Picture' },
   { extension: 'gif', creator: 'ogle', type: 'GIFf', comment: 'GIF Picture' },
   { extension: 'png', creator: 'ogle', type: 'PNG ', comment: 'Portable Network Graphic' },
+  { extension: 'bmp', creator: 'ogle', type: 'BMPp', comment: 'Windows Bitmap' },
   { extension: 'psd', creator: '8BIM', type: '8BPS', comment: 'PhotoShop Document' },
   { extension: 'qxd', creator: 'XPR3', type: 'XDOC', comment: 'QuarkXpress Document' },
   { extension: 'ai', creator: 'ART5', type: 'EPSF', comment: 'Adobe Illustrator' },

@@ -1,8 +1,9 @@
 import {
+  isTransferSearching,
   transferActivity,
   type TransferJob,
 } from '../util/transfer-activity';
-import { formatBytes, formatBytesPerSec, formatRemainingTime } from './format-bytes';
+import { formatBytes, formatBytesPerSec, formatItems, formatRemainingTime } from './format-bytes';
 import { DEFAULT_FOLDER_ICONS } from '../fs/icon-cache';
 
 const STRUCTURE_ATTR = 'data-transfer-key';
@@ -12,7 +13,7 @@ function escapeHtml(s: string): string {
 }
 
 function jobPct(j: TransferJob): number {
-  if (j.status === 'queued') return 0;
+  if (j.status === 'queued' || isTransferSearching(j)) return 0;
   if (j.bytesTotal > 0) return Math.min(100, Math.round((j.bytesDone / j.bytesTotal) * 100));
   if (j.status === 'done' && j.bytesDone > 0) return 100;
   return 0;
@@ -21,6 +22,7 @@ function jobPct(j: TransferJob): number {
 function jobRate(j: TransferJob): string {
   if (j.status === 'queued') return 'Queued';
   if (j.status === 'cancelled') return 'Cancelled';
+  if (isTransferSearching(j)) return j.detail ?? 'Searching';
   if (j.status === 'running' && j.rate > 0) return formatBytesPerSec(j.rate);
   if (j.status === 'error') return 'Failed';
   if (j.status === 'done') return 'Done';
@@ -29,6 +31,10 @@ function jobRate(j: TransferJob): string {
 }
 
 function jobSize(j: TransferJob): string {
+  if (isTransferSearching(j)) {
+    const items = formatItems(j.itemsDone);
+    return j.bytesTotal > 0 ? `${items} · ${formatBytes(j.bytesTotal)}` : items;
+  }
   if (j.status === 'queued' && j.bytesTotal > 0) return formatBytes(j.bytesTotal);
   if (j.bytesTotal > 0) return `${formatBytes(j.bytesDone)} of ${formatBytes(j.bytesTotal)}`;
   if (j.bytesDone > 0) return formatBytes(j.bytesDone);
@@ -71,6 +77,7 @@ function rowHtml(j: TransferJob, nested = false): string {
       ? `<img class="file-transfer__icon" src="${DEFAULT_FOLDER_ICONS.small}" alt="" width="16" height="16" />`
       : `<img class="file-transfer__icon" src="${escapeHtml(j.iconSrc)}" alt="" width="16" height="16" />`;
   const nestClass = nested ? ' file-transfer--sub' : '';
+  const searching = isTransferSearching(j);
   const statusClass =
     j.status === 'error'
       ? ' file-transfer--error'
@@ -78,7 +85,9 @@ function rowHtml(j: TransferJob, nested = false): string {
         ? ' file-transfer--queued'
         : j.status === 'cancelled'
           ? ' file-transfer--cancelled'
-          : '';
+          : searching
+            ? ' file-transfer--searching'
+            : '';
   return `<div class="file-transfer${nestClass}${statusClass}" data-id="${escapeHtml(j.id)}">
       ${icon}
       <div class="file-transfer__main">
@@ -109,6 +118,7 @@ function paintRow(row: HTMLElement, j: TransferJob): void {
   row.classList.toggle('file-transfer--error', j.status === 'error');
   row.classList.toggle('file-transfer--queued', j.status === 'queued');
   row.classList.toggle('file-transfer--cancelled', j.status === 'cancelled');
+  row.classList.toggle('file-transfer--searching', isTransferSearching(j));
   const top = row.querySelector('.file-transfer__top');
   let cancel = row.querySelector('.file-transfer__cancel');
   if (canCancel(j)) {

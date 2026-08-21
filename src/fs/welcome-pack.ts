@@ -7,6 +7,8 @@ import { AS_MAGIC, AD_MAGIC, buildAppleSingle } from './appledouble';
 import { expandIncoming, isExpandableArchive, type ExpandedNode } from './expand-incoming';
 import { importExpandedTree, type ImportItemTrack } from './import-transfer';
 import type { Catalog } from './virtual-fs';
+import { nodeRef } from './virtual-fs';
+import type { NodeRef } from './catalog-caps';
 import { log } from '../util/logger';
 
 export const WELCOME_PACK_BASE = '/welcome';
@@ -38,10 +40,9 @@ export type WelcomePackProgress = {
 
 export type WelcomePackFs = Pick<
   Catalog,
-  'rootId' | 'ensureDir' | 'beginBatch' | 'endBatch' | 'createFile' | 'put' | 'remove'
+  'rootId' | 'ensureDir' | 'beginBatch' | 'endBatch' | 'createFile' | 'put' | 'remove' | 'lookup'
 > & {
-  lookup(parentId: number, name: string): Promise<{ id: number; isDir: boolean } | undefined>;
-  importBlob(parentId: number, file: File): Promise<unknown>;
+  importBlob(parentId: NodeRef, file: File): Promise<unknown>;
 };
 
 export type WelcomePackStore = WelcomePackFs & {
@@ -191,13 +192,13 @@ function tryExpandWelcome(name: string, data: Uint8Array): ExpandedNode[] | null
 /** Drop the wrapper once inner items are in the catalog (unless expand kept that name). */
 async function discardWelcomeArchive(
   fs: WelcomePackFs,
-  parentId: number,
+  parentId: NodeRef,
   archiveName: string,
   expanded: ExpandedNode[],
 ): Promise<void> {
   if (expanded.some((n) => namesMatch(n.name, archiveName))) return;
   const leftover = await fs.lookup(parentId, archiveName);
-  if (leftover && !leftover.isDir) await fs.remove(leftover.id);
+  if (leftover && !leftover.isDir) await fs.remove(nodeRef(leftover));
 }
 
 function yieldForUi(): Promise<void> {
@@ -218,7 +219,7 @@ async function importOneWelcomeFile(
     let parentId = fs.rootId();
     for (const dir of item.dirs) {
       try {
-        parentId = (await fs.ensureDir(parentId, dir)).id;
+        parentId = nodeRef(await fs.ensureDir(parentId, dir));
       } catch {
         result.skipped++;
         return result;

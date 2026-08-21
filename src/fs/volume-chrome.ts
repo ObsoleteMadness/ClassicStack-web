@@ -1,0 +1,73 @@
+/** Finder chrome from volume identity — decoration only, not catalog I/O. */
+
+import type { ShareKind } from '../ui/finder-host';
+import type { CatalogCapabilities, PathFormat } from './catalog-caps';
+
+export type VolumeChrome = {
+  volumeIcon: string;
+  kindLabel: string;
+  pathFormat: PathFormat;
+};
+
+const CHROME: Record<string, VolumeChrome> = {
+  afp: { volumeIcon: 'appleshare', kindLabel: 'AppleShare', pathFormat: 'mac' },
+  smb: { volumeIcon: 'windows', kindLabel: 'Windows share', pathFormat: 'dos' },
+  ncp: { volumeIcon: 'novell', kindLabel: 'NetWare volume', pathFormat: 'ncp' },
+  etherdfs: { volumeIcon: 'dos', kindLabel: 'DOS drive', pathFormat: 'dos' },
+  local: { volumeIcon: 'disk', kindLabel: 'Local volume', pathFormat: 'posix' },
+};
+
+const GENERIC: VolumeChrome = { volumeIcon: 'disk', kindLabel: 'Volume', pathFormat: 'posix' };
+
+/** Chrome for a volume: local shares use protocol so local+smb still looks Windows. */
+export function volumeChrome(caps: CatalogCapabilities): VolumeChrome {
+  const kind: ShareKind | string = caps.identity.shareKind === 'local'
+    ? (caps.identity.protocol ?? 'local')
+    : caps.identity.shareKind;
+  const base = CHROME[kind] ?? CHROME[caps.identity.shareKind] ?? GENERIC;
+  return {
+    ...base,
+    pathFormat: caps.pathFormat || base.pathFormat,
+    kindLabel: caps.identity.shareKind === 'local' && caps.identity.protocol
+      ? `Local ${base.kindLabel}`
+      : base.kindLabel,
+  };
+}
+
+/** True when s is a ClassicStack client URI (`scheme://…`), not an NBP object name. */
+export function isClientURI(s: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(s);
+}
+
+/**
+ * Join a discovered server with a volume per the client URI grammar:
+ *   scheme://[user[:pass]@]server[,transport]/volume
+ * NBP names (in-browser AFP) stay `server:volume`.
+ */
+export function clientVolumeURI(server: string, volume = ''): string {
+  const vol = volume.trim();
+  if (isClientURI(server)) {
+    const base = server.replace(/\/+$/, '');
+    if (!vol) return base;
+    const suffix = '/' + vol;
+    if (base.toLowerCase().endsWith(suffix.toLowerCase())) return base;
+    return base + suffix;
+  }
+  if (!vol) return server;
+  return `${server}:${vol}`;
+}
+
+/** Format a store-relative `'/'` path for the status bar / Get Info. */
+export function formatStorePath(path: string, fmt: PathFormat, volume = ''): string {
+  const parts = path.split('/').filter(Boolean);
+  switch (fmt) {
+    case 'mac':
+      return [volume || 'Volume', ...parts].join(':');
+    case 'dos':
+      return (volume ? `${volume}\\` : '\\') + parts.join('\\');
+    case 'ncp':
+      return `${volume || 'VOL'}:${parts.join('/')}`;
+    default:
+      return '/' + parts.join('/');
+  }
+}

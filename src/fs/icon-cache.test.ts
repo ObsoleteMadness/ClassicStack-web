@@ -13,6 +13,8 @@ import {
   HAS_BUNDLE,
   HAS_CUSTOM_ICON,
   IconCache,
+  defaultIconsForExtension,
+  fileExtension,
   iconForkLoadOptions,
   iconSetForFile,
   isCdevStyleType,
@@ -21,6 +23,9 @@ import {
 } from './icon-cache';
 import { CDEV_ICON_ID, CUSTOM_ICON_ID, IconSize } from './resource-types/icon-set';
 import type { VNode } from './virtual-fs';
+import { encodeIco } from './winicon';
+import { buildPeWithIco } from './winicon/exe-fixtures';
+import type { DecodedIcon } from './resource-types/icon-decoder';
 
 function entry(type: string, id: number, payload: Uint8Array): ResourceEntry {
   return {
@@ -601,5 +606,90 @@ describe('IconCache.getForNode', () => {
     );
     expect(forks).toBe(0);
     expect(urls.large.startsWith('data:')).toBe(true);
+  });
+
+  it('extracts a glyph from a PE .exe data fork', async () => {
+    const cache = new IconCache();
+    const pixels = new Uint8ClampedArray(16 * 16 * 4);
+    pixels.fill(200);
+    for (let i = 3; i < pixels.length; i += 4) pixels[i] = 255;
+    const frame: DecodedIcon = { typeCode: 'ICO', isColor: true, width: 16, height: 16, pixels };
+    const pe = buildPeWithIco(encodeIco([frame]));
+    const urls = await cache.getForNode({
+      addr: 'path',
+      path: 'NOTEPAD.EXE',
+      parentPath: '',
+      name: 'NOTEPAD.EXE',
+      isDir: false,
+      data: pe,
+      resource: new Uint8Array(),
+      finderInfo: new Uint8Array(32),
+      createDate: 0,
+      modDate: 0,
+      dataBytes: pe.length,
+    });
+    expect(urls.small.startsWith('data:')).toBe(true);
+    expect(urls.small).toContain('ICO');
+  });
+
+  it('uses an Icons8 default for .exe when no PE icon is present', async () => {
+    const cache = new IconCache();
+    const urls = await cache.getForNode(fileNode(3, 'SETUP.EXE', '????', '????'));
+    expect(urls.large).toMatch(/icons8-application-window-96\.png/);
+  });
+
+  it('uses an Icons8 default for archive suffixes (case insensitive)', async () => {
+    const cache = new IconCache();
+    const urls = await cache.getForNode(fileNode(3, 'Pack.ZIP', 'ZIP ', 'SITx'));
+    expect(urls.large).toMatch(/icons8-archive-folder-96\.png/);
+    const rar = await cache.getForTypeCreator('????', '????', 'game.RAR');
+    expect(rar.large).toMatch(/icons8-archive-folder-96\.png/);
+  });
+
+  it('uses an Icons8 default for image suffixes instead of FILE32', async () => {
+    const cache = new IconCache();
+    const urls = await cache.getForNode(fileNode(3, 'Photo.JPEG', 'JPEG', 'ogle'));
+    expect(urls.large).toMatch(/icons8-image-file-96\.png/);
+    expect(urls.large).not.toMatch(/FILE32\.png/);
+  });
+
+  it('keeps the TEXT32 system glyph for text files', async () => {
+    const cache = new IconCache();
+    const urls = await cache.getForNode(fileNode(3, 'ReadMe.txt', 'TEXT', 'ttxt'));
+    expect(urls.large).toMatch(/TEXT32\.png/);
+    expect(urls.large).not.toMatch(/icons8-/);
+  });
+
+  it('does not override a known Mac type glyph with an extension default', async () => {
+    const cache = new IconCache();
+    const urls = await cache.getForNode(fileNode(3, 'App.zip', 'APPL', 'ttxt'));
+    expect(urls.large).toMatch(/APPL32\.png/);
+    expect(urls.large).not.toMatch(/icons8-archive-folder/);
+  });
+
+  it('picks distinct defaults for dll / bat / sys / pdf', async () => {
+    const cache = new IconCache();
+    expect((await cache.getForNode(fileNode(3, 'kernel32.dll', '????', '????'))).large).toMatch(
+      /icons8-dll-96\.png/,
+    );
+    expect((await cache.getForNode(fileNode(4, 'autoexec.bat', '????', '????'))).large).toMatch(
+      /icons8-command-line-96\.png/,
+    );
+    expect((await cache.getForNode(fileNode(5, 'himem.sys', '????', '????'))).large).toMatch(
+      /icons8-binary-file-96\.png/,
+    );
+    expect((await cache.getForNode(fileNode(6, 'Manual.pdf', '????', '????'))).large).toMatch(
+      /icons8-pdf-1-96\.png/,
+    );
+  });
+});
+
+describe('defaultIconsForExtension', () => {
+  it('matches suffixes case-insensitively and ignores a leading path', () => {
+    expect(fileExtension('C:\\DOS\\EDIT.COM')).toBe('com');
+    expect(defaultIconsForExtension('C:\\DOS\\EDIT.COM')?.large).toMatch(/icons8-command-line-96\.png/);
+    expect(defaultIconsForExtension('archive.7z')?.large).toMatch(/icons8-archive-folder-96\.png/);
+    expect(defaultIconsForExtension('readme.txt')).toBeNull();
+    expect(defaultIconsForExtension('noext')).toBeNull();
   });
 });

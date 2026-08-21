@@ -1,6 +1,8 @@
 /** Name clashes when copying, moving, or importing into a folder. */
 
 import { isAbortError } from '../util/abort';
+import type { NodeRef } from './catalog-caps';
+import { nodeRef, type VNode } from './virtual-fs';
 
 export type NameConflictChoice = 'replace' | 'rename' | 'cancel';
 
@@ -33,12 +35,12 @@ export function copyItemName(base: string): string {
 }
 
 type LookupFs = {
-  lookup(parentId: number, name: string): Promise<{ id: number } | undefined>;
+  lookup(parent: NodeRef, name: string): Promise<VNode | undefined>;
 };
 
 export async function uniqueCopyName(
   fs: LookupFs,
-  parentId: number,
+  parentId: NodeRef,
   base: string,
   reserved: Set<string> = new Set(),
 ): Promise<string> {
@@ -56,15 +58,15 @@ export async function uniqueCopyName(
   }
 }
 
-export type PlacementPlan = { destName: string; replaceId: number | null };
+export type PlacementPlan = { destName: string; replaceId: NodeRef | null };
 
 export async function planItemPlacement(
   fs: LookupFs,
-  parentId: number,
+  parentId: NodeRef,
   name: string,
   isDir: boolean,
   opts: {
-    ignoreId?: number;
+    ignoreId?: NodeRef;
     reserved?: Set<string>;
     resolveConflict: (info: {
       name: string;
@@ -75,12 +77,12 @@ export async function planItemPlacement(
 ): Promise<PlacementPlan | null> {
   const reserved = opts.reserved ?? new Set();
   const existing = await fs.lookup(parentId, name);
-  if (!existing || existing.id === opts.ignoreId) {
+  if (!existing || nodeRef(existing) === opts.ignoreId) {
     return { destName: name, replaceId: null };
   }
   const suggestedName = await uniqueCopyName(fs, parentId, name, reserved);
   const choice = await opts.resolveConflict({ name, isDir, suggestedName });
   if (choice === 'cancel') return null;
-  if (choice === 'replace') return { destName: name, replaceId: existing.id };
+  if (choice === 'replace') return { destName: name, replaceId: nodeRef(existing) };
   return { destName: suggestedName, replaceId: null };
 }

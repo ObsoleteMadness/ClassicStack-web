@@ -19,6 +19,8 @@ import {
 import { throwIfAborted } from '../util/abort';
 import { log } from '../util/logger';
 import type { Catalog, VNode } from './virtual-fs';
+import { nodeRef, parentRef } from './virtual-fs';
+import type { NodeRef } from './catalog-caps';
 import type { ByteRangeReader } from './byte-range';
 
 export type ExpandSitInPlaceOpts = {
@@ -54,14 +56,14 @@ export async function expandSitInPlace(
   log.trace(`expand in-place “${node.name}” ${opts.fileSize ?? node.dataBytes ?? node.data.length}b`, 'expand');
   return fs.withRangeReader(
     node,
-    (read) => expandSitFromReader(fs, node.parentId, read, opts),
+    (read) => expandSitFromReader(fs, parentRef(node), read, opts),
     { signal: opts.track?.signal },
   );
 }
 
 async function expandSitFromReader(
   fs: ExpandFs,
-  parentId: number,
+  parentId: NodeRef,
   read: ByteRangeReader,
   opts: ExpandSitInPlaceOpts,
 ): Promise<boolean> {
@@ -87,7 +89,7 @@ async function expandSitFromReader(
 
   const tree = sitPackedToTree(members);
   const reserved = new Set<string>();
-  const planned: { item: MetaNode; replaceId: number | null }[] = [];
+  const planned: { item: MetaNode; replaceId: NodeRef | null }[] = [];
   for (const item of tree) {
     const plan = await planItemPlacement(fs, parentId, item.name, item.kind === 'dir', {
       reserved,
@@ -172,7 +174,7 @@ function metaFiles(nodes: MetaNode[], prefix = ''): ExpandTrackFile[] {
 
 async function writeMetaNode(
   fs: ExpandFs,
-  parentId: number,
+  parentId: NodeRef,
   node: MetaNode,
   read: ByteRangeReader,
   track?: ImportItemTrack,
@@ -184,9 +186,9 @@ async function writeMetaNode(
     const dir = await fs.ensureDir(parentId, node.name);
     const folderMeta = folderExpanded(node);
     if (folderMeta) await stampDir(fs, dir, folderMeta);
-    track?.onDir?.(parentId, node.name, dir.id, path);
+    track?.onDir?.(parentId, node.name, nodeRef(dir), path);
     for (const child of node.children) {
-      await writeMetaNode(fs, dir.id, child, read, track, path);
+      await writeMetaNode(fs, nodeRef(dir), child, read, track, path);
     }
     return;
   }

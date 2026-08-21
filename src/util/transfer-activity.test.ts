@@ -92,6 +92,28 @@ describe('transferActivity', () => {
     transferActivity.clearFinished();
   });
 
+  it('tracks searching item counts without filling the progress bar', () => {
+    const id = transferActivity.start({ name: 'Docs', kind: 'folder', bytesTotal: 0 });
+    transferActivity.setFound(id, 3, 1500);
+    const job = transferActivity.list().find((j) => j.id === id)!;
+    expect(job.detail).toBe('Searching');
+    expect(job.itemsDone).toBe(3);
+    expect(job.bytesTotal).toBe(1500);
+    expect(job.bytesDone).toBe(0);
+    expect(transferActivity.aggregateProgress()).toEqual({
+      pct: 0,
+      running: true,
+      indeterminate: true,
+    });
+    transferActivity.setBytes(id, 0, 1500, '');
+    transferActivity.addBytes(id, 500);
+    const downloading = transferActivity.aggregateProgress();
+    expect(downloading.indeterminate).toBe(false);
+    expect(downloading.pct).toBe(33);
+    transferActivity.finish(id);
+    transferActivity.clearFinished();
+  });
+
   it('queues nested extract jobs and begins them later', () => {
     const parent = transferActivity.start({ name: 'Pack.sit', kind: 'file', bytesTotal: 80 });
     const [a, b] = transferActivity.startMany([

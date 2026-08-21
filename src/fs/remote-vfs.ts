@@ -1,12 +1,15 @@
 /** AFP volume as a Finder Catalog (same API as IndexedDB VirtualFS). */
 
-import { CNIDRoot, macTime } from '../protocol/afp/constants';
+import { CNIDRoot } from '../protocol/afp/constants';
 import type { AfpClient } from '../services/afp-client/client';
 import type { DirEntry } from '../services/afp-client/commands';
 import { unescapeHostFilename } from '../protocol/host-filename';
 import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appledouble';
 import { be32 } from '../protocol/binary';
-import type { Catalog, VNode, VfsChangeListener, ChildrenBatchListener } from './virtual-fs';
+import type { Catalog, CnidVNode, VNode, VfsChangeListener, ChildrenBatchListener } from './virtual-fs';
+import { requireCnid, nodeRef } from './virtual-fs';
+import { afpVolumeCaps, asCnid, fromUnixMs, toUnixMs, type CatalogCapabilities, type NodeRef } from './catalog-caps';
+import { finderFlags, kIsInvisible, kNameLocked } from './finder-info';
 import { importDataTransferInto, type ImportProgress } from './import-transfer';
 import { finderInfoFromName } from './extension-map';
 import { bufferRangeReader, type ByteRangeReader } from './byte-range';
@@ -21,7 +24,7 @@ export class RemoteVfs implements Catalog {
   readonly client: AfpClient;
   readonly volumeName: string;
   readonly volId: number;
-  private nodes = new Map<number, VNode>();
+  private nodes = new Map<number, CnidVNode>();
   private forksLoaded = new Set<number>();
   private listeners = new Set<VfsChangeListener>();
   private batchDepth = 0;
@@ -31,10 +34,14 @@ export class RemoteVfs implements Catalog {
     this.client = client;
     this.volumeName = volumeName;
     this.volId = volId;
-    this.nodes.set(this.rootId(), this.makeRoot());
+    this.nodes.set(CNIDRoot, this.makeRoot());
   }
 
-  rootId(): number {
+  capabilities(): CatalogCapabilities {
+    return afpVolumeCaps;
+  }
+
+  rootId(): NodeRef {
     return CNIDRoot;
   }
 
@@ -57,11 +64,51 @@ export class RemoteVfs implements Catalog {
     }
   }
 
-  async get(id: number): Promise<VNode | undefined> {
-    return this.nodes.get(id) ?? (id === this.rootId() ? this.ensureRoot() : undefined);
+  async get(ref: NodeRef): Promise<VNode | undefined> {
+    if (typeof ref === 'string') return this.resolvePath(ref);
+    return this.nodes.get(ref) ?? (ref === CNIDRoot ? this.ensureRoot() : undefined);
   }
 
-  async ensureContent(id: number, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined> {
+  async resolvePath(path: string): Promise<VNode | undefined> {
+    const parts = path.split('/').filter(Boolean);
+    let cur: VNode | undefined = await this.get(CNIDRoot);
+    for (const part of parts) {
+      if (!cur) return undefined;
+      cur = await this.lookup(nodeRef(cur), part);
+    }
+    return cur;
+  }
+
+  async pathOf(ref: NodeRef): Promise<string> {
+    if (typeof ref === 'string') return ref;
+    const names: string[] = [];
+    let cur = await this.get(ref);
+    while (cur && cur.addr === 'cnid' && cur.id !== CNIDRoot) {
+      if (cur.name) names.unshift(cur.name);
+      if (!cur.parentId || cur.parentId === cur.id) break;
+      cur = await this.get(cur.parentId);
+    }
+    return names.join('/');
+  }
+
+  async setAttrs(ref: NodeRef, patch: Record<string, boolean>): Promise<void> {
+    const node = await this.get(ref);
+    if (!node) throw new Error('not found');
+    node.attrs = { ...(node.attrs ?? {}), ...patch };
+    if (node.finderInfo.length >= 10) {
+      const fi = new Uint8Array(node.finderInfo);
+      let flags = finderFlags(fi);
+      if (patch.invisible != null) flags = patch.invisible ? flags | kIsInvisible : flags & ~kIsInvisible;
+      if (patch.locked != null) flags = patch.locked ? flags | kNameLocked : flags & ~kNameLocked;
+      fi[8] = (flags >> 8) & 0xff;
+      fi[9] = flags & 0xff;
+      node.finderInfo = fi;
+    }
+    await this.put(node);
+  }
+
+  async ensureContent(ref: NodeRef, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined> {
+    const id = asCnid(ref);
     const node = await this.get(id);
     if (!node || node.isDir) return node;
     if (!this.forksLoaded.has(id)) await this.hydrateForks(node, onBytes, signal);
@@ -69,10 +116,11 @@ export class RemoteVfs implements Catalog {
   }
 
   async children(
-    parentId: number,
+    parent: NodeRef,
     onBatch?: ChildrenBatchListener,
     signal?: AbortSignal,
   ): Promise<VNode[]> {
+    const parentId = asCnid(parent);
     const kids: VNode[] = [];
     const seen = new Set<number>();
     const take = async (batch: DirEntry[]) => {
@@ -90,8 +138,9 @@ export class RemoteVfs implements Catalog {
     return kids;
   }
 
-  async lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined> {
+  async lookup(parent: NodeRef, name: string, signal?: AbortSignal): Promise<VNode | undefined> {
     throwIfAborted(signal);
+    const parentId = asCnid(parent);
     const lower = name.toLowerCase();
     for (const n of this.nodes.values()) {
       if (n.parentId === parentId && n.name.toLowerCase() === lower) return n;
@@ -154,13 +203,13 @@ export class RemoteVfs implements Catalog {
     opts?: { resource?: boolean; signal?: AbortSignal; priority?: number },
   ): Promise<T> {
     throwIfAborted(opts?.signal);
-    if (this.forksLoaded.has(node.id)) {
+    if (this.forksLoaded.has(requireCnid(node).id)) {
       const bytes = opts?.resource ? node.resource : node.data;
       return fn(bufferRangeReader(bytes));
     }
     return this.client.withForkReader(
       node.name,
-      node.parentId,
+      requireCnid(node).parentId,
       opts?.resource === true,
       fn,
       this.volId,
@@ -168,7 +217,8 @@ export class RemoteVfs implements Catalog {
     );
   }
 
-  async mkdir(parentId: number, name: string): Promise<VNode> {
+  async mkdir(parent: NodeRef, name: string): Promise<VNode> {
+    const parentId = asCnid(parent);
     const existing = await this.lookup(parentId, name);
     if (existing) throw new Error('exists');
     await this.client.mkdir(name, parentId, this.volId);
@@ -177,7 +227,8 @@ export class RemoteVfs implements Catalog {
     return node;
   }
 
-  async ensureDir(parentId: number, name: string): Promise<VNode> {
+  async ensureDir(parent: NodeRef, name: string): Promise<VNode> {
+    const parentId = asCnid(parent);
     const existing = await this.lookup(parentId, name);
     if (existing?.isDir) return existing;
     if (existing) throw new Error('exists');
@@ -185,7 +236,7 @@ export class RemoteVfs implements Catalog {
   }
 
   async createFile(
-    parentId: number,
+    parent: NodeRef,
     name: string,
     data: Uint8Array,
     resource = new Uint8Array(),
@@ -194,6 +245,7 @@ export class RemoteVfs implements Catalog {
     signal?: AbortSignal,
   ): Promise<VNode> {
     throwIfAborted(signal);
+    const parentId = asCnid(parent);
     await this.client.writeFile(name, data, parentId, false, this.volId, onBytes, signal);
     throwIfAborted(signal);
     if (resource.length) await this.client.writeFile(name, resource, parentId, true, this.volId, onBytes, signal);
@@ -205,58 +257,64 @@ export class RemoteVfs implements Catalog {
       (await this.lookup(parentId, name)) ??
       this.placeholderFile(parentId, name, data, resource, finderInfo);
     if (node) {
+      const cnid = requireCnid(node);
       node.data = data;
       node.resource = resource;
       node.finderInfo = finderInfo;
       node.dataBytes = data.length;
       node.resourceBytes = resource.length;
-      this.forksLoaded.add(node.id);
-      this.nodes.set(node.id, node);
+      this.forksLoaded.add(cnid.id);
+      this.nodes.set(cnid.id, cnid);
     }
     this.notify(parentId);
     return node;
   }
 
   async put(node: VNode): Promise<void> {
-    this.nodes.set(node.id, node);
-    await this.client.setFinderInfo(node.name, node.finderInfo, node.parentId, this.volId, {
-      createDate: node.createDate || undefined,
-      modDate: node.modDate || undefined,
+    const n = requireCnid(node);
+    this.nodes.set(n.id, n);
+    await this.client.setFinderInfo(n.name, n.finderInfo, n.parentId, this.volId, {
+      createDate: n.createDate ? fromUnixMs(n.createDate) : undefined,
+      modDate: n.modDate ? fromUnixMs(n.modDate) : undefined,
     });
-    this.notify(node.parentId);
+    this.notify(n.parentId);
   }
 
-  async rename(id: number, newName: string): Promise<void> {
-    const n = this.nodes.get(id) ?? (await this.get(id));
+  async rename(ref: NodeRef, newName: string): Promise<void> {
+    const id = asCnid(ref);
+    const n = this.nodes.get(id) ?? requireCnid((await this.get(id))!);
     if (!n) throw new Error('not found');
     if (n.id === this.rootId()) throw new Error('cannot rename volume root');
     await this.client.rename(n.name, newName, n.parentId, this.volId);
     n.name = newName;
-    n.modDate = macTime();
+    n.modDate = Date.now();
     this.nodes.set(id, n);
     this.notify(n.parentId);
   }
 
-  async move(id: number, newParent: number): Promise<void> {
-    const n = this.nodes.get(id) ?? (await this.get(id));
+  async move(ref: NodeRef, newParent: NodeRef): Promise<void> {
+    const id = asCnid(ref);
+    const parentId = asCnid(newParent);
+    const n = this.nodes.get(id) ?? requireCnid((await this.get(id))!);
     if (!n) throw new Error('not found');
     if (n.id === this.rootId()) throw new Error('cannot move volume root');
-    if (n.parentId === newParent) return;
-    await this.client.moveAndRename(n.parentId, n.name, newParent, '', this.volId);
+    if (n.parentId === parentId) return;
+    await this.client.moveAndRename(n.parentId, n.name, parentId, '', this.volId);
     const oldParent = n.parentId;
-    n.parentId = newParent;
-    n.modDate = macTime();
+    n.parentId = parentId;
+    n.modDate = Date.now();
     this.nodes.set(id, n);
-    this.notify(oldParent, newParent);
+    this.notify(oldParent, parentId);
   }
 
-  async remove(id: number): Promise<void> {
+  async remove(ref: NodeRef): Promise<void> {
+    const id = asCnid(ref);
     const n = this.nodes.get(id);
     if (!n) return;
     if (n.id === this.rootId()) throw new Error('cannot delete volume root');
     if (n.isDir) {
       const kids = await this.children(id);
-      for (const k of kids) await this.remove(k.id);
+      for (const k of kids) await this.remove(nodeRef(k));
     }
     await this.client.remove(n.name, n.parentId, this.volId);
     this.nodes.delete(id);
@@ -264,17 +322,19 @@ export class RemoteVfs implements Catalog {
     this.notify(n.parentId);
   }
 
-  async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
+  async importDataTransfer(parent: NodeRef, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
+    const parentId = asCnid(parent);
     return importDataTransferInto(this, parentId, dt, (p, file, onBytes, resource, signal) => this.importBlob(p, file, onBytes, resource, signal), opts);
   }
 
   private async importBlob(
-    parentId: number,
+    parent: NodeRef,
     file: File,
     onBytes?: (n: number) => void,
     resource?: Uint8Array,
     signal?: AbortSignal,
   ): Promise<VNode> {
+    const parentId = asCnid(parent);
     throwIfAborted(signal);
     const buf = new Uint8Array(await file.arrayBuffer());
     throwIfAborted(signal);
@@ -285,7 +345,8 @@ export class RemoteVfs implements Catalog {
         const target = name.slice(2);
         const existing = await this.lookup(parentId, target);
         if (existing && !existing.isDir) {
-          const data = this.forksLoaded.has(existing.id)
+          const cnid = requireCnid(existing);
+          const data = this.forksLoaded.has(cnid.id)
             ? existing.data
             : await this.client.readFile(existing.name, parentId, false, this.volId);
           return this.createFile(parentId, target, data, ad.resource, ad.finderInfo, onBytes, signal);
@@ -306,22 +367,23 @@ export class RemoteVfs implements Catalog {
 
   private async hydrateForks(node: VNode, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<void> {
     throwIfAborted(signal);
+    const n = requireCnid(node);
     try {
-      node.data = await this.client.readFile(node.name, node.parentId, false, this.volId, onBytes, signal);
+      node.data = await this.client.readFile(n.name, n.parentId, false, this.volId, onBytes, signal);
     } catch (err) {
       if (isAbortError(err)) throw err;
       node.data = EMPTY;
     }
     try {
-      node.resource = await this.client.readFile(node.name, node.parentId, true, this.volId, onBytes, signal);
+      node.resource = await this.client.readFile(n.name, n.parentId, true, this.volId, onBytes, signal);
     } catch (err) {
       if (isAbortError(err)) throw err;
       node.resource = EMPTY;
     }
     node.dataBytes = node.data.length;
     node.resourceBytes = node.resource.length;
-    this.forksLoaded.add(node.id);
-    this.nodes.set(node.id, node);
+    this.forksLoaded.add(n.id);
+    this.nodes.set(n.id, n);
   }
 
   private adopt(
@@ -340,7 +402,8 @@ export class RemoteVfs implements Catalog {
     parentId: number,
   ): VNode {
     const prev = this.nodes.get(e.cnid);
-    const node: VNode = {
+    const node: CnidVNode = {
+      addr: 'cnid',
       id: e.cnid,
       parentId: e.parentId || parentId,
       name: e.name,
@@ -348,8 +411,8 @@ export class RemoteVfs implements Catalog {
       data: prev && this.forksLoaded.has(e.cnid) ? prev.data : EMPTY,
       resource: prev && this.forksLoaded.has(e.cnid) ? prev.resource : EMPTY,
       finderInfo: e.finderInfo?.length ? e.finderInfo.slice() : new Uint8Array(32),
-      createDate: e.createDate,
-      modDate: e.modDate,
+      createDate: toUnixMs(e.createDate),
+      modDate: toUnixMs(e.modDate),
       dataBytes: e.isDir ? 0 : e.dataLen,
       resourceBytes: e.isDir ? 0 : e.rsrcLen,
       ...(e.attributes ? { attributes: e.attributes } : {}),
@@ -364,9 +427,10 @@ export class RemoteVfs implements Catalog {
     return node;
   }
 
-  private makeRoot(): VNode {
+  private makeRoot(): CnidVNode {
     return {
-      id: this.rootId(),
+      addr: 'cnid',
+      id: CNIDRoot,
       parentId: 1,
       name: this.volumeName,
       isDir: true,
@@ -379,7 +443,7 @@ export class RemoteVfs implements Catalog {
   }
 
   private ensureRoot(): VNode {
-    let n = this.nodes.get(this.rootId());
+    let n = this.nodes.get(CNIDRoot);
     if (!n) {
       n = this.makeRoot();
       this.nodes.set(n.id, n);
@@ -387,8 +451,9 @@ export class RemoteVfs implements Catalog {
     return n;
   }
 
-  private placeholderDir(parentId: number, name: string): VNode {
-    const node: VNode = {
+  private placeholderDir(parentId: number, name: string): CnidVNode {
+    const node: CnidVNode = {
+      addr: 'cnid',
       id: Date.now() & 0x7fffffff,
       parentId,
       name,
@@ -396,8 +461,8 @@ export class RemoteVfs implements Catalog {
       data: EMPTY,
       resource: EMPTY,
       finderInfo: new Uint8Array(32),
-      createDate: macTime(),
-      modDate: macTime(),
+      createDate: Date.now(),
+      modDate: Date.now(),
     };
     this.nodes.set(node.id, node);
     return node;
@@ -410,7 +475,8 @@ export class RemoteVfs implements Catalog {
     resource: Uint8Array,
     finderInfo: Uint8Array,
   ): VNode {
-    const node: VNode = {
+    const node: CnidVNode = {
+      addr: 'cnid',
       id: Date.now() & 0x7fffffff,
       parentId,
       name,
@@ -418,8 +484,8 @@ export class RemoteVfs implements Catalog {
       data,
       resource,
       finderInfo,
-      createDate: macTime(),
-      modDate: macTime(),
+      createDate: Date.now(),
+      modDate: Date.now(),
       dataBytes: data.length,
       resourceBytes: resource.length,
     };

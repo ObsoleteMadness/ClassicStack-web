@@ -55,6 +55,8 @@ export interface RemoteEndpoint {
    * volumes as children after login and shows Disconnect on this row.
    */
   role?: 'server' | 'volume';
+  /** Copyable connect URI (no volume, no trailing slash). */
+  uri?: string;
 }
 
 /** Result of contacting a remote (or local) endpoint before / after login. */

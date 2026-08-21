@@ -1,5 +1,7 @@
 import { CNIDRoot } from '../protocol/afp/constants';
 import type { VNode, VfsChangeListener, ChildrenBatchListener } from '../fs/virtual-fs';
+import { nodeRef, parentRef } from '../fs/virtual-fs';
+import { asCnid, catalogCapsForSession, refKey, toUnixMs, type CatalogCapabilities, type NodeRef } from '../fs/catalog-caps';
 import { importDataTransferInto, type ImportProgress } from '../fs/import-transfer';
 import { finderInfoFromName } from '../fs/extension-map';
 import { bufferRangeReader, type ByteRangeReader } from '../fs/byte-range';
@@ -27,65 +29,103 @@ export class ApiCatalog implements CatalogWithBackend {
   readonly reportsChunkedBytes = true;
   readonly sessionId: string;
   readonly api: FinderAPI;
-  private root: number;
-  private nodes = new Map<number, VNode>();
-  private forksLoaded = new Set<number>();
+  private caps: CatalogCapabilities;
+  private root: NodeRef;
+  private nodes = new Map<string, VNode>();
+  private forksLoaded = new Set<string>();
   private listeners = new Set<VfsChangeListener>();
   private batchDepth = 0;
-  private batchParents = new Set<number>();
+  private batchParents = new Set<string>();
 
   constructor(api: FinderAPI, session: FinderSessionDto) {
     this.api = api;
     this.sessionId = session.sessionId;
-    this.root = session.rootId || CNIDRoot;
+    this.caps = catalogCapsForSession(session);
+    this.root = this.caps.addressBy === 'path' ? (session.rootPath ?? '') : (session.rootId || CNIDRoot);
   }
 
-  rootId(): number { return this.root; }
+  capabilities(): CatalogCapabilities { return this.caps; }
+  rootId(): NodeRef { return this.root; }
   subscribe(fn: VfsChangeListener): () => void { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   beginBatch(): void { this.batchDepth++; }
   endBatch(): void {
     if (this.batchDepth <= 0) return;
     this.batchDepth--;
     if (this.batchDepth === 0 && this.batchParents.size) {
-      const parentIds = [...this.batchParents];
+      const parentIds = [...this.batchParents].map((k) => (k.startsWith('p:') ? k.slice(2) : Number(k.slice(2))));
       this.batchParents.clear();
       this.emit(parentIds);
     }
   }
 
-  async get(id: number): Promise<VNode | undefined> {
-    const cached = this.nodes.get(id);
+  async get(ref: NodeRef): Promise<VNode | undefined> {
+    const cached = this.nodes.get(refKey(ref));
     if (cached) return cached;
     try {
-      return this.adopt(await this.api.getNode(this.sessionId, id));
+      return this.adopt(await this.api.getNode(this.sessionId, ref));
     } catch {
-      return id === this.root ? this.ensureRoot() : undefined;
+      return ref === this.root || ref === '' || ref === this.rootId() ? this.ensureRoot() : undefined;
     }
   }
 
-  async ensureContent(id: number, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined> {
-    const node = await this.get(id);
+  async ensureContent(ref: NodeRef, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined> {
+    const node = await this.get(ref);
     if (!node || node.isDir) return node;
-    if (!this.forksLoaded.has(id)) await this.hydrateForks(node, onBytes, signal);
+    const key = refKey(nodeRef(node));
+    if (!this.forksLoaded.has(key)) await this.hydrateForks(node, onBytes, signal);
     return node;
   }
 
-  async children(parentId: number, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]> {
+  async children(parent: NodeRef, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]> {
     throwIfAborted(signal);
-    const raw = await this.api.children(this.sessionId, parentId);
+    const raw = await this.api.children(this.sessionId, parent);
     const kids = raw.map((n) => this.adopt(n));
     await onBatch?.(kids);
     return kids;
   }
 
-  async lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined> {
+  async lookup(parent: NodeRef, name: string, signal?: AbortSignal): Promise<VNode | undefined> {
     throwIfAborted(signal);
     const lower = name.toLowerCase();
     for (const n of this.nodes.values()) {
-      if (n.parentId === parentId && n.name.toLowerCase() === lower) return n;
+      if (parentRef(n) === parent && n.name.toLowerCase() === lower) return n;
     }
-    const raw = await this.api.lookup(this.sessionId, parentId, name);
+    const raw = await this.api.lookup(this.sessionId, parent, name);
     return raw ? this.adopt(raw) : undefined;
+  }
+
+  async resolvePath(path: string): Promise<VNode | undefined> {
+    if (this.caps.addressBy === 'path') return this.get(path);
+    try {
+      const raw = await this.api.resolvePath(this.sessionId, path);
+      return raw ? this.adopt(raw) : undefined;
+    } catch {
+      const parts = path.split('/').filter(Boolean);
+      let cur: VNode | undefined = await this.get(this.root);
+      for (const part of parts) {
+        if (!cur) return undefined;
+        cur = await this.lookup(nodeRef(cur), part);
+      }
+      return cur;
+    }
+  }
+
+  async pathOf(ref: NodeRef): Promise<string> {
+    if (this.caps.addressBy === 'path') return String(ref);
+    try {
+      return await this.api.pathOf(this.sessionId, ref);
+    } catch {
+      return '';
+    }
+  }
+
+  async setAttrs(ref: NodeRef, patch: Record<string, boolean>): Promise<void> {
+    if (this.api.writeAttrs) await this.api.writeAttrs(this.sessionId, ref, patch);
+    const n = await this.get(ref);
+    if (n) {
+      n.attrs = { ...(n.attrs ?? {}), ...patch };
+      this.nodes.set(refKey(nodeRef(n)), n);
+    }
   }
 
   async loadResourceFork(node: VNode, opts?: ResourceForkLoadOpts): Promise<ResourceFork | null> {
@@ -122,32 +162,32 @@ export class ApiCatalog implements CatalogWithBackend {
     opts?: { resource?: boolean; signal?: AbortSignal; priority?: number },
   ): Promise<T> {
     throwIfAborted(opts?.signal);
-    if (this.forksLoaded.has(node.id)) {
+    if (this.forksLoaded.has(refKey(nodeRef(node)))) {
       const bytes = opts?.resource ? node.resource : node.data;
       return fn(bufferRangeReader(bytes));
     }
     const read: ByteRangeReader = (offset, count) =>
-      this.api.readFork(this.sessionId, node.id, !!opts?.resource, offset, count);
+      this.api.readFork(this.sessionId, nodeRef(node), !!opts?.resource, offset, count);
     return fn(read);
   }
 
-  async mkdir(parentId: number, name: string): Promise<VNode> {
-    const existing = await this.lookup(parentId, name);
+  async mkdir(parent: NodeRef, name: string): Promise<VNode> {
+    const existing = await this.lookup(parent, name);
     if (existing) throw new Error('exists');
-    const node = this.adopt(await this.api.mkdir(this.sessionId, parentId, name));
-    this.notify(parentId);
+    const node = this.adopt(await this.api.mkdir(this.sessionId, parent, name));
+    this.notify(parent);
     return node;
   }
 
-  async ensureDir(parentId: number, name: string): Promise<VNode> {
-    const existing = await this.lookup(parentId, name);
+  async ensureDir(parent: NodeRef, name: string): Promise<VNode> {
+    const existing = await this.lookup(parent, name);
     if (existing?.isDir) return existing;
     if (existing) throw new Error('exists');
-    return this.mkdir(parentId, name);
+    return this.mkdir(parent, name);
   }
 
   async createFile(
-    parentId: number,
+    parent: NodeRef,
     name: string,
     data: Uint8Array,
     resource = new Uint8Array(),
@@ -156,75 +196,79 @@ export class ApiCatalog implements CatalogWithBackend {
     signal?: AbortSignal,
   ): Promise<VNode> {
     throwIfAborted(signal);
-    const raw = await this.api.create(this.sessionId, parentId, name, { finderInfo });
+    const raw = await this.api.create(this.sessionId, parent, name, { finderInfo });
     const node = this.adopt(raw);
-    if (data.length) await this.writeFork(node.id, false, data, onBytes, signal);
+    const id = nodeRef(node);
+    if (data.length) await this.writeFork(id, false, data, onBytes, signal);
     throwIfAborted(signal);
-    if (resource.length) await this.writeFork(node.id, true, resource, onBytes, signal);
+    if (resource.length) await this.writeFork(id, true, resource, onBytes, signal);
     node.data = data;
     node.resource = resource;
     node.finderInfo = finderInfo;
     node.dataBytes = data.length;
     node.resourceBytes = resource.length;
-    this.forksLoaded.add(node.id);
-    this.nodes.set(node.id, node);
-    this.notify(parentId);
+    this.forksLoaded.add(refKey(id));
+    this.nodes.set(refKey(id), node);
+    this.notify(parent);
     return node;
   }
 
   async put(node: VNode): Promise<void> {
-    this.nodes.set(node.id, node);
-    await this.api.writeFinderInfo(this.sessionId, node.id, node.finderInfo);
-    this.notify(node.parentId);
+    const id = nodeRef(node);
+    this.nodes.set(refKey(id), node);
+    await this.api.writeFinderInfo(this.sessionId, id, node.finderInfo);
+    this.notify(parentRef(node));
   }
 
-  async rename(id: number, newName: string): Promise<void> {
-    const n = this.nodes.get(id) ?? (await this.get(id));
+  async rename(ref: NodeRef, newName: string): Promise<void> {
+    const n = this.nodes.get(refKey(ref)) ?? (await this.get(ref));
     if (!n) throw new Error('not found');
-    if (n.id === this.rootId()) throw new Error('cannot rename volume root');
-    await this.api.rename(this.sessionId, id, newName);
+    if (nodeRef(n) === this.rootId()) throw new Error('cannot rename volume root');
+    await this.api.rename(this.sessionId, ref, newName);
     n.name = newName;
-    this.nodes.set(id, n);
-    this.notify(n.parentId);
+    this.nodes.set(refKey(nodeRef(n)), n);
+    this.notify(parentRef(n));
   }
 
-  async move(id: number, newParent: number): Promise<void> {
-    const n = this.nodes.get(id) ?? (await this.get(id));
+  async move(ref: NodeRef, newParent: NodeRef): Promise<void> {
+    const n = this.nodes.get(refKey(ref)) ?? (await this.get(ref));
     if (!n) throw new Error('not found');
-    if (n.id === this.rootId()) throw new Error('cannot move volume root');
-    if (n.parentId === newParent) return;
-    await this.api.move(this.sessionId, id, newParent);
-    const oldParent = n.parentId;
-    n.parentId = newParent;
-    this.nodes.set(id, n);
+    if (nodeRef(n) === this.rootId()) throw new Error('cannot move volume root');
+    if (parentRef(n) === newParent) return;
+    await this.api.move(this.sessionId, ref, newParent);
+    const oldParent = parentRef(n);
+    if (n.addr === 'path') n.parentPath = String(newParent);
+    else n.parentId = Number(newParent);
+    this.nodes.set(refKey(nodeRef(n)), n);
     this.notify(oldParent, newParent);
   }
 
-  async remove(id: number): Promise<void> {
-    const n = this.nodes.get(id) ?? (await this.get(id));
+  async remove(ref: NodeRef): Promise<void> {
+    const n = this.nodes.get(refKey(ref)) ?? (await this.get(ref));
     if (!n) return;
-    if (n.id === this.rootId()) throw new Error('cannot delete volume root');
+    if (nodeRef(n) === this.rootId()) throw new Error('cannot delete volume root');
     if (n.isDir) {
-      const kids = await this.children(id);
-      for (const k of kids) await this.remove(k.id);
+      const kids = await this.children(ref);
+      for (const k of kids) await this.remove(nodeRef(k));
     }
-    await this.api.remove(this.sessionId, id);
-    this.nodes.delete(id);
-    this.forksLoaded.delete(id);
-    this.notify(n.parentId);
+    await this.api.remove(this.sessionId, ref);
+    this.nodes.delete(refKey(ref));
+    this.forksLoaded.delete(refKey(ref));
+    this.notify(parentRef(n));
   }
 
-  async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
+  async importDataTransfer(parent: NodeRef, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
+    if (typeof parent !== 'number') throw new Error('host import requires a CNID parent');
     return importDataTransferInto(
       this,
-      parentId,
+      parent,
       dt,
       (p, file, onBytes, resource, signal) => this.importBlob(p, file, onBytes, resource, signal),
       opts,
     );
   }
 
-  async copyFrom(src: CatalogWithBackend, srcId: number, destParent: number, opts: TransferOptions): Promise<void> {
+  async copyFrom(src: CatalogWithBackend, srcId: NodeRef, destParent: NodeRef, opts: TransferOptions): Promise<void> {
     await consumeProgress(
       this.api.copy(
         {
@@ -243,7 +287,7 @@ export class ApiCatalog implements CatalogWithBackend {
     this.notify(destParent);
   }
 
-  async moveFrom(src: CatalogWithBackend, srcId: number, destParent: number, opts: TransferOptions): Promise<void> {
+  async moveFrom(src: CatalogWithBackend, srcId: NodeRef, destParent: NodeRef, opts: TransferOptions): Promise<void> {
     if (src.api.backendId === this.api.backendId && src.sessionId === this.sessionId) {
       if (opts.replaceId != null) await this.remove(opts.replaceId);
       if (opts.destName) await src.rename(srcId, opts.destName);
@@ -269,19 +313,20 @@ export class ApiCatalog implements CatalogWithBackend {
     this.notify(destParent);
   }
 
-  async expandNode(id: number, opts?: Pick<TransferOptions, 'signal' | 'onProgress'>): Promise<void> {
-    await consumeProgress(this.api.expand(this.sessionId, id, opts?.signal), opts?.onProgress, opts?.signal);
-    const node = await this.get(id);
-    if (node) this.notify(node.parentId);
+  async expandNode(ref: NodeRef, opts?: Pick<TransferOptions, 'signal' | 'onProgress'>): Promise<void> {
+    await consumeProgress(this.api.expand(this.sessionId, ref, opts?.signal), opts?.onProgress, opts?.signal);
+    const node = await this.get(ref);
+    if (node) this.notify(parentRef(node));
   }
 
   private async importBlob(
-    parentId: number,
+    parent: NodeRef,
     file: File,
     onBytes?: (n: number) => void,
     resource?: Uint8Array,
     signal?: AbortSignal,
   ): Promise<unknown> {
+    const parentId = asCnid(parent);
     throwIfAborted(signal);
     const buf = new Uint8Array(await file.arrayBuffer());
     const name = unescapeHostFilename(file.name);
@@ -291,9 +336,9 @@ export class ApiCatalog implements CatalogWithBackend {
         const target = name.slice(2);
         const existing = await this.lookup(parentId, target);
         if (existing && !existing.isDir) {
-          const data = this.forksLoaded.has(existing.id)
+          const data = this.forksLoaded.has(refKey(nodeRef(existing)))
             ? existing.data
-            : await this.readWholeFork(existing.id, false, onBytes, signal);
+            : await this.readWholeFork(nodeRef(existing), false, onBytes, signal);
           return this.createFile(parentId, target, data, ad.resource, ad.finderInfo, onBytes, signal);
         }
         return this.createFile(parentId, target, new Uint8Array(), ad.resource, ad.finderInfo, onBytes, signal);
@@ -313,25 +358,25 @@ export class ApiCatalog implements CatalogWithBackend {
   private async hydrateForks(node: VNode, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<void> {
     throwIfAborted(signal);
     try {
-      node.data = await this.readWholeFork(node.id, false, onBytes, signal);
+      node.data = await this.readWholeFork(nodeRef(node), false, onBytes, signal);
     } catch (err) {
       if (isAbortError(err)) throw err;
       node.data = EMPTY;
     }
     try {
-      node.resource = await this.readWholeFork(node.id, true, onBytes, signal);
+      node.resource = await this.readWholeFork(nodeRef(node), true, onBytes, signal);
     } catch (err) {
       if (isAbortError(err)) throw err;
       node.resource = EMPTY;
     }
     node.dataBytes = node.data.length;
     node.resourceBytes = node.resource.length;
-    this.forksLoaded.add(node.id);
-    this.nodes.set(node.id, node);
+    this.forksLoaded.add(refKey(nodeRef(node)));
+    this.nodes.set(refKey(nodeRef(node)), node);
   }
 
   private async writeFork(
-    id: number,
+    id: NodeRef,
     resource: boolean,
     data: Uint8Array,
     onBytes?: (n: number) => void,
@@ -347,7 +392,7 @@ export class ApiCatalog implements CatalogWithBackend {
   }
 
   private async readWholeFork(
-    id: number,
+    id: NodeRef,
     resource: boolean,
     onBytes?: (n: number) => void,
     signal?: AbortSignal,
@@ -360,57 +405,77 @@ export class ApiCatalog implements CatalogWithBackend {
   }
 
   private adopt(raw: FinderNodeDto): VNode {
-    const prev = this.nodes.get(raw.id);
-    const loaded = this.forksLoaded.has(raw.id);
+    const key = raw.addr === 'path' ? refKey(raw.path) : refKey(raw.id);
+    const prev = this.nodes.get(key);
+    const loaded = this.forksLoaded.has(key);
     const finderInfo = b64ToBytes(raw.finderInfo);
-    const node: VNode = {
-      id: raw.id,
-      parentId: raw.parentId,
+    const common = {
       name: raw.name,
       isDir: raw.isDir,
       data: loaded && prev ? prev.data : EMPTY,
       resource: loaded && prev ? prev.resource : EMPTY,
       finderInfo: finderInfo.length ? finderInfo : new Uint8Array(32),
-      createDate: raw.createDate ?? 0,
-      modDate: raw.modDate ?? 0,
+      createDate: toUnixMs(raw.createDate ?? 0),
+      modDate: toUnixMs(raw.modDate ?? 0),
+      accessDate: raw.accessDate != null ? toUnixMs(raw.accessDate) : undefined,
       dataBytes: raw.isDir ? 0 : (raw.dataBytes ?? 0),
       resourceBytes: raw.isDir ? 0 : (raw.resourceBytes ?? 0),
+      shortName: raw.shortName,
+      mediumName: raw.mediumName,
+      attrs: raw.attrs,
     };
+    const node: VNode = raw.addr === 'path'
+      ? { addr: 'path', path: raw.path, parentPath: raw.parentPath, ...common }
+      : { addr: 'cnid', id: raw.id, parentId: raw.parentId, ...common };
     if (!raw.isDir && loaded && prev) {
       node.dataBytes = prev.data.length;
       node.resourceBytes = prev.resource.length;
     }
-    this.nodes.set(node.id, node);
+    this.nodes.set(refKey(nodeRef(node)), node);
     return node;
   }
 
   private ensureRoot(): VNode {
-    const existing = this.nodes.get(this.root);
+    const existing = this.nodes.get(refKey(this.root));
     if (existing) return existing;
-    const root: VNode = {
-      id: this.root,
-      parentId: 1,
-      name: '',
-      isDir: true,
-      data: EMPTY,
-      resource: EMPTY,
-      finderInfo: new Uint8Array(32),
-      createDate: 0,
-      modDate: 0,
-    };
-    this.nodes.set(this.root, root);
+    const root: VNode = this.caps.addressBy === 'path'
+      ? {
+          addr: 'path',
+          path: '',
+          parentPath: '',
+          name: '',
+          isDir: true,
+          data: EMPTY,
+          resource: EMPTY,
+          finderInfo: new Uint8Array(32),
+          createDate: 0,
+          modDate: 0,
+        }
+      : {
+          addr: 'cnid',
+          id: typeof this.root === 'number' ? this.root : CNIDRoot,
+          parentId: 1,
+          name: '',
+          isDir: true,
+          data: EMPTY,
+          resource: EMPTY,
+          finderInfo: new Uint8Array(32),
+          createDate: 0,
+          modDate: 0,
+        };
+    this.nodes.set(refKey(nodeRef(root)), root);
     return root;
   }
 
-  private notify(...parentIds: number[]): void {
+  private notify(...parentIds: NodeRef[]): void {
     if (this.batchDepth > 0) {
-      for (const id of parentIds) this.batchParents.add(id);
+      for (const id of parentIds) this.batchParents.add(refKey(id));
       return;
     }
     this.emit(parentIds);
   }
 
-  private emit(parentIds: number[]): void {
+  private emit(parentIds: NodeRef[]): void {
     const change = { parentIds };
     for (const fn of this.listeners) fn(change);
   }

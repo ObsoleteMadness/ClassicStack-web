@@ -14,3 +14,15 @@ export type {
   TransferOptions,
   CrossTransferRequest,
 } from './types';
+export type { CatalogCapabilities, NodeRef, VolumeIdentity } from '../fs/catalog-caps';
+export {
+  afpVolumeCaps,
+  smbVolumeCaps,
+  ncpVolumeCaps,
+  edfsVolumeCaps,
+  localShareCaps,
+  catalogCapsForSession,
+  parseRefKey,
+  refKey,
+} from '../fs/catalog-caps';
+export { volumeChrome, formatStorePath, clientVolumeURI, isClientURI } from '../fs/volume-chrome';

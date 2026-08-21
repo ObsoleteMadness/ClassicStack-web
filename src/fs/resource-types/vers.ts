@@ -29,6 +29,10 @@ export interface VersRec {
 export interface VersGetInfo {
   version: string;
   copyright: string;
+  product?: string;
+  productVersion?: string;
+  description?: string;
+  company?: string;
 }
 
 const COPYRIGHT_RE = /(?:©|\(c\)|copyright)/i;

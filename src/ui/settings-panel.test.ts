@@ -8,11 +8,16 @@ describe('settings-panel', () => {
       nav: [{ id: 'general', label: 'General', iconHtml: '<svg/>' }],
       selectedId: 'general',
       panelTitle: 'General',
+      panelDescription: 'Finder preferences.',
+      panelIconHtml: '<svg class="panel-icon"/>',
       panelHtml: '<p>Body</p>',
     });
     expect(html).toContain('settings-shell__body');
     expect(html).toContain('is-selected');
     expect(html).toContain('aria-current="page"');
+    expect(html).toContain('settings-panel__heading');
+    expect(html).toContain('Finder preferences.');
+    expect(html).toContain('panel-icon');
     expect(html).toContain('<p>Body</p>');
   });
 

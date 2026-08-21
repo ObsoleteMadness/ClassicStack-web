@@ -1,3 +1,5 @@
+import { menubarMinTop } from './window-layout';
+
 /** Bottom-right resize grip and title-bar move for Finder and floating windows. */
 
 interface ResizeOpts {
@@ -46,8 +48,9 @@ function onPointerMove(e: PointerEvent): void {
   if (!move) return;
   e.preventDefault();
   const pad = 8;
+  const minTop = menubarMinTop();
   const left = Math.max(pad, Math.min(window.innerWidth - 40, move.left + (e.clientX - move.x)));
-  const top = Math.max(pad, Math.min(window.innerHeight - 40, move.top + (e.clientY - move.y)));
+  const top = Math.max(minTop, Math.min(window.innerHeight - 40, move.top + (e.clientY - move.y)));
   move.el.style.left = `${Math.round(left)}px`;
   move.el.style.top = `${Math.round(top)}px`;
 }

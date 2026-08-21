@@ -2,17 +2,20 @@
 
 import type { ByteRangeReader } from './byte-range';
 import type { ResourceFork } from './resource-fork';
+import { afpVolumeCaps, type CatalogCapabilities, type NodeRef } from './catalog-caps';
 import type {
   Catalog,
   ChildrenBatchListener,
+  CnidVNode,
   VfsChangeListener,
   VNode,
 } from './virtual-fs';
 
 const ROOT_ID = 2;
 
-function emptyRoot(): VNode {
+function emptyRoot(): CnidVNode {
   return {
+    addr: 'cnid',
     id: ROOT_ID,
     parentId: 1,
     name: '',
@@ -31,7 +34,18 @@ function unsupported(op: string): never {
 
 /** Catalog with an empty root; mutations throw. */
 export class EmptyCatalog implements Catalog {
-  rootId(): number {
+  capabilities(): CatalogCapabilities {
+    return {
+      ...afpVolumeCaps,
+      readOnly: true,
+      resourceFork: false,
+      finderInfo: false,
+      desktopIcons: false,
+      resourceIcons: false,
+    };
+  }
+
+  rootId(): NodeRef {
     return ROOT_ID;
   }
 
@@ -42,16 +56,16 @@ export class EmptyCatalog implements Catalog {
   beginBatch(): void {}
   endBatch(): void {}
 
-  async get(id: number): Promise<VNode | undefined> {
-    return id === ROOT_ID ? emptyRoot() : undefined;
+  async get(ref: NodeRef): Promise<VNode | undefined> {
+    return ref === ROOT_ID ? emptyRoot() : undefined;
   }
 
-  async ensureContent(id: number): Promise<VNode | undefined> {
-    return this.get(id);
+  async ensureContent(ref: NodeRef): Promise<VNode | undefined> {
+    return this.get(ref);
   }
 
   async children(
-    _parentId: number,
+    _parent: NodeRef,
     onBatch?: ChildrenBatchListener,
     _signal?: AbortSignal,
   ): Promise<VNode[]> {
@@ -61,6 +75,14 @@ export class EmptyCatalog implements Catalog {
 
   async lookup(): Promise<VNode | undefined> {
     return undefined;
+  }
+
+  async resolvePath(path: string): Promise<VNode | undefined> {
+    return path === '' || path === '/' ? emptyRoot() : undefined;
+  }
+
+  async pathOf(): Promise<string> {
+    return '';
   }
 
   async loadResourceFork(): Promise<ResourceFork | null> {

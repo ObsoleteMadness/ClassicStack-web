@@ -1,16 +1,19 @@
 /** In-browser copy/move/expand between Finder catalogs (AFP PWA). */
 
 import type { Catalog, VNode } from '../fs/virtual-fs';
+import { nodeRef, parentRef } from '../fs/virtual-fs';
 import { RemoteVfs } from '../fs/remote-vfs';
 import { expandArchiveFile } from '../fs/expand-incoming';
 import { expandSitInPlace } from '../fs/expand-inplace';
 import { importExpandedTree } from '../fs/import-transfer';
 import { throwIfAborted } from '../util/abort';
+import type { NodeRef } from '../fs/catalog-caps';
+import { asCnid } from '../fs/catalog-caps';
 import type { CrossTransferRequest, OpProgress } from './types';
 
 type CopyCtx = {
   destName: string;
-  destParentId: number;
+  destParentId: NodeRef;
   bytesDone: number;
   bytesTotal?: number;
   signal?: AbortSignal;
@@ -29,7 +32,7 @@ async function* copyNode(
   src: Catalog,
   dest: Catalog,
   node: VNode,
-  destParent: number,
+  destParent: NodeRef,
   destName: string,
   ctx: CopyCtx,
 ): AsyncGenerator<OpProgress> {
@@ -44,13 +47,13 @@ async function* copyNode(
   };
   if (node.isDir) {
     const dir = await dest.mkdir(destParent, destName);
-    for (const child of await src.children(node.id, undefined, ctx.signal)) {
-      yield* copyNode(src, dest, child, dir.id, child.name, ctx);
+    for (const child of await src.children(nodeRef(node), undefined, ctx.signal)) {
+      yield* copyNode(src, dest, child, nodeRef(dir), child.name, ctx);
     }
     return;
   }
   if (sameAfpClient(src, dest) && src instanceof RemoteVfs && dest instanceof RemoteVfs) {
-    await src.client.copyFile(node.parentId, node.name, dest.volId, destParent, destName, src.volId);
+    await src.client.copyFile(asCnid(parentRef(node)), node.name, dest.volId, asCnid(destParent), destName, src.volId);
     ctx.bytesDone += nodeBytes(node);
     yield {
       phase: 'copying',
@@ -73,7 +76,7 @@ async function* copyNode(
         ctx.bytesDone += n;
       }
     : undefined;
-  const full = (await src.ensureContent(node.id, onRead, ctx.signal)) ?? node;
+  const full = (await src.ensureContent(nodeRef(node), onRead, ctx.signal)) ?? node;
   throwIfAborted(ctx.signal);
   await dest.createFile(
     destParent,
@@ -108,7 +111,7 @@ export async function* copyBetweenCatalogs(
   }
   if (req.replace) {
     const existing = await dest.lookup(req.destParentId, req.destName);
-    if (existing) await dest.remove(existing.id);
+    if (existing) await dest.remove(nodeRef(existing));
   }
   const ctx: CopyCtx = {
     destName: req.destName,
@@ -147,7 +150,7 @@ export async function* moveBetweenCatalogs(
   if (src === dest || (src instanceof RemoteVfs && dest instanceof RemoteVfs && src.client === dest.client && src.volId === dest.volId)) {
     if (req.replace) {
       const existing = await dest.lookup(req.destParentId, req.destName);
-      if (existing && existing.id !== req.srcId) await dest.remove(existing.id);
+      if (existing && nodeRef(existing) !== req.srcId) await dest.remove(nodeRef(existing));
     }
     if (req.destName && req.destName !== node.name) await src.rename(req.srcId, req.destName);
     await src.move(req.srcId, req.destParentId);
@@ -162,10 +165,10 @@ export async function* moveBetweenCatalogs(
 /** Expand an archive next to itself on a catalog (StuffIt in-place, else load + expand). */
 export async function* expandOnCatalog(
   cat: Catalog,
-  id: number,
+  ref: NodeRef,
   signal?: AbortSignal,
 ): AsyncGenerator<OpProgress> {
-  const node = await cat.get(id);
+  const node = await cat.get(ref);
   if (!node || node.isDir) {
     yield { error: 'not an archive', done: true };
     return;
@@ -187,10 +190,12 @@ export async function* expandOnCatalog(
       resolveConflict: async () => 'rename',
     });
     if (!inPlace) {
-      const full = (await cat.ensureContent(id, track.onBytes, signal)) ?? node;
+      const full = (await cat.ensureContent(ref, track.onBytes, signal)) ?? node;
       throwIfAborted(signal);
       const tree = expandArchiveFile(full.name, full.data);
-      await importExpandedTree(cat, node.parentId, tree, track);
+      const parent = parentRef(node);
+      if (typeof parent !== 'number') throw new Error('expand: AFP parent required');
+      await importExpandedTree(cat, parent, tree, track);
     }
     yield { phase: 'expanding', path: node.name, bytesDone, bytesTotal, done: true };
   } finally {

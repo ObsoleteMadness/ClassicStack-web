@@ -4,7 +4,7 @@
 export const MENUBAR_CHANGE = 'cs-menubar-change';
 
 const MENU_SEL = '[data-menu]';
-const TRIGGER_SEL = '.app-menu__trigger';
+const DROPDOWN_SEL = '.app-menu__dropdown';
 
 /** Currently open menu key (`data-menu`), or null if all menus are closed. */
 export function menubarOpenKey(root: HTMLElement): string | null {
@@ -49,9 +49,19 @@ function adjacentKey(root: HTMLElement, current: string, dir: -1 | 1): string | 
   return keys[(i + dir + keys.length) % keys.length] ?? current;
 }
 
+/** True when the event was aimed at this menubar, even if innerHTML detached the target. */
+function eventInsideRoot(root: HTMLElement, e: Event): boolean {
+  if (typeof e.composedPath === 'function' && e.composedPath().includes(root)) return true;
+  const t = e.target;
+  if (t instanceof Node && root.contains(t)) return true;
+  const menu = closestFrom(e.target, MENU_SEL);
+  return !!(menu && root.contains(menu));
+}
+
 /**
  * Bind click / hover / keyboard tracking on a stable root that contains `[data-menu]`
- * items (each with an `.app-menu__trigger`). The root must not be replaced by innerHTML.
+ * items. A click anywhere on a menu title (except the dropdown) toggles that menu.
+ * The root must not be replaced by innerHTML.
  *
  * While a menu is open, moving the pointer onto another title switches to that menu —
  * the same tracking mode as macOS / Windows menu bars.
@@ -60,13 +70,13 @@ export function bindMenuBarTracking(root: HTMLElement): () => void {
   const onPointerOver = (e: PointerEvent): void => {
     if (e.pointerType === 'touch') return;
     if (!menubarOpenKey(root)) return;
-    if (closestFrom(e.target, '.app-menu__dropdown')) return;
+    if (closestFrom(e.target, DROPDOWN_SEL)) return;
     const key = menuKeyOf(e.target, root);
     if (key) setMenubarOpen(root, key);
   };
 
   const onClick = (e: MouseEvent): void => {
-    if (!closestFrom(e.target, TRIGGER_SEL)) return;
+    if (closestFrom(e.target, DROPDOWN_SEL)) return;
     const key = menuKeyOf(e.target, root);
     if (!key) return;
     e.stopPropagation();
@@ -75,10 +85,9 @@ export function bindMenuBarTracking(root: HTMLElement): () => void {
     else setMenubarOpen(root, open === key ? null : key);
   };
 
-  const onWindowClick = (e: MouseEvent): void => {
+  const onDocumentClick = (e: MouseEvent): void => {
     if (!menubarOpenKey(root)) return;
-    const menu = closestFrom(e.target, MENU_SEL);
-    if (menu && root.contains(menu)) return;
+    if (eventInsideRoot(root, e)) return;
     setMenubarOpen(root, null);
   };
 
@@ -99,13 +108,15 @@ export function bindMenuBarTracking(root: HTMLElement): () => void {
 
   root.addEventListener('pointerover', onPointerOver);
   root.addEventListener('click', onClick);
-  window.addEventListener('click', onWindowClick);
+  // Capture so the same click that opens a menu cannot dismiss it after innerHTML
+  // replacement detaches the original target (the SPA View title hit this).
+  document.addEventListener('click', onDocumentClick, true);
   window.addEventListener('keydown', onKey);
 
   return () => {
     root.removeEventListener('pointerover', onPointerOver);
     root.removeEventListener('click', onClick);
-    window.removeEventListener('click', onWindowClick);
+    document.removeEventListener('click', onDocumentClick, true);
     window.removeEventListener('keydown', onKey);
   };
 }

@@ -34,6 +34,19 @@ function gitCommitShort(): string {
 
 /** Serve and copy ./icons → /icons for system Finder glyphs. */
 function iconsStaticPlugin(): Plugin {
+  const copyIconsTree = (srcDir: string, destDir: string): void => {
+    if (!fs.existsSync(srcDir)) return;
+    fs.mkdirSync(destDir, { recursive: true });
+    for (const name of fs.readdirSync(srcDir)) {
+      if (name === '.DS_Store') continue;
+      const src = path.join(srcDir, name);
+      const dest = path.join(destDir, name);
+      const st = fs.statSync(src);
+      if (st.isDirectory()) copyIconsTree(src, dest);
+      else if (st.isFile()) fs.copyFileSync(src, dest);
+    }
+  };
+
   return {
     name: 'classicstack-icons-static',
     configureServer(server) {
@@ -51,20 +64,16 @@ function iconsStaticPlugin(): Plugin {
           res.end('not found');
           return;
         }
-        res.setHeader('Content-Type', 'image/png');
+        const ext = path.extname(file).toLowerCase();
+        const type =
+          ext === '.gif' ? 'image/gif' : ext === '.svg' ? 'image/svg+xml' : 'image/png';
+        res.setHeader('Content-Type', type);
         res.setHeader('Cache-Control', 'public, max-age=86400');
         fs.createReadStream(file).pipe(res);
       });
     },
     closeBundle() {
-      const outDir = path.join(root, 'dist', 'icons');
-      fs.mkdirSync(outDir, { recursive: true });
-      for (const name of fs.readdirSync(iconsDir)) {
-        const src = path.join(iconsDir, name);
-        if (fs.statSync(src).isFile()) {
-          fs.copyFileSync(src, path.join(outDir, name));
-        }
-      }
+      copyIconsTree(iconsDir, path.join(root, 'dist', 'icons'));
     },
   };
 }

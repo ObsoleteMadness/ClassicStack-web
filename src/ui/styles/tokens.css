@@ -94,11 +94,11 @@ finder-window.is-maximized .window-resize-handle {
   }
 }
 
-.titlebar {
+.finder-chrome {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
+  gap: 4px;
+  min-width: 0;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #2c333b, #262c33);
   cursor: grab;
@@ -106,8 +106,20 @@ finder-window.is-maximized .window-resize-handle {
   touch-action: none;
 }
 
-finder-window.is-dragging .titlebar {
+finder-window.is-dragging .finder-chrome {
   cursor: grabbing;
+}
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  max-width: min(280px, 36%);
+  padding: 8px 8px 8px 14px;
+  border-bottom: none;
+  background: transparent;
+  cursor: inherit;
 }
 
 .titlebar-zoom {
@@ -118,19 +130,35 @@ finder-window.is-dragging .titlebar {
   font-weight: 700;
   font-size: 15px;
   letter-spacing: -0.02em;
+  white-space: nowrap;
 }
 
-.titlebar .spacer {
+.node-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.titlebar .spacer,
+.toolbar .spacer {
   flex: 1;
+  min-width: 8px;
 }
 
 .toolbar {
   display: flex;
   gap: 6px;
   align-items: center;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-pane);
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px 8px 4px;
+  border-bottom: none;
+  background: transparent;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .btn {
@@ -393,6 +421,25 @@ finder-window.is-dragging .titlebar {
 
 .side-item .dot.off {
   background: var(--text-muted);
+}
+
+.side-item--windows .dot { background: #3a96dd; }
+.side-item--novell .dot { background: #d32f2f; }
+.side-item--dos .dot { background: #9e9e9e; }
+.side-item--appleshare .dot { background: var(--ok); }
+.side-item--disk .dot { background: var(--ok); }
+
+.preview-attrs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 8px 0;
+}
+.preview-attr {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
 }
 
 .side-badge {
@@ -1555,6 +1602,10 @@ finder-window.is-dragging .titlebar {
   padding: 0 10px;
   cursor: pointer;
   border-radius: 4px;
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  height: 100%;
 }
 
 .app-menu.open .app-menu__trigger,
@@ -1612,6 +1663,91 @@ finder-window.is-dragging .titlebar {
   text-align: center;
   color: var(--ok);
   font-size: 12px;
+}
+
+
+.app-menu__label {
+  flex: 1;
+  min-width: 0;
+}
+
+.app-menu__shortcut {
+  margin-left: auto;
+  padding-left: 16px;
+  opacity: 0.55;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.app-menu__submenu-trigger {
+  position: relative;
+}
+
+.app-menu__submenu-btn {
+  width: 100%;
+}
+
+.app-menu__submenu-arrow {
+  margin-left: auto;
+  opacity: 0.55;
+  font-size: 12px;
+}
+
+.app-menu__submenu {
+  position: absolute;
+  left: calc(100% - 4px);
+  top: -4px;
+  min-width: 180px;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.18));
+  z-index: 120;
+  display: none;
+}
+
+.app-menu__submenu-trigger:hover > .app-menu__submenu,
+.app-menu__submenu-trigger:focus-within > .app-menu__submenu {
+  display: block;
+}
+
+.rsrc-explorer__actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  margin-right: 8px;
+}
+
+.rsrc-explorer__preview-overlay[hidden] {
+  display: none !important;
+}
+
+.rsrc-explorer__preview-overlay {
+  position: absolute;
+  inset: 40px 8px 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.rsrc-explorer__preview-overlay img,
+.rsrc-explorer__preview-overlay svg {
+  max-width: 100%;
+  max-height: 100%;
+  background: #fff;
+  border-radius: 4px;
+}
+
+.rsrc-explorer__preview-overlay [data-act="close-preview"] {
+  position: absolute;
+  top: 8px;
+  right: 8px;
 }
 
 .app-menu__dropdown hr {
@@ -2002,6 +2138,7 @@ get-info-window[hidden],
 /* —— Resource fork explorer —— */
 
 resource-fork-explorer,
+win-resource-explorer,
 .rsrc-explorer {
   position: fixed;
   z-index: 60;
@@ -2020,6 +2157,7 @@ resource-fork-explorer,
 }
 
 resource-fork-explorer[hidden],
+win-resource-explorer[hidden],
 .rsrc-explorer[hidden] {
   display: none !important;
 }
@@ -2049,10 +2187,7 @@ resource-fork-explorer[hidden],
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
-}
-
-.rsrc-explorer__chrome .log-panel__btn:last-child {
-  margin-left: auto;
+  flex: 1;
 }
 
 .rsrc-explorer__meta {
@@ -2403,6 +2538,21 @@ img.file-transfer__icon {
   background: var(--text-muted);
 }
 
+.file-transfer--searching .file-transfer__bar-fill {
+  width: 32% !important;
+  border-radius: 99px;
+  animation: file-transfer-search 1.1s ease-in-out infinite;
+}
+
+@keyframes file-transfer-search {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(360%);
+  }
+}
+
 .file-transfer__meta {
   margin-top: 4px;
   font-size: 11px;
@@ -2534,8 +2684,12 @@ settings-window[hidden],
   color: var(--accent);
 }
 
-.settings-nav__icon svg {
+.settings-nav__icon svg,
+.settings-nav__icon img {
   display: block;
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
 }
 
 .settings-nav__label {
@@ -2553,11 +2707,53 @@ settings-window[hidden],
   background: var(--bg-pane);
 }
 
+.settings-panel__heading-slot:empty {
+  display: none;
+}
+
+.settings-panel__heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 0 0 16px;
+}
+
+.settings-panel__heading-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  margin-top: 2px;
+}
+
+.settings-panel__heading-icon img,
+.settings-panel__heading-icon svg {
+  display: block;
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+}
+
+.settings-panel__heading-text {
+  min-width: 0;
+  flex: 1;
+}
+
 .settings-panel__title {
-  margin: 0 0 14px;
+  margin: 0;
   font-size: 22px;
   font-weight: 700;
   letter-spacing: -0.03em;
+  line-height: 1.2;
+}
+
+.settings-panel__desc {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.45;
 }
 
 .settings-panel__lead {
@@ -2744,6 +2940,13 @@ html.compact-ui .settings-nav__item {
 
 html.compact-ui .settings-panel__title {
   font-size: 18px;
+}
+
+html.compact-ui .settings-panel__heading-icon,
+html.compact-ui .settings-panel__heading-icon img,
+html.compact-ui .settings-panel__heading-icon svg {
+  width: 28px;
+  height: 28px;
 }
 
 /* —— Netboot dialog —— */
@@ -3162,6 +3365,19 @@ name-conflict-dialog[hidden],
   white-space: nowrap;
 }
 
+.side-item .side-item-host {
+  margin-left: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.side-item .side-item-spinner {
+  width: 10px;
+  height: 10px;
+  border-width: 1.5px;
+  flex-shrink: 0;
+}
+
 .side-item--child {
   padding-left: 28px;
   font-size: 12px;
@@ -3448,8 +3664,14 @@ html.compact-ui finder-window {
 }
 
 html.compact-ui finder-window .titlebar,
+html.compact-ui finder-window .titlebar-zoom,
 html.compact-ui finder-window .window-resize-handle {
   display: none;
+}
+
+html.compact-ui finder-window .finder-chrome {
+  cursor: default;
+  background: var(--bg-pane);
 }
 
 html.compact-ui .app-menubar__inner {

@@ -18,6 +18,7 @@ const HARALD_KUHR = 'https://github.com/haraldk';
 const TWELVE_MONKEYS = 'https://github.com/haraldk/TwelveMonkeys';
 const TWELVE_MONKEYS_PICT =
   'https://github.com/haraldk/TwelveMonkeys/tree/master/imageio/imageio-pict';
+const ICONS8 = 'https://icons8.com/';
 const GPL = 'https://www.gnu.org/licenses/gpl-3.0.html';
 
 function extLink(href: string, label: string): string {
@@ -105,6 +106,9 @@ export class AboutDialog extends HTMLElement {
               ${extLink(TWELVE_MONKEYS, 'TwelveMonkeys')}
               ${extLink(TWELVE_MONKEYS_PICT, 'imageio-pict')}
               (PICT bitmap packing; BSD-3-Clause)
+            </li>
+            <li>
+              Icons by ${extLink(ICONS8, 'Icons8')}
             </li>
           </ul>
         </div>

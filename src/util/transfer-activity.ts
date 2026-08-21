@@ -3,14 +3,19 @@
 import { isAbortError, throwIfAborted } from './abort';
 import { AsyncSemaphore } from './async-semaphore';
 
+import type { NodeRef } from '../fs/catalog-caps';
+
 export type TransferKind = 'file' | 'folder';
 
 export type TransferStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
 
+/** Rate-column caption while a folder job is enumerating items before the copy/download. */
+export const TRANSFER_DETAIL_SEARCHING = 'Searching';
+
 /** Catalog subset used to delete a dest file left behind by a cancelled write. */
 export type TransferDest = {
-  lookup(parentId: number, name: string): Promise<{ id: number; isDir: boolean } | undefined>;
-  remove(id: number): Promise<void>;
+  lookup(parent: NodeRef, name: string): Promise<{ addr?: string; id?: number; path?: string; isDir: boolean } | undefined>;
+  remove(ref: NodeRef): Promise<void>;
 };
 
 export interface TransferJob {
@@ -19,6 +24,8 @@ export interface TransferJob {
   kind: TransferKind;
   bytesDone: number;
   bytesTotal: number;
+  /** Items found during Searching, or processed afterwards. */
+  itemsDone: number;
   rate: number;
   status: TransferStatus;
   error?: string;
@@ -52,7 +59,7 @@ type Listener = () => void;
 
 const FILE_ICON = '/icons/FILE16.png';
 
-type WriteLoc = { dest: TransferDest; parentId: number; name: string; kind?: TransferKind };
+type WriteLoc = { dest: TransferDest; parentId: NodeRef; name: string; kind?: TransferKind };
 
 type JobRec = TransferJob & {
   lastBytes: number;
@@ -126,6 +133,7 @@ class TransferActivity {
       if (j.parentId && this.jobs.has(j.parentId)) continue;
       if (j.status !== 'running') continue;
       running = true;
+      if (isSearchingJob(j)) continue;
       done += j.bytesDone;
       total += j.bytesTotal;
     }
@@ -186,7 +194,7 @@ class TransferActivity {
    * Dest folder + name for Finder overlay (the copy target, including folders).
    * Call as soon as the dest name is known so the item can appear before the write.
    */
-  setDest(id: string, dest: TransferDest, parentId: number, name: string, kind?: TransferKind): void {
+  setDest(id: string, dest: TransferDest, parentId: NodeRef, name: string, kind?: TransferKind): void {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
     j.dests = [{ dest, parentId, name, kind }];
@@ -194,7 +202,7 @@ class TransferActivity {
   }
 
   /** Extra dest overlay (e.g. several top-level items from one archive). */
-  addDest(id: string, dest: TransferDest, parentId: number, name: string, kind?: TransferKind): void {
+  addDest(id: string, dest: TransferDest, parentId: NodeRef, name: string, kind?: TransferKind): void {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
     const dests = j.dests ?? (j.dests = []);
@@ -215,7 +223,7 @@ class TransferActivity {
    * Remember the dest file currently being written so cancel can delete a
    * partial copy. Folder jobs should point this at the file in flight, not the folder.
    */
-  watchPartial(id: string, dest: TransferDest, parentId: number, name: string): void {
+  watchPartial(id: string, dest: TransferDest, parentId: NodeRef, name: string): void {
     this.setWriteFile(id, dest, parentId, name);
   }
 
@@ -223,7 +231,7 @@ class TransferActivity {
    * Overlay the dest file currently being written. Folder dest overlays on the
    * same job are kept so a parent listing still shows progress after enumerate.
    */
-  setWriteFile(id: string, dest: TransferDest, parentId: number, name: string): void {
+  setWriteFile(id: string, dest: TransferDest, parentId: NodeRef, name: string): void {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
     const folders = (j.dests ?? []).filter((d) => (d.kind ?? j.kind) === 'folder');
@@ -234,7 +242,7 @@ class TransferActivity {
   }
 
   /** Running/queued writes targeting `parentId` in `dest` (top-level dest or in-flight file). */
-  writesIn(dest: TransferDest, parentId: number): TransferWriteProgress[] {
+  writesIn(dest: TransferDest, parentId: NodeRef): TransferWriteProgress[] {
     const out: TransferWriteProgress[] = [];
     const seen = new Set<string>();
     for (const j of this.jobs.values()) {
@@ -279,7 +287,10 @@ class TransferActivity {
     j.partial = undefined;
     try {
       const node = await partial.dest.lookup(partial.parentId, partial.name);
-      if (node && !node.isDir) await partial.dest.remove(node.id);
+      if (node && !node.isDir) {
+        const ref: NodeRef = node.path != null && node.addr === 'path' ? node.path : (node.id as number);
+        await partial.dest.remove(ref);
+      }
     } catch {
       /* dest may already be gone */
     }
@@ -327,6 +338,20 @@ class TransferActivity {
     const j = this.jobs.get(id);
     if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
     j.bytesTotal = Math.max(n, j.bytesDone);
+    this.emit();
+  }
+
+  /**
+   * Searching-phase totals: item count and listed size so far. The progress
+   * bar stays indeterminate until setBytes starts the download.
+   */
+  setFound(id: string, items: number, bytes: number): void {
+    const j = this.jobs.get(id);
+    if (!j || (j.status !== 'running' && j.status !== 'queued')) return;
+    if (j.status === 'queued') j.status = 'running';
+    j.itemsDone = Math.max(0, items);
+    j.bytesTotal = Math.max(0, bytes);
+    j.detail = TRANSFER_DETAIL_SEARCHING;
     this.emit();
   }
 
@@ -412,6 +437,7 @@ class TransferActivity {
       kind: spec.kind,
       bytesDone: 0,
       bytesTotal: spec.bytesTotal ?? 0,
+      itemsDone: 0,
       rate: 0,
       status: spec.queued ? 'queued' : 'running',
       iconSrc: spec.iconSrc ?? (spec.kind === 'folder' ? '' : FILE_ICON),
@@ -430,9 +456,18 @@ class TransferActivity {
   }
 }
 
+function isSearchingJob(j: TransferJob): boolean {
+  return j.status === 'running' && j.detail === TRANSFER_DETAIL_SEARCHING;
+}
+
+/** True while a running job is enumerating items (zip download, folder copy prepare). */
+export function isTransferSearching(j: TransferJob): boolean {
+  return isSearchingJob(j);
+}
+
 function jobProgress(j: TransferJob): { pct: number; indeterminate: boolean } {
   if (j.status === 'queued') return { pct: 0, indeterminate: false };
-  if (j.bytesTotal <= 0) return { pct: 0, indeterminate: j.status === 'running' };
+  if (isSearchingJob(j) || j.bytesTotal <= 0) return { pct: 0, indeterminate: j.status === 'running' };
   return { pct: Math.min(100, Math.round((j.bytesDone / j.bytesTotal) * 100)), indeterminate: false };
 }
 

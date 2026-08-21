@@ -87,6 +87,28 @@ export function renderSettingsNav(nav: SettingsNavItem[], selectedId: string): s
     .join('');
 }
 
+/** Panel header: section icon left of title, short description underneath. */
+export function renderSettingsPanelHeading(opts: {
+  title: string;
+  description?: string;
+  iconHtml?: string;
+}): string {
+  const icon = opts.iconHtml
+    ? `<span class="settings-panel__heading-icon" aria-hidden="true">${opts.iconHtml}</span>`
+    : '';
+  const desc = opts.description
+    ? `<p class="settings-panel__desc">${escapeHtml(opts.description)}</p>`
+    : '';
+  return `
+    <header class="settings-panel__heading">
+      ${icon}
+      <div class="settings-panel__heading-text">
+        <h3 id="settings-panel-title" class="settings-panel__title">${escapeHtml(opts.title)}</h3>
+        ${desc}
+      </div>
+    </header>`;
+}
+
 export function renderSettingsFrame(title: string, navHtml: string): string {
   return `
     <div class="settings-shell__backdrop" data-act="close"></div>
@@ -98,7 +120,7 @@ export function renderSettingsFrame(title: string, navHtml: string): string {
       <div class="settings-shell__body">
         <nav class="settings-nav" aria-label="Settings sections">${navHtml}</nav>
         <section class="settings-panel" aria-labelledby="settings-panel-title">
-          <h3 id="settings-panel-title" class="settings-panel__title"></h3>
+          <div class="settings-panel__heading-slot"></div>
           <div class="settings-panel__content"></div>
         </section>
       </div>
@@ -110,9 +132,16 @@ export function renderSettingsShell(opts: {
   nav: SettingsNavItem[];
   selectedId: string;
   panelTitle: string;
+  panelDescription?: string;
+  panelIconHtml?: string;
   panelHtml: string;
 }): string {
   const nav = renderSettingsNav(opts.nav, opts.selectedId);
+  const heading = renderSettingsPanelHeading({
+    title: opts.panelTitle,
+    description: opts.panelDescription,
+    iconHtml: opts.panelIconHtml,
+  });
 
   return `
     <div class="settings-shell__backdrop" data-act="close"></div>
@@ -124,7 +153,7 @@ export function renderSettingsShell(opts: {
       <div class="settings-shell__body">
         <nav class="settings-nav" aria-label="Settings sections">${nav}</nav>
         <section class="settings-panel" aria-labelledby="settings-panel-title">
-          <h3 id="settings-panel-title" class="settings-panel__title">${escapeHtml(opts.panelTitle)}</h3>
+          ${heading}
           <div class="settings-panel__content">${opts.panelHtml}</div>
         </section>
       </div>

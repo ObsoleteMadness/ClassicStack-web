@@ -6,6 +6,8 @@ import { loadPrefs } from '../util/prefs';
 import { log } from '../util/logger';
 import { expandIncoming, isExpandableArchive, type ExpandedDir, type ExpandedFile, type ExpandedNode } from './expand-incoming';
 import type { Catalog, VNode } from './virtual-fs';
+import { nodeRef } from './virtual-fs';
+import type { NodeRef } from './catalog-caps';
 import { throwIfAborted, isAbortError, abortError } from '../util/abort';
 import { iconCache } from './icon-cache';
 import {
@@ -34,11 +36,11 @@ export type ImportItemTrack = {
   onExpand?: (item: ExpandTrackFile) => ImportItemTrack | undefined;
   signal?: AbortSignal;
   /** Called just before a dest file is created (Finder overlay + cancel partial). */
-  onWrite?: (parentId: number, name: string) => void;
+  onWrite?: (parentId: NodeRef, name: string) => void;
   /** Called when an extracted folder is created (Finder overlay in that parent). */
-  onDir?: (parentId: number, name: string, dirId: number, path: string) => void;
+  onDir?: (parentId: NodeRef, name: string, dirId: NodeRef, path: string) => void;
   /** Delete a dest file left behind if this write is cancelled mid-flight. */
-  removePartial?: (parentId: number, name: string) => Promise<void>;
+  removePartial?: (parentId: NodeRef, name: string) => Promise<void>;
   /**
    * Serialize this item behind other Finder copies (AFP Writes on LocalTalk).
    * Re-enters for the same job when an archive expands inside the import.
@@ -63,7 +65,7 @@ export type ImportProgress = {
 };
 
 type ImportBlob = (
-  parentId: number,
+  parentId: NodeRef,
   file: File,
   onBytes?: (n: number) => void,
   /** Host resource fork from `..namedfork/rsrc` (Chrome on macOS). */
@@ -82,7 +84,7 @@ type ImportFs = Pick<
  */
 export async function importDataTransferInto(
   fs: ImportFs,
-  parentId: number,
+  parentId: NodeRef,
   dt: DataTransfer,
   importBlob: ImportBlob,
   opts?: ImportProgress,
@@ -189,7 +191,7 @@ export async function importDataTransferInto(
 
 async function planIncoming(
   fs: ImportFs,
-  parentId: number,
+  parentId: NodeRef,
   groups: { name: string; isDir: boolean }[],
   resolveConflict?: ImportProgress['resolveConflict'],
 ): Promise<PlacementPlan[]> {
@@ -226,7 +228,7 @@ function topFileName(file: File): string {
 
 async function importFsEntry(
   fs: ImportFs,
-  parentId: number,
+  parentId: NodeRef,
   entry: FileSystemEntry,
   importBlob: ImportBlob,
   onItem?: () => void,
@@ -243,7 +245,7 @@ async function importFsEntry(
     const folder = entry as FileSystemDirectoryEntry;
     const kids = (await readDirectoryEntries(folder)).sort(compareImportEntries);
     for (const kid of kids) {
-      await importFsEntry(fs, dir.id, kid, importBlob, onItem, track, undefined, folder);
+      await importFsEntry(fs, nodeRef(dir), kid, importBlob, onItem, track, undefined, folder);
     }
     return;
   }
@@ -258,7 +260,7 @@ async function importFsEntry(
 
 async function importFileWithRelativePath(
   fs: ImportFs,
-  parentId: number,
+  parentId: NodeRef,
   file: File,
   importBlob: ImportBlob,
   track?: ImportItemTrack,
@@ -277,14 +279,14 @@ async function importFileWithRelativePath(
   for (let i = 0; i < parts.length - 1; i++) {
     const part = parts[i]!;
     if (!part || part === '.' || part === '..') continue;
-    dirId = (await fs.ensureDir(dirId, unescapeHostFilename(part))).id;
+    dirId = nodeRef(await fs.ensureDir(dirId, unescapeHostFilename(part)));
   }
   await importOneFile(fs, dirId, file, importBlob, track);
 }
 
 async function importOneFile(
   fs: ImportFs,
-  parentId: number,
+  parentId: NodeRef,
   file: File,
   importBlob: ImportBlob,
   track?: ImportItemTrack,
@@ -336,7 +338,7 @@ async function importOneFile(
 }
 
 async function writeTrackedBlob(
-  parentId: number,
+  parentId: NodeRef,
   name: string,
   write: () => Promise<unknown>,
   track?: ImportItemTrack,
@@ -380,7 +382,7 @@ function expandedByteTotal(files: ExpandTrackFile[]): number {
 /** Write expanded Mac files/folders through Catalog.createFile / put (forks, Finder info, dates). */
 export async function importExpandedTree(
   fs: Pick<Catalog, 'ensureDir' | 'createFile' | 'put'>,
-  parentId: number,
+  parentId: NodeRef,
   nodes: ExpandedNode[],
   track?: ImportItemTrack,
   opts?: { announce?: boolean; prefix?: string },
@@ -395,7 +397,7 @@ export async function importExpandedTree(
 
 async function writeExpandedNodes(
   fs: Pick<Catalog, 'ensureDir' | 'createFile' | 'put'>,
-  parentId: number,
+  parentId: NodeRef,
   nodes: ExpandedNode[],
   track?: ImportItemTrack,
   prefix = '',
@@ -405,9 +407,9 @@ async function writeExpandedNodes(
     const path = prefix ? `${prefix}/${node.name}` : node.name;
     if (node.kind === 'dir') {
       const dir = await fs.ensureDir(parentId, node.name);
-      track?.onDir?.(parentId, node.name, dir.id, path);
+      track?.onDir?.(parentId, node.name, nodeRef(dir), path);
       await stampExpandedMeta(fs, dir, node, true);
-      await writeExpandedNodes(fs, dir.id, node.children, track, path);
+      await writeExpandedNodes(fs, nodeRef(dir), node.children, track, path);
       continue;
     }
     await importExpandedFile(fs, parentId, node, track, path);
@@ -416,7 +418,7 @@ async function writeExpandedNodes(
 
 async function importExpandedFile(
   fs: Pick<Catalog, 'createFile' | 'put'>,
-  parentId: number,
+  parentId: NodeRef,
   node: ExpandedFile,
   track?: ImportItemTrack,
   path = node.name,

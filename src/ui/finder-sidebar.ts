@@ -101,6 +101,24 @@ export function viewingCatalogEndpoint(
   return isCatalogEndpoint(ep) && source === 'remote' && remoteOpen && currentId === ep.id;
 }
 
+/**
+ * Volumes listed under a sidebar server. An empty cache entry is authoritative
+ * (the server enumerated zero shares) and must not fall through to another
+ * endpoint’s global `remoteVolumes` — that made “Test Volume” appear under
+ * WIN98-1 after opening a local share.
+ */
+export function volumesForEndpoint(
+  ep: RemoteEndpoint,
+  known: Map<string, string[]>,
+  currentId: string,
+  remoteLoggedIn: boolean,
+  remoteVolumes: string[],
+): string[] {
+  if (known.has(ep.id)) return known.get(ep.id) ?? [];
+  if (remoteLoggedIn && ep.id === currentId) return remoteVolumes;
+  return [];
+}
+
 export type ShareDrop = { key: string; name: string };
 
 /**

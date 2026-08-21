@@ -16,6 +16,7 @@ import { LoginDialog } from './ui/login-dialog';
 import { NameConflictDialog } from './ui/name-conflict-dialog';
 import { ExtensionEditorDialog } from './ui/extension-editor-dialog';
 import { ResourceForkExplorer } from './ui/resource-fork-explorer';
+import { WinResourceExplorer } from './ui/win-resource-explorer';
 import { GetInfoWindow } from './ui/get-info-window';
 import {
   NetbootDialog,
@@ -72,12 +73,14 @@ async function main(): Promise<void> {
   const extensionEditor = new ExtensionEditorDialog();
   const resourceExplorer = new ResourceForkExplorer();
   resourceExplorer.hidden = true;
+  const winResourceExplorer = new WinResourceExplorer();
+  winResourceExplorer.hidden = true;
   const getInfoWindow = new GetInfoWindow();
   getInfoWindow.hidden = true;
   const settings = new SettingsWindow();
 
   stage.appendChild(finder);
-  app.append(menubar, stage, logPanel, activityWindow, fileActivityWindow, netboot, about, alertDialog, afpSessions, loginDialog, nameConflictDialog, extensionEditor, resourceExplorer, getInfoWindow, settings);
+  app.append(menubar, stage, logPanel, activityWindow, fileActivityWindow, netboot, about, alertDialog, afpSessions, loginDialog, nameConflictDialog, extensionEditor, resourceExplorer, winResourceExplorer, getInfoWindow, settings);
 
   const serial = new WebSerialPort();
   const pcap = new PcapCapture();
@@ -201,11 +204,13 @@ async function main(): Promise<void> {
     activityWindow,
     afpSessions,
     resourceExplorer,
+    winResourceExplorer,
     getInfoWindow,
     about,
     alertDialog,
     settings,
     finder,
+    extensionEditor,
     onCaptureChanged() {
       menubar.refreshCaptureStatus();
     },
@@ -226,9 +231,11 @@ async function main(): Promise<void> {
   if (savedWindows.log?.open) logPanel.show();
   if (savedWindows.activity?.open) activityWindow.show();
   if (savedWindows.resource?.open) resourceExplorer.show();
+  if (savedWindows.winresource?.open) winResourceExplorer.show();
 
   finder.bind(vfs, host);
   finder.bindResourceExplorer(resourceExplorer);
+  finder.bindWinResourceExplorer(winResourceExplorer);
   finder.bindGetInfoWindow(getInfoWindow);
 
   if (!WebSerialPort.supported()) {

@@ -7,10 +7,12 @@ import { BOOTSTRAP_FLOPPY_URL } from './netboot-dialog';
 import type { ExtensionEditorDialog } from './extension-editor-dialog';
 import type { AlertDialog } from './alert-dialog';
 import { uiIcons } from './lucide-icon';
+import { settingsBitmapIcons } from './settings-icons';
 import {
   renderSettingsFrame,
   renderSettingsGroup,
   renderSettingsNav,
+  renderSettingsPanelHeading,
   type SettingsNavItem,
   type SettingsRow,
 } from './settings-panel';
@@ -36,8 +38,8 @@ export interface SettingsHost {
 }
 
 const NAV: SettingsNavItem[] = [
-  { id: 'general', label: 'General', iconHtml: uiIcons.settings },
-  { id: 'netboot', label: 'Netboot', iconHtml: uiIcons.netboot },
+  { id: 'general', label: 'General', iconHtml: settingsBitmapIcons.general },
+  { id: 'netboot', label: 'Netboot', iconHtml: settingsBitmapIcons.netboot },
   { id: 'environment', label: 'Environment', iconHtml: uiIcons.environment },
 ];
 
@@ -45,6 +47,12 @@ const SECTION_TITLES: Record<SettingsSection, string> = {
   general: 'General',
   netboot: 'Netboot',
   environment: 'Environment',
+};
+
+const SECTION_DESC: Record<SettingsSection, string> = {
+  general: 'Finder appearance, import, and export preferences.',
+  netboot: 'AppleTalk Boot Protocol and ChainBoot for classic Macs.',
+  environment: 'Browser storage, preference backup, and reset options.',
 };
 
 /** Two-column settings window (General, Netboot, Environment). */
@@ -109,10 +117,17 @@ export class SettingsWindow extends HTMLElement {
       btn.classList.toggle('is-selected', selected);
       btn.setAttribute('aria-current', selected ? 'page' : 'false');
     });
-    const title = this.querySelector('.settings-panel__title');
+    const headingSlot = this.querySelector('.settings-panel__heading-slot');
     const content = this.querySelector('.settings-panel__content');
     const panel = this.querySelector('.settings-panel');
-    if (title) title.textContent = SECTION_TITLES[this.section];
+    if (headingSlot) {
+      const nav = NAV.find((item) => item.id === this.section);
+      headingSlot.innerHTML = renderSettingsPanelHeading({
+        title: SECTION_TITLES[this.section],
+        description: SECTION_DESC[this.section],
+        iconHtml: nav?.iconHtml,
+      });
+    }
     if (content) content.innerHTML = this.renderSection(this.section);
     if (panel) panel.scrollTop = 0;
   }
@@ -209,8 +224,6 @@ export class SettingsWindow extends HTMLElement {
       ? `${state.diskImage.name} (${state.diskImage.size.toLocaleString()} bytes)`
       : 'No System volume selected';
 
-    const intro = `<p class="settings-panel__lead">AppleTalk Boot Protocol + ChainBoot. Ships with <code>ChainLoader.bin</code>; advertises as <code>BootServer</code> when enabled and connected.</p>`;
-
     const rows: SettingsRow[] = [
       {
         type: 'link',
@@ -246,7 +259,7 @@ export class SettingsWindow extends HTMLElement {
       },
     ];
 
-    return intro + renderSettingsGroup(undefined, rows);
+    return renderSettingsGroup(undefined, rows);
   }
 
   private renderEnvironment(): string {

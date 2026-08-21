@@ -5,15 +5,26 @@ import type { LogPanel } from './log-panel';
 import type { ActivityWindow } from './activity-window';
 import type { AfpSessionsDialog } from './afp-sessions-dialog';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
+import type { WinResourceExplorer } from './win-resource-explorer';
 import type { GetInfoWindow } from './get-info-window';
 import type { FinderWindow } from './finder-window';
 import type { AboutDialog } from './about-dialog';
 import type { AlertDialog } from './alert-dialog';
 import type { SettingsWindow } from './settings-window';
-import { iconCache } from '../fs/icon-cache';
 import { persistWindow } from './window-layout';
 import { isCompactUi } from './layout-mode';
 import { bindMenuBarTracking, MENUBAR_CHANGE, menubarOpenKey, setMenubarOpen } from './menu-bar-track';
+import {
+  FILE_MENU_KEY,
+  applyFileMenuAction,
+  fileMenuInnerHTML,
+} from './finder-file-menu';
+import {
+  VIEW_MENU_KEY,
+  applyViewMenuAction,
+  viewMenuInnerHTML,
+} from './finder-view-menu';
+import type { ExtensionEditorDialog } from './extension-editor-dialog';
 
 export interface AdvancedMenuHost {
   pcap: PcapCapture;
@@ -21,15 +32,17 @@ export interface AdvancedMenuHost {
   activityWindow: ActivityWindow;
   afpSessions: AfpSessionsDialog;
   resourceExplorer: ResourceForkExplorer;
+  winResourceExplorer?: WinResourceExplorer;
   getInfoWindow: GetInfoWindow;
   about: AboutDialog;
   alertDialog?: AlertDialog;
   settings?: SettingsWindow;
   finder?: FinderWindow;
+  extensionEditor?: ExtensionEditorDialog;
   onCaptureChanged?(capturing: boolean): void;
 }
 
-/** Screen-top menu bar with ClassicStack / Advanced menus. */
+/** Screen-top menu bar with ClassicStack / File / View / Advanced menus. */
 export class AppMenuBar extends HTMLElement {
   private host: AdvancedMenuHost | null = null;
   private unbindTracking: (() => void) | null = null;
@@ -81,7 +94,10 @@ export class AppMenuBar extends HTMLElement {
     const logOpen = this.host ? !this.host.logPanel.hidden : false;
     const activityOpen = this.host ? !this.host.activityWindow.hidden : false;
     const appOpen = menubarOpenKey(this) === 'app';
+    const fileOpen = menubarOpenKey(this) === FILE_MENU_KEY;
+    const viewOpen = menubarOpenKey(this) === VIEW_MENU_KEY;
     const advancedOpen = menubarOpenKey(this) === 'advanced';
+    const finderHost = this.host?.finder ? { finder: this.host.finder } : null;
     this.innerHTML = `
       <div class="app-menubar__inner">
         <div class="app-menubar__menus">
@@ -98,6 +114,20 @@ export class AppMenuBar extends HTMLElement {
               </button>
             </div>
           </div>
+          ${
+            finderHost
+              ? `<div class="app-menu${fileOpen ? ' open' : ''} finder-file-menu" data-menu="${FILE_MENU_KEY}">
+            ${fileMenuInnerHTML(finderHost, fileOpen)}
+          </div>`
+              : ''
+          }
+          ${
+            finderHost
+              ? `<div class="app-menu${viewOpen ? ' open' : ''} finder-view-menu" data-menu="${VIEW_MENU_KEY}">
+            ${viewMenuInnerHTML(finderHost, viewOpen)}
+          </div>`
+              : ''
+          }
           <div class="app-menu${advancedOpen ? ' open' : ''}" data-menu="advanced">
             <button type="button" class="app-menu__trigger" data-act="toggle-advanced" aria-haspopup="true" aria-expanded="${advancedOpen}">
               Advanced
@@ -124,15 +154,6 @@ export class AppMenuBar extends HTMLElement {
                 <span class="app-menu__check">${activityOpen ? '✓' : ''}</span>
                 Activity
               </button>
-              <hr />
-              <button type="button" role="menuitem" data-act="resource-fork" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Resource Fork…
-              </button>
-              <button type="button" role="menuitem" data-act="clear-icon-cache" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Clear icon cache
-              </button>
             </div>
           </div>
         </div>
@@ -152,11 +173,33 @@ export class AppMenuBar extends HTMLElement {
   }
 
   private onClick(e: MouseEvent): void {
-    const t = (e.target as HTMLElement).closest('[data-act]') as HTMLElement | null;
+    const el = e.target instanceof Element ? e.target : e.target instanceof Node ? e.target.parentElement : null;
+    const t = el?.closest('[data-act]') as HTMLElement | null;
     if (!t || !this.host) return;
     e.stopPropagation();
     const act = t.dataset.act;
-    if (act === 'toggle-app' || act === 'toggle-advanced') return;
+    if (act === 'toggle-app' || act === 'toggle-file' || act === 'toggle-view' || act === 'toggle-advanced') return;
+
+    void (async () => {
+      if (this.host?.finder) {
+        const host = { finder: this.host.finder };
+        if (await applyFileMenuAction(act, host)) {
+          this.closeMenus();
+          this.render();
+          return;
+        }
+        if (await applyViewMenuAction(act, host)) {
+          this.closeMenus();
+          this.render();
+          return;
+        }
+      }
+      this.handleAppMenuAction(act);
+    })();
+  }
+
+  private handleAppMenuAction(act: string | undefined): void {
+    if (!this.host || !act) return;
 
     if (act === 'about') {
       this.closeMenus();
@@ -209,22 +252,6 @@ export class AppMenuBar extends HTMLElement {
       this.host.activityWindow.toggle();
       return;
     }
-
-    if (act === 'resource-fork') {
-      this.closeMenus();
-      this.host.finder?.openResourceExplorer();
-      return;
-    }
-
-    if (act === 'clear-icon-cache') {
-      this.closeMenus();
-      void (async () => {
-        await iconCache.clear();
-        this.host?.finder?.invalidateIcons?.();
-        log.info('Cleared application icon cache', 'icons');
-      })();
-      return;
-    }
   }
 
   private snapshotWindows(): void {
@@ -234,6 +261,7 @@ export class AppMenuBar extends HTMLElement {
     persistWindow('log', host.logPanel);
     persistWindow('activity', host.activityWindow);
     persistWindow('resource', host.resourceExplorer);
+    if (host.winResourceExplorer) persistWindow('winresource', host.winResourceExplorer);
     persistWindow('info', host.getInfoWindow);
   }
 
