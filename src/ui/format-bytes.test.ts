@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { formatRemainingTime } from './format-bytes';
+import { formatItems, formatRemainingTime } from './format-bytes';
+
+describe('formatItems', () => {
+  it('singularizes one item', () => {
+    expect(formatItems(1)).toBe('1 item');
+  });
+
+  it('pluralizes other counts', () => {
+    expect(formatItems(0)).toBe('0 items');
+    expect(formatItems(12)).toBe('12 items');
+  });
+});
 
 describe('formatRemainingTime', () => {
   it('uses seconds under a minute', () => {

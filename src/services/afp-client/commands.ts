@@ -418,6 +418,32 @@ export function rename(volId: number, dirId: number, path: string, newName: stri
   return new Uint8Array(out);
 }
 
+/**
+ * FPCopyFile: cmd pad srcVol srcDir dstVol dstDir srcPath dstPathType0 newName.
+ * Dest path type 0 means dstDirID is the destination directory (Inside Macintosh AFP).
+ */
+export function copyFile(
+  srcVolId: number,
+  srcDirId: number,
+  srcName: string,
+  dstVolId: number,
+  dstDirId: number,
+  newName: string,
+): Uint8Array {
+  const out: number[] = [C.CmdCopyFile, 0];
+  appendBe16(out, srcVolId);
+  appendBe32(out, srcDirId);
+  appendBe16(out, dstVolId);
+  appendBe32(out, dstDirId);
+  putPath(out, srcName);
+  even(out);
+  out.push(0);
+  putPString(out, '');
+  if (!newName || newName === srcName) putNullPath(out);
+  else putCNodeName(out, newName);
+  return new Uint8Array(out);
+}
+
 export function moveAndRename(
   volId: number,
   srcDir: number,

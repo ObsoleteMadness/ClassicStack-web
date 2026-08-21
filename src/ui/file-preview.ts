@@ -4,11 +4,11 @@ import { readTypeCreator } from '../fs/icon-cache';
 export type FilePreviewKind = 'text' | 'image' | 'audio' | 'pict';
 
 const TEXT_TYPES = new Set(['TEXT', 'ttro']);
-const IMAGE_TYPES = new Set(['JPEG', 'GIFf', 'PNG ']);
+const IMAGE_TYPES = new Set(['JPEG', 'GIFf', 'PNG ', 'BMPp', 'BMP ']);
 const AUDIO_TYPES = new Set(['WAVE', 'MPG3', 'AIFF', 'AIFC']);
 const PICT_TYPES = new Set(['PICT']);
 
-const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif']);
+const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp']);
 const AUDIO_EXTS = new Set(['wav', 'mp3', 'aiff', 'aif']);
 const PICT_EXTS = new Set(['pict', 'pic', 'pct']);
 const TEXT_EXTS = new Set(['ttro']);
@@ -24,11 +24,16 @@ export function previewKindFor(node: { name: string; finderInfo: Uint8Array; isD
   return null;
 }
 
+export function isBmpPreview(name: string, type: string): boolean {
+  return type === 'BMPp' || type === 'BMP ' || filenameExtension(name) === 'bmp';
+}
+
 export function previewMime(kind: FilePreviewKind, name: string, type: string): string {
   const ext = filenameExtension(name);
   if (kind === 'image') {
     if (type === 'GIFf' || ext === 'gif') return 'image/gif';
     if (type === 'PNG ' || ext === 'png') return 'image/png';
+    if (type === 'BMPp' || type === 'BMP ' || ext === 'bmp') return 'image/bmp';
     return 'image/jpeg';
   }
   if (kind === 'audio') {

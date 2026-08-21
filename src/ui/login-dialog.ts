@@ -1,17 +1,10 @@
 import { log } from '../util/logger';
+import type { CredentialPromptOptions, Credentials, ShareKind } from './finder-host';
 
-export type LoginCredentials =
-  | { kind: 'guest' }
-  | { kind: 'password'; username: string; password: string };
+export type LoginCredentials = Credentials;
+export type LoginPromptOptions = CredentialPromptOptions;
 
-export interface LoginPromptOptions {
-  serverName: string;
-  uams: string[];
-  error?: string;
-  allowGuest: boolean;
-}
-
-/** Modal AFP login (guest or username/password). */
+/** Modal login (guest or username/password) for AFP, SMB, and NCP. */
 export class LoginDialog extends HTMLElement {
   private opts: LoginPromptOptions | null = null;
   private pending: ((v: LoginCredentials | null) => void) | null = null;
@@ -38,7 +31,7 @@ export class LoginDialog extends HTMLElement {
     this.opts = opts;
     this.hidden = false;
     this.render();
-    log.info(`Login dialog for “${opts.serverName}” UAMs=[${opts.uams.join(', ')}]`, 'afp');
+    log.info(`Login dialog for “${opts.serverName}” ${authLabel(opts.kind)}=[${opts.uams.join(', ')}]`, opts.kind || 'afp');
     queueMicrotask(() => {
       const user = this.querySelector<HTMLInputElement>('[data-field="user"]');
       user?.focus();
@@ -49,11 +42,13 @@ export class LoginDialog extends HTMLElement {
   }
 
   close(): void {
+    const done = this.pending;
     this.busy = false;
     this.pending = null;
     this.hidden = true;
     this.opts = null;
     this.password = '';
+    done?.(null);
   }
 
   private finish(value: LoginCredentials | null): void {
@@ -80,8 +75,8 @@ export class LoginDialog extends HTMLElement {
       this.innerHTML = '';
       return;
     }
-    const name = escapeHtml(opts.serverName || 'AFP server');
-    const uams = opts.uams.length ? escapeHtml(opts.uams.join(', ')) : 'none advertised';
+    const name = escapeHtml(opts.serverName || serverNoun(opts.kind));
+    const methods = opts.uams.length ? escapeHtml(opts.uams.join(', ')) : 'none advertised';
     const err =
       opts.error && !this.busy ? `<div class="login-dialog__error">${escapeHtml(opts.error)}</div>` : '';
     const guest = opts.allowGuest
@@ -90,6 +85,7 @@ export class LoginDialog extends HTMLElement {
     const connectLabel = this.busy
       ? `<span class="status-spinner" aria-hidden="true"></span> Signing in…`
       : 'Connect';
+    const passMax = opts.kind === 'afp' || !opts.kind ? 'maxlength="8" ' : '';
     this.innerHTML = `
       <div class="login-dialog__backdrop" data-act="${this.busy ? '' : 'cancel'}"></div>
       <form class="login-dialog__card" role="dialog" aria-labelledby="login-title" aria-busy="${this.busy}" autocomplete="on">
@@ -97,7 +93,7 @@ export class LoginDialog extends HTMLElement {
           <h2 id="login-title">Connect to ${name}</h2>
           <button type="button" class="btn" data-act="cancel" aria-label="Cancel" ${this.busy ? 'disabled' : ''}>✕</button>
         </header>
-        <p class="login-dialog__lead">Sign in to browse volumes. UAMs: <code>${uams}</code></p>
+        <p class="login-dialog__lead">${authLead(opts.kind, methods)}</p>
         ${err}
         <div class="login-dialog__field">
           <label for="afp-user">Name</label>
@@ -105,7 +101,7 @@ export class LoginDialog extends HTMLElement {
         </div>
         <div class="login-dialog__field">
           <label for="afp-pass">Password</label>
-          <input id="afp-pass" data-field="pass" name="password" type="password" maxlength="8" value="${escapeHtml(this.password)}" ${this.busy ? 'disabled' : ''} />
+          <input id="afp-pass" data-field="pass" name="password" type="password" ${passMax}value="${escapeHtml(this.password)}" ${this.busy ? 'disabled' : ''} />
         </div>
         <footer class="login-dialog__footer">
           ${guest}
@@ -128,13 +124,13 @@ export class LoginDialog extends HTMLElement {
     const act = t.dataset.act;
     if (act === 'cancel') {
       if (this.busy) return;
-      log.info('AFP login cancelled', 'afp');
+      log.info('Login cancelled', this.opts?.kind || 'afp');
       this.finish(null);
       return;
     }
     if (act === 'guest') {
       if (this.busy) return;
-      log.info('AFP login as Guest', 'afp');
+      log.info('Login as Guest', this.opts?.kind || 'afp');
       this.accept({ kind: 'guest' });
     }
   }
@@ -148,8 +144,43 @@ export class LoginDialog extends HTMLElement {
       this.render();
       return;
     }
-    log.info(`AFP login as “${this.username.trim()}”`, 'afp');
+    log.info(`Login as “${this.username.trim()}”`, this.opts?.kind || 'afp');
     this.accept({ kind: 'password', username: this.username.trim(), password: this.password });
+  }
+}
+
+function authLabel(kind?: ShareKind): string {
+  switch (kind) {
+    case 'smb':
+      return 'Capabilities';
+    case 'ncp':
+      return 'Login';
+    default:
+      return 'UAMs';
+  }
+}
+
+function serverNoun(kind?: ShareKind): string {
+  switch (kind) {
+    case 'smb':
+      return 'SMB server';
+    case 'ncp':
+      return 'NetWare server';
+    case 'etherdfs':
+      return 'EtherDFS server';
+    default:
+      return 'AFP server';
+  }
+}
+
+function authLead(kind: ShareKind | undefined, methods: string): string {
+  switch (kind) {
+    case 'smb':
+      return `Sign in to browse shares. Capabilities: <code>${methods}</code>`;
+    case 'ncp':
+      return `Sign in to browse volumes. Login: <code>${methods}</code>`;
+    default:
+      return `Sign in to browse volumes. UAMs: <code>${methods}</code>`;
   }
 }
 

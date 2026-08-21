@@ -17,6 +17,9 @@ import {
   IconSize,
 } from './resource-types/icon-set';
 import type { VNode } from './virtual-fs';
+import { nodeRef } from './virtual-fs';
+import type { NodeRef } from './catalog-caps';
+import { refKey } from './catalog-caps';
 import { escapeHostFilename } from '../protocol/host-filename';
 import { isAbortError, throwIfAborted } from '../util/abort';
 import {
@@ -27,8 +30,12 @@ import {
   finderIconId,
   isFinderInvisible,
 } from './finder-info';
+import type { ByteRangeReader } from './byte-range';
+import { bufferRangeReader } from './byte-range';
+import { extractWinIcons, isWinIconName, pickIconNear } from './winicon';
 
 export { HAS_BUNDLE, HAS_CUSTOM_ICON, FINDER_IS_INVISIBLE, finderFlags, isFinderInvisible, finderIconId };
+export { isWinIconName } from './winicon';
 
 export const CUSTOM_FOLDER_ICON_NAME = 'Icon\r';
 /** Host-escaped form of Icon\\r (ClassicStack reserved-char token). */
@@ -55,6 +62,8 @@ export interface IconLookupExtras {
     creator: string,
     signal?: AbortSignal,
   ) => Promise<DesktopIconBlob[] | null>;
+  /** Ranged data-fork reader (PE/NE/.ico). */
+  loadDataRange?: <T>(node: VNode, fn: (read: ByteRangeReader) => Promise<T>) => Promise<T>;
   signal?: AbortSignal;
 }
 
@@ -79,6 +88,10 @@ export function readTypeCreator(finderInfo: Uint8Array): { type: string; creator
 
 function cacheKey(creator: string, type: string): string {
   return `${padOsType(creator)}|${padOsType(type)}`;
+}
+
+function winCacheKey(node: VNode): string {
+  return `win:${refKey(nodeRef(node))}:${node.modDate}:${node.dataBytes ?? node.data.length}`;
 }
 
 /** Classic Finder volume Desktop file (FNDR/ERIK); later a volume icon cache, not a glyph source. */
@@ -218,6 +231,63 @@ function pickSystemIcon(candidates: string[]): string {
   return systemIconUrl(candidates[candidates.length - 1] ?? 'FILE32.png');
 }
 
+/** Filename suffix without a leading dot, lowercased. Empty when there is none. */
+export function fileExtension(name: string): string {
+  const base = name.split(/[/\\]/).pop() ?? name;
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0 || dot === base.length - 1) return '';
+  return base.slice(dot + 1).toLowerCase();
+}
+
+/** Icons8 glyphs used when a file has no Mac type icon (generic FILE16/FILE32). */
+const DEFAULT_EXTENSION_ICONS: Record<string, string> = {
+  exe: 'icons8-application-window-96.png',
+  zip: 'icons8-archive-folder-96.png',
+  cab: 'icons8-archive-folder-96.png',
+  rar: 'icons8-archive-folder-96.png',
+  '7z': 'icons8-archive-folder-96.png',
+  arj: 'icons8-archive-folder-96.png',
+  dll: 'icons8-dll-96.png',
+  bmp: 'icons8-image-file-96.png',
+  jpg: 'icons8-image-file-96.png',
+  jpeg: 'icons8-image-file-96.png',
+  gif: 'icons8-image-file-96.png',
+  png: 'icons8-image-file-96.png',
+  com: 'icons8-command-line-96.png',
+  bat: 'icons8-command-line-96.png',
+  cmd: 'icons8-command-line-96.png',
+  sys: 'icons8-binary-file-96.png',
+  vxd: 'icons8-binary-file-96.png',
+  ocx: 'icons8-binary-file-96.png',
+  pdf: 'icons8-pdf-1-96.png',
+};
+
+function extensionIconUrl(file: string): string {
+  return `/icons/ui/${file}`;
+}
+
+/** Default Icons8 URLs for a filename suffix, or null when the suffix is unmapped. */
+export function defaultIconsForExtension(name: string): IconUrls | null {
+  const file = DEFAULT_EXTENSION_ICONS[fileExtension(name)];
+  if (!file) return null;
+  const url = extensionIconUrl(file);
+  return { small: url, large: url };
+}
+
+function isGenericFileIconUrl(src: string): boolean {
+  return /(?:^|\/)FILE(?:16|32)\.png(?:\?|$)/i.test(src);
+}
+
+/** True when the cache fell back to the classic FILE16/FILE32 PNGs. */
+export function isGenericFileIcon(urls: IconUrls): boolean {
+  return isGenericFileIconUrl(urls.small) || isGenericFileIconUrl(urls.large);
+}
+
+function withExtensionDefault(name: string | undefined, urls: IconUrls): IconUrls {
+  if (!name || !isGenericFileIcon(urls)) return urls;
+  return defaultIconsForExtension(name) ?? urls;
+}
+
 async function resolveSystemIcon(type: string, size: 16 | 32): Promise<string> {
   const t = padOsType(type).replace(/\s+$/g, '') || 'FILE';
   if (size === 16) {
@@ -265,6 +335,8 @@ export class IconCache {
   private typeInflight = new Map<string, Promise<IconUrls>>();
   private dirInflight = new Map<string, Promise<IconUrls>>();
   private desktopInflight = new Map<string, Promise<IconUrls | null>>();
+  private winMemory = new Map<string, IconUrls>();
+  private winInflight = new Map<string, Promise<IconUrls | null>>();
   /** Type/creator keys whose cached glyph came from an 8-bit/cicn family (not ICN# / AFP B&W). */
   private colorKeys = new Set<string>();
   /** Type/creator keys whose resource fork was already opened for icons. */
@@ -311,6 +383,7 @@ export class IconCache {
     this.bundleCache.clear();
     this.dirMemory.clear();
     this.desktopMemory.clear();
+    this.winMemory.clear();
     this.colorKeys.clear();
     this.iconForkTried.clear();
     this.defaultKeys.clear();
@@ -318,6 +391,7 @@ export class IconCache {
     this.typeInflight.clear();
     this.dirInflight.clear();
     this.desktopInflight.clear();
+    this.winInflight.clear();
     await this.init();
     if (!this.db) return;
     await this.clearStore('typeIcons');
@@ -372,25 +446,30 @@ export class IconCache {
   /** Resolve icons for a VirtualFS node (local share or remote AFP). */
   async getForNode(
     node: VNode,
-    findChild?: (parentId: number, name: string) => Promise<VNode | undefined>,
+    findChild?: (parent: NodeRef, name: string) => Promise<VNode | undefined>,
     loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
     extras?: IconLookupExtras,
   ): Promise<IconUrls> {
     await this.ensureDefaults();
     if (node.isDir) {
-      return this.getForDirectory(String(node.id), node, findChild, loadIconFork);
+      return this.getForDirectory(String(nodeRef(node)), node, findChild, loadIconFork);
+    }
+    const extDefault = (urls: IconUrls) => withExtensionDefault(node.name, urls);
+    if (isWinIconName(node.name)) {
+      const win = await this.getForWinFile(node, extras);
+      if (win) return extDefault(win);
     }
     const { type, creator } = readTypeCreator(node.finderInfo);
     if (isVolumeDesktopFile(node.name, type, creator)) {
-      return this.getForTypeCreator(type, creator);
+      return this.getForTypeCreator(type, creator, node.name);
     }
     const key = cacheKey(creator, type);
     const cached = this.memory.get(key) ?? (await this.loadPersisted(key));
     if (cached) this.memory.set(key, cached);
     const custom = (finderFlags(node.finderInfo) & HAS_CUSTOM_ICON) !== 0;
-    if (cached && !custom && this.colorKeys.has(key)) return cached;
-    if (cached && !custom && this.defaultKeys.has(key)) return cached;
-    if (cached && !custom && this.iconForkTried.has(key)) return cached;
+    if (cached && !custom && this.colorKeys.has(key)) return extDefault(cached);
+    if (cached && !custom && this.defaultKeys.has(key)) return extDefault(cached);
+    if (cached && !custom && this.iconForkTried.has(key)) return extDefault(cached);
 
     throwIfAborted(extras?.signal);
 
@@ -404,7 +483,7 @@ export class IconCache {
         try {
           const urls = await pending;
           throwIfAborted(extras?.signal);
-          return urls;
+          return extDefault(urls);
         } catch (err) {
           if (!(isAbortError(err) && extras?.signal && !extras.signal.aborted)) {
             throw err;
@@ -420,7 +499,7 @@ export class IconCache {
         if (this.typeInflight.get(key) === work) this.typeInflight.delete(key);
       });
     }
-    return work;
+    return extDefault(await work);
   }
 
   private async resolveFileNode(
@@ -578,38 +657,81 @@ export class IconCache {
     });
   }
 
+  private async getForWinFile(node: VNode, extras?: IconLookupExtras): Promise<IconUrls | null> {
+    const key = winCacheKey(node);
+    const hit = this.winMemory.get(key);
+    if (hit) return hit;
+    const pending = this.winInflight.get(key);
+    if (pending) return pending;
+
+    const work = (async (): Promise<IconUrls | null> => {
+      throwIfAborted(extras?.signal);
+      try {
+        const icons = extras?.loadDataRange
+          ? await extras.loadDataRange(node, (read) => extractWinIcons(read))
+          : node.data.length >= 6
+            ? await extractWinIcons(bufferRangeReader(node.data))
+            : [];
+        throwIfAborted(extras?.signal);
+        if (!icons.length) return null;
+        const smallIcon = pickIconNear(icons, 16);
+        const largeIcon = pickIconNear(icons, 32);
+        if (!smallIcon && !largeIcon) return null;
+        const small = smallIcon ? await decodedIconToDataUrl(smallIcon) : null;
+        const large = largeIcon ? await decodedIconToDataUrl(largeIcon) : null;
+        if (!small && !large) return null;
+        const urls: IconUrls = { small: small ?? large!, large: large ?? small! };
+        this.winMemory.set(key, urls);
+        return urls;
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        return null;
+      }
+    })();
+    this.winInflight.set(key, work);
+    void work.finally(() => {
+      if (this.winInflight.get(key) === work) this.winInflight.delete(key);
+    });
+    return work;
+  }
+
   /** Resolve icons when only Finder info is known (remote listings). */
-  async getForTypeCreator(type: string, creator: string): Promise<IconUrls> {
+  async getForTypeCreator(type: string, creator: string, name?: string): Promise<IconUrls> {
     await this.ensureDefaults();
     const key = cacheKey(creator, type);
     const pending = this.typeInflight.get(key);
-    if (pending) return pending;
+    if (pending) return withExtensionDefault(name, await pending);
     const cached = this.memory.get(key) ?? (await this.loadPersisted(key));
     if (cached) {
       this.memory.set(key, cached);
-      return cached;
+      return withExtensionDefault(name, cached);
     }
     const urls: IconUrls = {
       small: await resolveSystemIcon(type, 16),
       large: await resolveSystemIcon(type, 32),
     };
     this.memory.set(key, urls);
-    return urls;
+    return withExtensionDefault(name, urls);
   }
 
   private async getForDirectory(
     pathKey: string,
     node: VNode,
-    findChild?: (parentId: number, name: string) => Promise<VNode | undefined>,
+    findChild?: (parent: NodeRef, name: string) => Promise<VNode | undefined>,
     loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
   ): Promise<IconUrls> {
     const hit = this.dirMemory.get(pathKey);
     if (hit) return hit;
 
-    // Named Icon\\r lookup only when the caller supplies findChild (Finder does
-    // this for folders in the current view). Do not enumerate the directory.
-    if (!findChild) {
-      return this.defaultFolder ?? DEFAULT_FOLDER_ICONS;
+    // Named Icon\\r lookup only when the folder has the custom-icon flag and
+    // the caller supplies findChild (Finder does this for on-screen folders).
+    // Do not enumerate the directory, and do not probe folders that are only
+    // using the default glyph.
+    const custom = (finderFlags(node.finderInfo) & HAS_CUSTOM_ICON) !== 0;
+    if (!custom || !findChild) {
+      const urls = this.defaultFolder ?? DEFAULT_FOLDER_ICONS;
+      this.dirMemory.set(pathKey, urls);
+      return urls;
     }
 
     const pending = this.dirInflight.get(pathKey);
@@ -625,7 +747,7 @@ export class IconCache {
   private async probeDirectory(
     pathKey: string,
     node: VNode,
-    findChild: (parentId: number, name: string) => Promise<VNode | undefined>,
+    findChild: (parent: NodeRef, name: string) => Promise<VNode | undefined>,
     loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
   ): Promise<IconUrls> {
     const hit = this.dirMemory.get(pathKey);
@@ -671,14 +793,14 @@ export class IconCache {
 
   private async tryCustomFolderIconFile(
     dir: VNode,
-    findChild?: (parentId: number, name: string) => Promise<VNode | undefined>,
+    findChild?: (parent: NodeRef, name: string) => Promise<VNode | undefined>,
     loadIconFork?: (node: VNode) => Promise<ResourceFork | null>,
   ): Promise<IconUrls | null> {
     if (!findChild) return null;
     try {
       const iconFile =
-        (await findChild(dir.id, CUSTOM_FOLDER_ICON_NAME)) ??
-        (await findChild(dir.id, CUSTOM_FOLDER_ICON_HOST_NAME));
+        (await findChild(nodeRef(dir), CUSTOM_FOLDER_ICON_NAME)) ??
+        (await findChild(nodeRef(dir), CUSTOM_FOLDER_ICON_HOST_NAME));
       if (!iconFile || iconFile.isDir) return null;
       const rsrcLen = iconFile.resourceBytes ?? iconFile.resource.length;
       if (iconFile.resource.length < 16 && rsrcLen < 16) return null;

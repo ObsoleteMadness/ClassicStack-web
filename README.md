@@ -1,6 +1,9 @@
-# ClassicStackWeb
+# ClassicStack-Web
+AppleTalk / AFP stack over **WebSerial → TashTalk → LocalTalk** in your **browser**.
 
-Browser AppleTalk / AFP stack over **WebSerial → TashTalk → LocalTalk**.
+> ## Need more features?
+> Checkout [ClassicStack](https://github.com/ObsoleteMadness/ClassicStack) - a full-featured Apple File Server, 
+> IPX/NetBeui SMB and Netware Server and Client for Windows, MacOS and Linux.
 
 ## Features
 
@@ -15,7 +18,9 @@ Browser AppleTalk / AFP stack over **WebSerial → TashTalk → LocalTalk**.
 - Advanced → **Extension editor…** maps filename suffixes to Macintosh creator/type plus a comment (saved in localStorage; used on import when there is no AppleDouble metadata)
 - Dropped BinHex (`.hqx`), MacBinary (`.bin`), StuffIt (`.sit`), and ZIP (`.zip`) are decoded into the inner Macintosh files (name, forks, type/creator); ZIP merges `._` and `__MACOSX` AppleDouble. Toggle via Advanced → **Auto-expand files**
 - Resource-fork icons (BNDL / ICN# / icl8) with `./icons` system fallbacks and a clearable local type-icon cache
-- Advanced → **Resource Fork…** (or Get Info / context menu **Resources…**) lists every resource type, id, and BNDL mapping in the selected file
+- Windows `.ico` plus icons embedded in PE/NE `.exe` / `.scr` (and `.dll` / `.cpl`)
+- Advanced → **Resource Fork…** (or Get Info / context menu **Resources…**) lists every Macintosh resource type, id, and BNDL mapping — hidden when the volume has no resource forks. Get Info type/creator editors hide when the volume has no Finder info
+- View → **Windows Resources…** (or Get Info / context **Windows Resources…** on `.exe` / `.dll` / `.ico`) lists PE/NE RT_* types with icon, bitmap, version, string, and hex previews
 
 ## Requirements
 
@@ -44,6 +49,14 @@ See the plan: TashTalk → LLAP/DDP → NBP → ATP → ASP → AFP, with a Virt
 
 Protocol codecs mirror [ClassicStack](https://github.com/ObsoleteMadness/ClassicStack).
 
+Finder UI (`src/ui/finder-window.ts`) must stay independent of archive and resource-fork codecs. StuffIt, BinHex, MacBinary, ZIP, Apple compressed resources (`dcmp`), icon/BNDL decoders, Windows ICO/PE/NE icon extractors, and any future **rez** decompiler live under `src/fs/` and register through `src/fs/codecs.ts` (`classicstack-web/fs/codecs`). When this repo splits into packages, those modules become their own packages (`@classicstack/finder-ui`, `@classicstack/expand`, `@classicstack/stuffit`, `@classicstack/resource-fork`, `@classicstack/winicon`, …) so a third party can ship a replacement SIT expander or rez decoder without forking the PWA.
+
+The Finder sidebar layout is owned by the host: set `RemoteEndpoint.group` / `badge` and implement `FinderHost.sidebarGroups()`. ClassicStack groups local shares vs AppleTalk / SMB / NetWare / EtherDFS clients; the TashTalk PWA keeps a single LocalTalk list.
+
+The extension→type/creator editor is shared (`ExtensionEditorDialog`). Persistence is a pluggable `ExtensionMapStore`: the PWA uses browser localStorage; ClassicStack’s SPA uses the Go `/extmap` API (Netatalk `extmap.conf`).
+
+Register with `registerArchiveCodec`, `registerResourceDecompressor`, `registerResourceTypeDecoder`, or `registerRezCodec`. Re-registering the bundled ids (`sit`, `binhex`, `macbinary`, `zip`, `applesingle`, `dcmp`) replaces the default implementation.
+
 ## Credits
 
 ClassicStack is indebted to the following source code and authors:
@@ -53,12 +66,14 @@ ClassicStack is indebted to the following source code and authors:
 - [XADMaster](https://github.com/MacPaw/XADMaster) / The Unarchiver — [Dag Ågren](https://github.com/DagAgren), [Dirk Stöcker](https://www.dstoecker.eu/xadmaster.html), and the xadmaster library — StuffIt archive formats (also via [stuffit-rs](https://github.com/benletchford/stuffit-rs))
 - [Matthias Wiesmann](https://github.com/wiesmann) for [QuickDrawViewer](https://github.com/wiesmann/QuickDrawViewer) (PICT / QuickDraw opcode layout and PackBits; Apache 2.0)
 - [Harald Kuhr](https://github.com/haraldk) for [TwelveMonkeys](https://github.com/haraldk/TwelveMonkeys) [imageio-pict](https://github.com/haraldk/TwelveMonkeys/tree/master/imageio/imageio-pict) (PICT bitmap packing; BSD-3-Clause)
+- Icons by [Icons8](https://icons8.com/)
 
 ## Notes
 
 - Guest login (`No User Authent`) plus `Cleartxt Passwrd` and Randnum UAMs when connecting as a client
-- Resource-fork icon decoder (ICN# / icl8 / BNDL) for Finder icons; system glyphs from `./icons`; application type icons cached locally (Advanced → Clear icon cache)
-- Resource Fork explorer (Advanced → Resource Fork…) dumps types, ids, BNDL/FREF mappings, and decoded icon previews from the selected file
+- Resource-fork icon decoder (ICN# / icl8 / BNDL) plus Windows ICO/PE/NE `.exe`/`.scr` icons; system glyphs from `./icons`; type icons cached locally (View → Clear icon cache)
+- Resource Fork explorer (View → Resource Fork…) dumps types, ids, BNDL/FREF mappings, and decoded icon previews — omitted when the volume has no resource forks
+- Windows resource explorer (View → Windows Resources…) dumps PE/NE RT_* types from the data fork (icons, bitmaps, version info, string tables, manifests) with a hex dump, modeled on the Macintosh viewer
 - Desktop DB Add/GetIcon is implemented on the server
 - AFP Write uses a simplified path; full WriteContinue parity may need tuning against specific Mac OS versions
 - Netboot ChainBoot keeps the selected HFS image in browser memory for the session (writes are not persisted back to the file)

@@ -2,9 +2,13 @@
 
 import type { ZipExportStyle } from '../fs/appledouble';
 
+export type DefaultViewMode = 'icon' | 'list' | 'column';
+
 export const PREFS_STORAGE_KEY = 'classicstack.prefs';
 
 export interface AppPrefs {
+  /** Finder view when no URL `view` parameter is present. */
+  defaultView: DefaultViewMode;
   /** When false, Finder hides items with the AppleDouble/Finder kIsInvisible flag (and Icon\\r). */
   showHiddenFiles: boolean;
   /** When false, skip Icon\\r / resource-fork icon reads and use DIR/FILE system glyphs. */
@@ -16,6 +20,7 @@ export interface AppPrefs {
 }
 
 const DEFAULTS: AppPrefs = {
+  defaultView: 'icon',
   showHiddenFiles: false,
   readFinderIcons: true,
   autoExpandFiles: true,
@@ -26,6 +31,10 @@ export function parsePrefs(raw: unknown): AppPrefs {
   if (!raw || typeof raw !== 'object') return { ...DEFAULTS };
   const parsed = raw as Partial<AppPrefs>;
   return {
+    defaultView:
+      parsed.defaultView === 'list' || parsed.defaultView === 'column' || parsed.defaultView === 'icon'
+        ? parsed.defaultView
+        : DEFAULTS.defaultView,
     showHiddenFiles:
       typeof parsed.showHiddenFiles === 'boolean'
         ? parsed.showHiddenFiles

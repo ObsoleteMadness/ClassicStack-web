@@ -2,16 +2,21 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_EXTENSION_MAP,
   EXTENSION_MAP_STORAGE_KEY,
+  browserExtensionMapStore,
   cloneDefaultExtensionMap,
   filenameExtension,
   finderInfoFromName,
+  hydrateExtensionMap,
   loadExtensionMap,
   lookupExtension,
   normalizeExtension,
   normalizeMappings,
   padOsType,
   parseExtensionMap,
+  persistExtensionMap,
   saveExtensionMap,
+  setExtensionMapStore,
+  type ExtensionMapping,
 } from './extension-map';
 
 const memory = new Map<string, string>();
@@ -34,6 +39,7 @@ function installStorage(): void {
 
 afterEach(() => {
   memory.clear();
+  setExtensionMapStore(browserExtensionMapStore());
 });
 
 describe('extension-map', () => {
@@ -41,6 +47,7 @@ describe('extension-map', () => {
     expect(padOsType('PDF')).toBe('PDF ');
     expect(padOsType('')).toBe('????');
     expect(normalizeExtension('.TXT')).toBe('txt');
+    expect(normalizeExtension('.')).toBe('.');
     expect(filenameExtension('Read Me.txt')).toBe('txt');
     expect(filenameExtension('archive.tar.gz')).toBe('gz');
     expect(filenameExtension('noext')).toBe('');
@@ -54,6 +61,10 @@ describe('extension-map', () => {
     expect(lookupExtension('clip.pict', rows)).toEqual({ type: 'PICT', creator: 'TVOD' });
     expect(lookupExtension('System.image', rows)).toEqual({ type: 'dImg', creator: 'ddsk' });
     expect(lookupExtension('unknown.xyz', rows)).toEqual({ type: '????', creator: '????' });
+    expect(lookupExtension('README', [{ extension: '.', type: '????', creator: 'UNIX', comment: '' }])).toEqual({
+      type: '????',
+      creator: 'UNIX',
+    });
     const fi = finderInfoFromName('photo.png', rows);
     expect(String.fromCharCode(...fi.subarray(0, 4))).toBe('PNG ');
     expect(String.fromCharCode(...fi.subarray(4, 8))).toBe('ogle');
@@ -90,5 +101,21 @@ describe('extension-map', () => {
     expect(saved).toEqual([{ extension: 'swift', creator: 'Xcod', type: 'TEXT', comment: 'Swift Source' }]);
     expect(JSON.parse(memory.get(EXTENSION_MAP_STORAGE_KEY)!)).toEqual(saved);
     expect(loadExtensionMap()).toEqual(saved);
+  });
+
+  it('lets a caller replace the backing store', async () => {
+    const mem: ExtensionMapping[] = [];
+    setExtensionMapStore({
+      async load() {
+        return mem.map((r) => ({ ...r }));
+      },
+      async save(rows) {
+        mem.splice(0, mem.length, ...rows);
+        return mem.map((r) => ({ ...r }));
+      },
+    });
+    await persistExtensionMap([{ extension: 'go', creator: 'CWIE', type: 'TEXT', comment: 'Go' }]);
+    expect(mem).toEqual([{ extension: 'go', creator: 'CWIE', type: 'TEXT', comment: 'Go' }]);
+    expect(await hydrateExtensionMap()).toEqual(mem);
   });
 });

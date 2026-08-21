@@ -1,9 +1,9 @@
-/** Filename extension → Macintosh type/creator codes (persisted in localStorage). */
+/** Filename extension → Macintosh type/creator codes. Persistence is a pluggable store. */
 
 export const EXTENSION_MAP_STORAGE_KEY = 'classicstack.extension-map';
 
 export interface ExtensionMapping {
-  /** Filename suffix without a leading dot (lowercase). */
+  /** Filename suffix without a leading dot (lowercase). `.` is the Netatalk catch-all. */
   extension: string;
   /** Four-character Macintosh creator OSType. */
   creator: string;
@@ -11,6 +11,23 @@ export interface ExtensionMapping {
   type: string;
   /** Short Internet Config–style comment (kind / format name). */
   comment: string;
+}
+
+/** Where the editor (and Finder import) reads and writes mappings. */
+export interface ExtensionMapStore {
+  load(): Promise<ExtensionMapping[]>;
+  save(rows: readonly ExtensionMapping[]): Promise<ExtensionMapping[]>;
+}
+
+/** Optional sync surface used by the browser localStorage store and prefs export. */
+export interface SyncExtensionMapStore extends ExtensionMapStore {
+  loadSync(): ExtensionMapping[];
+  saveSync(rows: readonly ExtensionMapping[]): ExtensionMapping[];
+  resetSync(): void;
+}
+
+function isSyncStore(s: ExtensionMapStore): s is SyncExtensionMapStore {
+  return typeof (s as SyncExtensionMapStore).loadSync === 'function';
 }
 
 /**
@@ -48,6 +65,7 @@ export const DEFAULT_EXTENSION_MAP: readonly ExtensionMapping[] = [
   { extension: 'jpeg', creator: 'ogle', type: 'JPEG', comment: 'JPEG Picture' },
   { extension: 'gif', creator: 'ogle', type: 'GIFf', comment: 'GIF Picture' },
   { extension: 'png', creator: 'ogle', type: 'PNG ', comment: 'Portable Network Graphic' },
+  { extension: 'bmp', creator: 'ogle', type: 'BMPp', comment: 'Windows Bitmap' },
   { extension: 'psd', creator: '8BIM', type: '8BPS', comment: 'PhotoShop Document' },
   { extension: 'qxd', creator: 'XPR3', type: 'XDOC', comment: 'QuarkXpress Document' },
   { extension: 'ai', creator: 'ART5', type: 'EPSF', comment: 'Adobe Illustrator' },
@@ -87,7 +105,9 @@ export function padOsType(s: string): string {
 }
 
 export function normalizeExtension(ext: string): string {
-  return ext.trim().replace(/^\.+/, '').toLowerCase();
+  const t = ext.trim().toLowerCase();
+  if (t === '.') return '.';
+  return t.replace(/^\.+/, '');
 }
 
 /** Last path segment after the final dot, matching historical VirtualFS behavior. */
@@ -131,33 +151,85 @@ export function parseExtensionMap(raw: unknown): ExtensionMapping[] | null {
   );
 }
 
+let cache: ExtensionMapping[] | null = null;
+let store: ExtensionMapStore = browserExtensionMapStore();
+
+export function browserExtensionMapStore(): SyncExtensionMapStore {
+  return {
+    async load() {
+      return this.loadSync();
+    },
+    async save(rows) {
+      return this.saveSync(rows);
+    },
+    loadSync() {
+      try {
+        const raw = localStorage.getItem(EXTENSION_MAP_STORAGE_KEY);
+        if (!raw) return cloneDefaultExtensionMap();
+        const parsed = parseExtensionMap(JSON.parse(raw) as unknown);
+        return parsed ?? cloneDefaultExtensionMap();
+      } catch {
+        return cloneDefaultExtensionMap();
+      }
+    },
+    saveSync(rows) {
+      const next = normalizeMappings(rows);
+      try {
+        localStorage.setItem(EXTENSION_MAP_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        /* quota / private mode */
+      }
+      return next;
+    },
+    resetSync() {
+      try {
+        localStorage.removeItem(EXTENSION_MAP_STORAGE_KEY);
+      } catch {
+        /* private mode */
+      }
+    },
+  };
+}
+
+/** Install the persistence backend (browser localStorage by default; ClassicStack uses the Go API). */
+export function setExtensionMapStore(next: ExtensionMapStore): void {
+  store = next;
+  cache = null;
+}
+
+export function extensionMapStore(): ExtensionMapStore {
+  return store;
+}
+
 export function loadExtensionMap(): ExtensionMapping[] {
-  try {
-    const raw = localStorage.getItem(EXTENSION_MAP_STORAGE_KEY);
-    if (!raw) return cloneDefaultExtensionMap();
-    const parsed = parseExtensionMap(JSON.parse(raw) as unknown);
-    return parsed ?? cloneDefaultExtensionMap();
-  } catch {
-    return cloneDefaultExtensionMap();
+  if (cache) return cache;
+  if (isSyncStore(store)) {
+    cache = store.loadSync();
+    return cache;
   }
+  return cloneDefaultExtensionMap();
+}
+
+export async function hydrateExtensionMap(): Promise<ExtensionMapping[]> {
+  cache = await store.load();
+  return cache;
 }
 
 export function resetExtensionMap(): void {
-  try {
-    localStorage.removeItem(EXTENSION_MAP_STORAGE_KEY);
-  } catch {
-    /* private mode */
-  }
+  cache = null;
+  if (isSyncStore(store)) store.resetSync();
 }
 
 export function saveExtensionMap(rows: readonly ExtensionMapping[]): ExtensionMapping[] {
   const next = normalizeMappings(rows);
-  try {
-    localStorage.setItem(EXTENSION_MAP_STORAGE_KEY, JSON.stringify(next));
-  } catch {
-    /* quota / private mode */
-  }
+  cache = next;
+  if (isSyncStore(store)) store.saveSync(next);
   return next;
+}
+
+export async function persistExtensionMap(rows: readonly ExtensionMapping[]): Promise<ExtensionMapping[]> {
+  cache = await store.save(normalizeMappings(rows));
+  return cache;
 }
 
 export function lookupExtension(
@@ -165,7 +237,8 @@ export function lookupExtension(
   rows: readonly ExtensionMapping[] = loadExtensionMap(),
 ): { type: string; creator: string } {
   const ext = filenameExtension(name);
-  const hit = ext ? rows.find((r) => r.extension === ext) : undefined;
+  const hit = (ext ? rows.find((r) => r.extension === ext) : undefined) ??
+    (!ext ? rows.find((r) => r.extension === '.') : undefined);
   return hit
     ? { type: padOsType(hit.type), creator: padOsType(hit.creator) }
     : { type: '????', creator: '????' };

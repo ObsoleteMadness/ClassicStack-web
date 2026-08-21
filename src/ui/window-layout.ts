@@ -2,7 +2,7 @@
 
 export const WINDOWS_STORAGE_KEY = 'classicstack.windows';
 
-export type WindowId = 'finder' | 'log' | 'activity' | 'resource' | 'info';
+export type WindowId = 'finder' | 'log' | 'activity' | 'resource' | 'winresource' | 'info';
 
 export interface WindowFrame {
   left: number;
@@ -19,11 +19,25 @@ export type WindowLayouts = Partial<Record<WindowId, WindowFrame>>;
 
 const PAD = 8;
 
+/** Bottom edge of the application menu bar (windows must not overlap it). */
+export function menubarMinTop(): number {
+  if (typeof document === 'undefined') return PAD;
+  const bar = document.querySelector('.app-menubar, .cs-shell') as HTMLElement | null;
+  if (bar) {
+    const bottom = bar.getBoundingClientRect().bottom;
+    if (bottom > 0) return Math.ceil(bottom);
+  }
+  const raw = getComputedStyle(document.documentElement).getPropertyValue('--app-menubar-height').trim();
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : PAD;
+}
+
+
 export function parseWindowLayouts(raw: unknown): WindowLayouts {
   if (!raw || typeof raw !== 'object') return {};
   const src = raw as Record<string, unknown>;
   const out: WindowLayouts = {};
-  for (const id of ['finder', 'log', 'activity', 'resource', 'info'] as const) {
+  for (const id of ['finder', 'log', 'activity', 'resource', 'winresource', 'info'] as const) {
     const frame = parseFrame(src[id]);
     if (frame) out[id] = frame;
   }
@@ -52,17 +66,18 @@ export function clampFrame(
   bounds: { width: number; height: number },
   minWidth = 280,
   minHeight = 160,
+  minTop = menubarMinTop(),
 ): WindowFrame {
   const width = Math.min(Math.max(Math.round(frame.width), minWidth), Math.max(minWidth, bounds.width));
   const height = Math.min(Math.max(Math.round(frame.height), minHeight), Math.max(minHeight, bounds.height));
   const maxLeft = Math.max(PAD, bounds.width - 40);
-  const maxTop = Math.max(PAD, bounds.height - 40);
+  const maxTop = Math.max(minTop, bounds.height - 40);
   return {
     ...frame,
     width,
     height,
     left: Math.max(PAD, Math.min(maxLeft, Math.round(frame.left))),
-    top: Math.max(PAD, Math.min(maxTop, Math.round(frame.top))),
+    top: Math.max(minTop, Math.min(maxTop, Math.round(frame.top))),
   };
 }
 
@@ -155,12 +170,16 @@ export function fitWindowToContents(
     panel.style.minHeight = prev.minHeight;
     panel.style.overflow = prev.overflow;
   }
-  const maxH = Math.max(minH, window.innerHeight - 16);
+  const minTop = menubarMinTop();
+  const maxH = Math.max(minH, window.innerHeight - minTop - 8);
   const height = Math.min(neededH, maxH);
   el.style.height = `${height}px`;
   const r = el.getBoundingClientRect();
   if (r.bottom > window.innerHeight - 8) {
-    el.style.top = `${Math.max(8, window.innerHeight - height - 8)}px`;
+    el.style.top = `${Math.max(minTop, window.innerHeight - height - 8)}px`;
+  }
+  if (r.top < minTop) {
+    el.style.top = `${minTop}px`;
   }
 }
 
@@ -235,6 +254,20 @@ export function defaultResourceFrame(): WindowFrame {
   const height = Math.min(480, window.innerHeight - pad * 2);
   return {
     left: Math.max(pad, window.innerWidth - width - pad),
+    top: Math.max(pad, window.innerHeight - height - pad),
+    width,
+    height,
+    open: false,
+  };
+}
+
+/** Default on the left so it can sit beside the Macintosh resource-fork viewer. */
+export function defaultWinResourceFrame(): WindowFrame {
+  const pad = 16;
+  const width = Math.min(640, window.innerWidth - pad * 2);
+  const height = Math.min(480, window.innerHeight - pad * 2);
+  return {
+    left: pad,
     top: Math.max(pad, window.innerHeight - height - pad),
     width,
     height,

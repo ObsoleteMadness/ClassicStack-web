@@ -32,6 +32,7 @@ import {
   closeFork,
   rename,
   moveAndRename,
+  copyFile,
   openDT,
   parseOpenDT,
   closeDT,
@@ -96,6 +97,26 @@ describe('AFP client wirePath + Pascal framing', () => {
     expect(b[o]).toBe(C.PathTypeLongNames);
     expect(b[o + 1]).toBe(3);
     expect([...b.subarray(o + 2, o + 5)]).toEqual([...encodeMacRoman('New')]);
+  });
+
+  it('CopyFile is srcVol/srcDir/dstVol/dstDir + dest path type 0', () => {
+    const b = copyFile(1, 2, 'orig.txt', 1, 2, 'copy.txt');
+    expect(b[0]).toBe(C.CmdCopyFile);
+    expect(be16(b, 2)).toBe(1);
+    expect(be32(b, 4)).toBe(2);
+    expect(be16(b, 8)).toBe(1);
+    expect(be32(b, 10)).toBe(2);
+    expect(b[14]).toBe(C.PathTypeLongNames);
+    const src = wirePath('orig.txt');
+    expect(b[15]).toBe(src.length);
+    let o = 16 + src.length;
+    if (o % 2) o++;
+    expect(b[o]).toBe(0);
+    expect(b[o + 1]).toBe(0);
+    o += 2;
+    expect(b[o]).toBe(C.PathTypeLongNames);
+    expect(b[o + 1]).toBe(8);
+    expect([...b.subarray(o + 2, o + 10)]).toEqual([...encodeMacRoman('copy.txt')]);
   });
 });
 

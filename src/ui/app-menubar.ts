@@ -1,55 +1,64 @@
 import { downloadBytes, type PcapCapture } from '../util/pcap';
 import { log } from '../util/logger';
-import { loadPrefs, savePrefs } from '../util/prefs';
 import { applyPrefsBundle, parsePrefsBundle, stringifyPrefsBundle } from '../util/prefs-bundle';
 import type { LogPanel } from './log-panel';
 import type { ActivityWindow } from './activity-window';
-import type { NetbootDialog } from './netboot-dialog';
 import type { AfpSessionsDialog } from './afp-sessions-dialog';
-import type { ExtensionEditorDialog } from './extension-editor-dialog';
 import type { ResourceForkExplorer } from './resource-fork-explorer';
+import type { WinResourceExplorer } from './win-resource-explorer';
 import type { GetInfoWindow } from './get-info-window';
 import type { FinderWindow } from './finder-window';
 import type { AboutDialog } from './about-dialog';
 import type { AlertDialog } from './alert-dialog';
-import { iconCache } from '../fs/icon-cache';
+import type { SettingsWindow } from './settings-window';
 import { persistWindow } from './window-layout';
 import { isCompactUi } from './layout-mode';
-
-type OpenMenu = 'app' | 'advanced' | null;
+import { bindMenuBarTracking, MENUBAR_CHANGE, menubarOpenKey, setMenubarOpen } from './menu-bar-track';
+import {
+  FILE_MENU_KEY,
+  applyFileMenuAction,
+  fileMenuInnerHTML,
+} from './finder-file-menu';
+import {
+  VIEW_MENU_KEY,
+  applyViewMenuAction,
+  viewMenuInnerHTML,
+} from './finder-view-menu';
+import type { ExtensionEditorDialog } from './extension-editor-dialog';
 
 export interface AdvancedMenuHost {
   pcap: PcapCapture;
   logPanel: LogPanel;
   activityWindow: ActivityWindow;
-  netboot: NetbootDialog;
   afpSessions: AfpSessionsDialog;
-  extensionEditor: ExtensionEditorDialog;
   resourceExplorer: ResourceForkExplorer;
+  winResourceExplorer?: WinResourceExplorer;
   getInfoWindow: GetInfoWindow;
   about: AboutDialog;
   alertDialog?: AlertDialog;
+  settings?: SettingsWindow;
   finder?: FinderWindow;
-  resetEnvironment?(eraseShare: boolean): Promise<void>;
+  extensionEditor?: ExtensionEditorDialog;
   onCaptureChanged?(capturing: boolean): void;
 }
 
-/** Screen-top menu bar with ClassicStack / Advanced menus. */
+/** Screen-top menu bar with ClassicStack / File / View / Advanced menus. */
 export class AppMenuBar extends HTMLElement {
   private host: AdvancedMenuHost | null = null;
-  private openMenu: OpenMenu = null;
+  private unbindTracking: (() => void) | null = null;
 
   connectedCallback(): void {
     this.classList.add('app-menubar');
     this.render();
     this.addEventListener('click', (e) => this.onClick(e));
-    window.addEventListener('click', this.onWindowClick);
-    window.addEventListener('keydown', this.onKey);
+    this.addEventListener(MENUBAR_CHANGE, this.onMenubarChange);
+    this.unbindTracking = bindMenuBarTracking(this);
   }
 
   disconnectedCallback(): void {
-    window.removeEventListener('click', this.onWindowClick);
-    window.removeEventListener('keydown', this.onKey);
+    this.removeEventListener(MENUBAR_CHANGE, this.onMenubarChange);
+    this.unbindTracking?.();
+    this.unbindTracking = null;
   }
 
   bind(host: AdvancedMenuHost): void {
@@ -84,16 +93,15 @@ export class AppMenuBar extends HTMLElement {
     const count = this.host?.pcap.packetCount ?? 0;
     const logOpen = this.host ? !this.host.logPanel.hidden : false;
     const activityOpen = this.host ? !this.host.activityWindow.hidden : false;
-    const showHidden = this.host?.finder?.getShowHiddenFiles?.() ?? false;
-    const autoExpand = this.host?.finder?.getAutoExpandFiles?.() ?? false;
-    const readFinderIcons = this.host?.finder?.getReadFinderIcons?.() ?? true;
-    const zipStyle = loadPrefs().zipExportStyle;
-    const appOpen = this.openMenu === 'app';
-    const advancedOpen = this.openMenu === 'advanced';
+    const appOpen = menubarOpenKey(this) === 'app';
+    const fileOpen = menubarOpenKey(this) === FILE_MENU_KEY;
+    const viewOpen = menubarOpenKey(this) === VIEW_MENU_KEY;
+    const advancedOpen = menubarOpenKey(this) === 'advanced';
+    const finderHost = this.host?.finder ? { finder: this.host.finder } : null;
     this.innerHTML = `
       <div class="app-menubar__inner">
         <div class="app-menubar__menus">
-          <div class="app-menu${appOpen ? ' open' : ''}">
+          <div class="app-menu${appOpen ? ' open' : ''}" data-menu="app">
             <button type="button" class="app-menu__trigger app-menubar__brand" data-act="toggle-app" aria-haspopup="true" aria-expanded="${appOpen}">
               ClassicStack
             </button>
@@ -101,9 +109,26 @@ export class AppMenuBar extends HTMLElement {
               <button type="button" role="menuitem" data-act="about" class="app-menu__item">
                 About ClassicStack…
               </button>
+              <button type="button" role="menuitem" data-act="settings" class="app-menu__item">
+                Settings…
+              </button>
             </div>
           </div>
-          <div class="app-menu${advancedOpen ? ' open' : ''}">
+          ${
+            finderHost
+              ? `<div class="app-menu${fileOpen ? ' open' : ''} finder-file-menu" data-menu="${FILE_MENU_KEY}">
+            ${fileMenuInnerHTML(finderHost, fileOpen)}
+          </div>`
+              : ''
+          }
+          ${
+            finderHost
+              ? `<div class="app-menu${viewOpen ? ' open' : ''} finder-view-menu" data-menu="${VIEW_MENU_KEY}">
+            ${viewMenuInnerHTML(finderHost, viewOpen)}
+          </div>`
+              : ''
+          }
+          <div class="app-menu${advancedOpen ? ' open' : ''}" data-menu="advanced">
             <button type="button" class="app-menu__trigger" data-act="toggle-advanced" aria-haspopup="true" aria-expanded="${advancedOpen}">
               Advanced
             </button>
@@ -121,10 +146,6 @@ export class AppMenuBar extends HTMLElement {
                 <span class="app-menu__check"></span>
                 Message Macintosh clients…
               </button>
-              <button type="button" role="menuitem" data-act="netboot" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Netboot…
-              </button>
               <button type="button" role="menuitemcheckbox" aria-checked="${logOpen}" data-act="show-log" class="app-menu__item">
                 <span class="app-menu__check">${logOpen ? '✓' : ''}</span>
                 Show Log
@@ -132,55 +153,6 @@ export class AppMenuBar extends HTMLElement {
               <button type="button" role="menuitemcheckbox" aria-checked="${activityOpen}" data-act="show-activity" class="app-menu__item">
                 <span class="app-menu__check">${activityOpen ? '✓' : ''}</span>
                 Activity
-              </button>
-              <hr />
-              <button type="button" role="menuitemcheckbox" aria-checked="${showHidden}" data-act="toggle-show-hidden" class="app-menu__item">
-                <span class="app-menu__check">${showHidden ? '✓' : ''}</span>
-                Show hidden files
-              </button>
-              <button type="button" role="menuitemcheckbox" aria-checked="${autoExpand}" data-act="toggle-auto-expand" class="app-menu__item">
-                <span class="app-menu__check">${autoExpand ? '✓' : ''}</span>
-                Auto-expand files
-              </button>
-              <button type="button" role="menuitemcheckbox" aria-checked="${readFinderIcons}" data-act="toggle-read-finder-icons" class="app-menu__item">
-                <span class="app-menu__check">${readFinderIcons ? '✓' : ''}</span>
-                Read finder icons
-              </button>
-              <hr />
-              <button type="button" role="menuitemradio" aria-checked="${zipStyle === 'appledouble'}" data-act="zip-appledouble" class="app-menu__item">
-                <span class="app-menu__check">${zipStyle === 'appledouble' ? '✓' : ''}</span>
-                AppleDouble zip
-              </button>
-              <button type="button" role="menuitemradio" aria-checked="${zipStyle === 'macosx'}" data-act="zip-macosx" class="app-menu__item">
-                <span class="app-menu__check">${zipStyle === 'macosx' ? '✓' : ''}</span>
-                Mac OS X zip
-              </button>
-              <hr />
-              <button type="button" role="menuitem" data-act="extension-editor" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Extension editor…
-              </button>
-              <button type="button" role="menuitem" data-act="resource-fork" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Resource Fork…
-              </button>
-              <button type="button" role="menuitem" data-act="clear-icon-cache" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Clear icon cache
-              </button>
-              <hr />
-              <button type="button" role="menuitem" data-act="export-prefs" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Export preferences…
-              </button>
-              <button type="button" role="menuitem" data-act="import-prefs" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Import preferences…
-              </button>
-              <hr />
-              <button type="button" role="menuitem" data-act="reset-environment" class="app-menu__item">
-                <span class="app-menu__check"></span>
-                Reset environment…
               </button>
             </div>
           </div>
@@ -192,46 +164,52 @@ export class AppMenuBar extends HTMLElement {
     `;
   }
 
-  private onWindowClick = (e: MouseEvent): void => {
-    if (!this.openMenu) return;
-    if (this.contains(e.target as Node)) return;
-    this.openMenu = null;
+  private onMenubarChange = (): void => {
     this.render();
-  };
-
-  private onKey = (e: KeyboardEvent): void => {
-    if (e.key === 'Escape' && this.openMenu) {
-      this.openMenu = null;
-      this.render();
-    }
   };
 
   private closeMenus(): void {
-    this.openMenu = null;
-    this.render();
+    setMenubarOpen(this, null);
   }
 
   private onClick(e: MouseEvent): void {
-    const t = (e.target as HTMLElement).closest('[data-act]') as HTMLElement | null;
+    const el = e.target instanceof Element ? e.target : e.target instanceof Node ? e.target.parentElement : null;
+    const t = el?.closest('[data-act]') as HTMLElement | null;
     if (!t || !this.host) return;
     e.stopPropagation();
     const act = t.dataset.act;
+    if (act === 'toggle-app' || act === 'toggle-file' || act === 'toggle-view' || act === 'toggle-advanced') return;
 
-    if (act === 'toggle-app') {
-      this.openMenu = this.openMenu === 'app' ? null : 'app';
-      this.render();
-      return;
-    }
+    void (async () => {
+      if (this.host?.finder) {
+        const host = { finder: this.host.finder };
+        if (await applyFileMenuAction(act, host)) {
+          this.closeMenus();
+          this.render();
+          return;
+        }
+        if (await applyViewMenuAction(act, host)) {
+          this.closeMenus();
+          this.render();
+          return;
+        }
+      }
+      this.handleAppMenuAction(act);
+    })();
+  }
 
-    if (act === 'toggle-advanced') {
-      this.openMenu = this.openMenu === 'advanced' ? null : 'advanced';
-      this.render();
-      return;
-    }
+  private handleAppMenuAction(act: string | undefined): void {
+    if (!this.host || !act) return;
 
     if (act === 'about') {
       this.closeMenus();
       this.host.about.open();
+      return;
+    }
+
+    if (act === 'settings') {
+      this.closeMenus();
+      this.host.settings?.open('general');
       return;
     }
 
@@ -263,12 +241,6 @@ export class AppMenuBar extends HTMLElement {
       return;
     }
 
-    if (act === 'netboot') {
-      this.closeMenus();
-      this.host.netboot.open();
-      return;
-    }
-
     if (act === 'show-log') {
       this.closeMenus();
       this.host.logPanel.toggle();
@@ -280,73 +252,6 @@ export class AppMenuBar extends HTMLElement {
       this.host.activityWindow.toggle();
       return;
     }
-
-    if (act === 'toggle-show-hidden') {
-      const next = !(this.host.finder?.getShowHiddenFiles?.() ?? false);
-      this.host.finder?.setShowHiddenFiles?.(next);
-      this.closeMenus();
-      return;
-    }
-
-    if (act === 'toggle-auto-expand') {
-      const next = !(this.host.finder?.getAutoExpandFiles?.() ?? false);
-      this.host.finder?.setAutoExpandFiles?.(next);
-      this.closeMenus();
-      return;
-    }
-
-    if (act === 'toggle-read-finder-icons') {
-      const next = !(this.host.finder?.getReadFinderIcons?.() ?? true);
-      this.host.finder?.setReadFinderIcons?.(next);
-      this.closeMenus();
-      return;
-    }
-
-    if (act === 'zip-appledouble' || act === 'zip-macosx') {
-      savePrefs({ zipExportStyle: act === 'zip-macosx' ? 'macosx' : 'appledouble' });
-      this.render();
-      return;
-    }
-
-    if (act === 'extension-editor') {
-      this.closeMenus();
-      this.host.extensionEditor.open();
-      return;
-    }
-
-    if (act === 'resource-fork') {
-      this.closeMenus();
-      this.host.finder?.openResourceExplorer();
-      return;
-    }
-
-    if (act === 'clear-icon-cache') {
-      this.closeMenus();
-      void (async () => {
-        await iconCache.clear();
-        this.host?.finder?.invalidateIcons?.();
-        log.info('Cleared application icon cache', 'icons');
-      })();
-      return;
-    }
-
-    if (act === 'export-prefs') {
-      this.closeMenus();
-      this.exportPreferences();
-      return;
-    }
-
-    if (act === 'import-prefs') {
-      this.closeMenus();
-      void this.importPreferences();
-      return;
-    }
-
-    if (act === 'reset-environment') {
-      this.closeMenus();
-      void this.resetEnvironment();
-      return;
-    }
   }
 
   private snapshotWindows(): void {
@@ -356,10 +261,11 @@ export class AppMenuBar extends HTMLElement {
     persistWindow('log', host.logPanel);
     persistWindow('activity', host.activityWindow);
     persistWindow('resource', host.resourceExplorer);
+    if (host.winResourceExplorer) persistWindow('winresource', host.winResourceExplorer);
     persistWindow('info', host.getInfoWindow);
   }
 
-  private exportPreferences(): void {
+  exportPreferences(): void {
     this.snapshotWindows();
     const json = stringifyPrefsBundle();
     const stamp = new Date().toISOString().slice(0, 10);
@@ -367,7 +273,7 @@ export class AppMenuBar extends HTMLElement {
     log.info('Exported preferences', 'app');
   }
 
-  private async importPreferences(): Promise<void> {
+  async importPreferences(): Promise<void> {
     const host = this.host;
     if (!host) return;
     const file = await pickJsonFile();
@@ -391,20 +297,6 @@ export class AppMenuBar extends HTMLElement {
     applyPrefsBundle(parsed);
     log.info(`Imported preferences from “${file.name}”`, 'app');
     location.reload();
-  }
-
-  private async resetEnvironment(): Promise<void> {
-    const host = this.host;
-    if (!host?.alertDialog || !host.resetEnvironment) return;
-    const result = await host.alertDialog.confirm({
-      title: 'Reset environment',
-      text: 'This restores default window positions and preferences, then reloads ClassicStack.',
-      checkboxLabel: 'Erase all Browser Share items',
-      confirmLabel: 'Reset',
-      danger: true,
-    });
-    if (!result.confirmed) return;
-    await host.resetEnvironment(result.checked);
   }
 }
 

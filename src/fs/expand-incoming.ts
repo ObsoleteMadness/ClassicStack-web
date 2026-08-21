@@ -9,6 +9,15 @@ import { parseMacBinary } from './macbinary';
 import { SitError } from './stuffit-codec';
 import { isStuffItArchive, parseStuffIt, stuffItExpandError, type SitEntry } from './stuffit';
 import { isZipArchive, parseZip, type ZipMember } from './zip';
+import {
+  ARCHIVE_CODEC_APPLESINGLE,
+  ARCHIVE_CODEC_BINHEX,
+  ARCHIVE_CODEC_MACBINARY,
+  ARCHIVE_CODEC_SIT,
+  ARCHIVE_CODEC_ZIP,
+  registerArchiveCodec,
+  sniffArchiveCodec,
+} from './codecs';
 
 const MAX_DEPTH = 8;
 
@@ -26,21 +35,16 @@ export type ExpandedNode = ExpandedFile | ExpandedDir;
 export { isStuffItArchive, isZipArchive };
 
 const SIT_TYPES = new Set(['SIT!', 'SIT5', 'SITD']);
-const EXPANDABLE_EXTS = new Set(['sit', 'hqx', 'bin', 'zip']);
 
 /**
  * True when the Finder should offer Expand (`.sit` / `.hqx` / `.bin` / `.zip`, StuffIt type, ZIP,
  * or BinHex stored as TEXT/SITx). Pass `data` when loaded: Expander Read Me files are also
- * TEXT/SITx but are not archives.
+ * TEXT/SITx but are not archives. Registered archive codecs are consulted first so a replacement
+ * SIT expander can opt files in or out.
  */
 export function isExpandableArchive(name: string, finderInfo?: Uint8Array, data?: Uint8Array): boolean {
-  if (EXPANDABLE_EXTS.has(filenameExtension(name))) return true;
-  if (!finderInfo || finderInfo.length < 8) return false;
-  const type = ostypeFromBytes(finderInfo, 0);
-  const creator = ostypeFromBytes(finderInfo, 4);
-  if (SIT_TYPES.has(type) || type === 'ZIP ') return true;
-  if (type === 'TEXT' && creator === 'SITx') return !data?.length || parseBinHex(data) != null;
-  return false;
+  const codec = sniffArchiveCodec({ name, finderInfo, data });
+  return codec != null && codec.expandable !== false;
 }
 
 /** Modal body when Expand cannot unpack a file. Never uses Finder type/creator. */
@@ -92,40 +96,14 @@ export function expandIncoming(name: string, bytes: Uint8Array): ExpandedNode[] 
 function expandBytes(name: string, data: Uint8Array, resource: Uint8Array, depth: number): ExpandedNode[] | null {
   if (depth > MAX_DEPTH) return null;
 
-  const hqx = parseBinHex(data);
-  if (hqx) return finishMacFile(hqx, depth + 1);
-
-  const mb = parseMacBinary(data);
-  if (mb) return finishMacFile(mb, depth + 1);
-
-  if (resource.length === 0) {
-    const as = parseAppleSingle(data);
-    if (as) {
-      return finishMacFile(
-        {
-          name,
-          data: as.data,
-          resource: as.resource,
-          finderInfo: as.finderInfo,
-        },
-        depth + 1,
-      );
-    }
-  }
-
-  if (isStuffItArchive(data)) {
-    const entries = parseStuffIt(data);
-    if (entries && entries.length) return expandNodes(sitEntriesToTree(entries), depth + 1);
-  }
-
-  if (isZipArchive(data)) {
-    const entries = parseZip(data);
-    if (entries && entries.length) return expandNodes(zipMembersToTree(entries), depth + 1);
-  }
-  return null;
+  const codec = sniffArchiveCodec({ name, data, resource });
+  if (!codec) return null;
+  const out = codec.expand(name, data);
+  if (!out?.length) return null;
+  return expandNodes(out, depth + 1);
 }
 
-function finishMacFile(file: MacFile, depth: number): ExpandedNode[] {
+function macFileNode(file: MacFile): ExpandedFile {
   let current = file;
   if (current.resource.length === 0) {
     const as = parseAppleSingle(current.data);
@@ -140,9 +118,7 @@ function finishMacFile(file: MacFile, depth: number): ExpandedNode[] {
       };
     }
   }
-  const nested = tryExpandBytes(current.name, current.data, current.resource, depth);
-  if (nested) return nested;
-  return [{ kind: 'file', ...current }];
+  return { kind: 'file', ...current };
 }
 
 /** Nested members that cannot be unpacked stay packed instead of aborting the parent archive. */
@@ -244,3 +220,76 @@ function membersToTree(
   }
   return root;
 }
+
+function finderType(finderInfo?: Uint8Array): string | undefined {
+  if (!finderInfo || finderInfo.length < 4) return undefined;
+  return ostypeFromBytes(finderInfo, 0);
+}
+
+function finderCreator(finderInfo?: Uint8Array): string | undefined {
+  if (!finderInfo || finderInfo.length < 8) return undefined;
+  return ostypeFromBytes(finderInfo, 4);
+}
+
+/** Register bundled expanders. Later `registerArchiveCodec` with the same id replaces one. */
+function registerBuiltinArchiveCodecs(): void {
+  // Last registered is sniffed first, matching the previous BinHex → MacBinary → AppleSingle → SIT → ZIP order.
+  registerArchiveCodec({
+    id: ARCHIVE_CODEC_ZIP,
+    sniff: ({ name, finderInfo, data }) =>
+      filenameExtension(name) === 'zip' || finderType(finderInfo) === 'ZIP ' || (!!data?.length && isZipArchive(data)),
+    expand: (_name, data) => {
+      const entries = parseZip(data);
+      return entries?.length ? zipMembersToTree(entries) : null;
+    },
+  });
+  registerArchiveCodec({
+    id: ARCHIVE_CODEC_SIT,
+    sniff: ({ name, finderInfo, data }) => {
+      const type = finderType(finderInfo);
+      return (
+        filenameExtension(name) === 'sit' ||
+        (!!type && SIT_TYPES.has(type)) ||
+        (!!data?.length && isStuffItArchive(data))
+      );
+    },
+    expand: (_name, data) => {
+      const entries = parseStuffIt(data);
+      return entries?.length ? sitEntriesToTree(entries) : null;
+    },
+  });
+  registerArchiveCodec({
+    id: ARCHIVE_CODEC_APPLESINGLE,
+    expandable: false,
+    sniff: ({ data, resource }) => !resource?.length && !!data?.length && parseAppleSingle(data) != null,
+    expand: (name, data) => {
+      const as = parseAppleSingle(data);
+      if (!as) return null;
+      return [{ kind: 'file', name, data: as.data, resource: as.resource, finderInfo: as.finderInfo }];
+    },
+  });
+  registerArchiveCodec({
+    id: ARCHIVE_CODEC_MACBINARY,
+    sniff: ({ name, data }) => filenameExtension(name) === 'bin' || (!!data?.length && parseMacBinary(data) != null),
+    expand: (_name, data) => {
+      const mb = parseMacBinary(data);
+      return mb ? [macFileNode(mb)] : null;
+    },
+  });
+  registerArchiveCodec({
+    id: ARCHIVE_CODEC_BINHEX,
+    sniff: ({ name, finderInfo, data }) => {
+      if (filenameExtension(name) === 'hqx') return true;
+      if (finderType(finderInfo) === 'TEXT' && finderCreator(finderInfo) === 'SITx') {
+        return !data?.length || parseBinHex(data) != null;
+      }
+      return !!data?.length && parseBinHex(data) != null;
+    },
+    expand: (_name, data) => {
+      const hqx = parseBinHex(data);
+      return hqx ? [macFileNode(hqx)] : null;
+    },
+  });
+}
+
+registerBuiltinArchiveCodecs();

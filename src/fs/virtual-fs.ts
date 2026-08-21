@@ -1,75 +1,105 @@
 /** IndexedDB-backed virtual AFP volume. */
 
 import { openDB, type IDBPDatabase } from './idb-shim';
-import { macTime } from '../protocol/afp/constants';
 import { escapeHostFilename, unescapeHostFilename } from '../protocol/host-filename';
+import {
+  afpVolumeCaps,
+  toUnixMs,
+  type CatalogCapabilities,
+  type NodeRef,
+} from './catalog-caps';
 import { parseAppleDouble, parseAppleSingle, AS_MAGIC, AD_MAGIC } from './appledouble';
 import { be32 } from '../protocol/binary';
 import { importDataTransferInto, readBlobProgress, type ImportProgress } from './import-transfer';
+import { finderFlags, kIsInvisible, kNameLocked } from './finder-info';
 import { finderInfoFromName } from './extension-map';
 import { throwIfAborted } from '../util/abort';
 import { bufferRangeReader, type ByteRangeReader } from './byte-range';
 import { loadFinderIconFork, ResourceFork, type ResourceForkLoadOpts } from './resource-fork';
 import { iconForkLoadOptions } from './icon-cache';
 
-export type VfsChange = { parentIds: number[] };
+export type VfsChange = { parentIds: NodeRef[] };
 export type VfsChangeListener = (change: VfsChange) => void;
 /** Invoked with children gathered so far after each remote enumerate page. */
 export type ChildrenBatchListener = (nodes: VNode[]) => void | Promise<void>;
 
-export interface VNode {
-  id: number;
-  parentId: number;
+export type VNodeBase = {
   name: string;
   isDir: boolean;
   data: Uint8Array;
   resource: Uint8Array;
   finderInfo: Uint8Array;
+  /** Unix milliseconds. */
   createDate: number;
+  /** Unix milliseconds. */
   modDate: number;
-  /** Enumerated fork sizes when `data`/`resource` are not loaded (remote AFP). */
   dataBytes?: number;
   resourceBytes?: number;
-  /** AFP file/dir attribute bits (locked / inhibit flags), when known. */
   attributes?: number;
+  shortName?: string;
+  mediumName?: string;
+  accessDate?: number;
+  backupDate?: number;
+  attrs?: Record<string, boolean>;
+};
+
+export type CnidVNode = VNodeBase & { addr: 'cnid'; id: number; parentId: number };
+export type PathVNode = VNodeBase & { addr: 'path'; path: string; parentPath: string };
+export type VNode = CnidVNode | PathVNode;
+
+export function nodeRef(n: VNode): NodeRef {
+  return n.addr === 'path' ? n.path : n.id;
 }
 
-/** Finder catalog: local IndexedDB share and remote AFP volumes both implement this. */
+export function parentRef(n: VNode): NodeRef {
+  return n.addr === 'path' ? n.parentPath : n.parentId;
+}
+
+export function cnidOf(n: VNode): number {
+  if (n.addr !== 'cnid') throw new Error('cnid node required');
+  return n.id;
+}
+
+export function requireCnid(n: VNode): CnidVNode {
+  if (n.addr !== 'cnid') throw new Error('cnid node required');
+  return n;
+}
+
+export function pathOfNode(n: VNode): string {
+  if (n.addr === 'path') return n.path;
+  throw new Error('path node required');
+}
+
+/** Finder catalog: CNID volumes (AFP) and path volumes (SMB/NCP/EtherDFS). */
 export interface Catalog {
-  rootId(): number;
+  capabilities(): CatalogCapabilities;
+  rootId(): NodeRef;
   subscribe(fn: VfsChangeListener): () => void;
   beginBatch(): void;
   endBatch(): void;
-  get(id: number): Promise<VNode | undefined>;
-  /** Load data/resource forks if the catalog stores them separately (remote AFP). */
-  ensureContent(id: number, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined>;
-  children(parentId: number, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]>;
-  lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined>;
-  /** Parse a resource fork via ranged reads (header and map; payloads on demand). */
+  get(ref: NodeRef): Promise<VNode | undefined>;
+  ensureContent(ref: NodeRef, onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined>;
+  children(parent: NodeRef, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]>;
+  lookup(parent: NodeRef, name: string, signal?: AbortSignal): Promise<VNode | undefined>;
+  resolvePath(path: string): Promise<VNode | undefined>;
+  pathOf(ref: NodeRef): Promise<string>;
+  setAttrs?(ref: NodeRef, patch: Record<string, boolean>): Promise<void>;
   loadResourceFork(node: VNode, opts?: ResourceForkLoadOpts): Promise<import('./resource-fork').ResourceFork | null>;
-  /** Enough of the resource fork to decode Finder icons. */
   loadIconResources(node: VNode, signal?: AbortSignal): Promise<import('./resource-fork').ResourceFork | null>;
-  /**
-   * AFP Desktop DB bitmaps for a type/creator (often B&W ICN#). Local catalogs omit this.
-   */
   loadDesktopIcons?(
     type: string,
     creator: string,
     signal?: AbortSignal,
   ): Promise<{ iconType: number; data: Uint8Array }[] | null>;
-  /**
-   * Ranged reads of a file’s data or resource bytes. The catalog may keep a
-   * backend handle open until `fn` returns.
-   */
   withRangeReader<T>(
     node: VNode,
     fn: (read: ByteRangeReader) => Promise<T>,
     opts?: { resource?: boolean; signal?: AbortSignal; priority?: number },
   ): Promise<T>;
-  mkdir(parentId: number, name: string): Promise<VNode>;
-  ensureDir(parentId: number, name: string): Promise<VNode>;
+  mkdir(parent: NodeRef, name: string): Promise<VNode>;
+  ensureDir(parent: NodeRef, name: string): Promise<VNode>;
   createFile(
-    parentId: number,
+    parent: NodeRef,
     name: string,
     data: Uint8Array,
     resource?: Uint8Array,
@@ -78,14 +108,10 @@ export interface Catalog {
     signal?: AbortSignal,
   ): Promise<VNode>;
   put(node: VNode): Promise<void>;
-  rename(id: number, newName: string): Promise<void>;
-  move(id: number, newParent: number): Promise<void>;
-  remove(id: number): Promise<void>;
-  importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number>;
-  /**
-   * True when createFile/ensureContent invoke onBytes per transferred chunk
-   * (AFP). Local IndexedDB catalogs write the whole buffer at once.
-   */
+  rename(ref: NodeRef, newName: string): Promise<void>;
+  move(ref: NodeRef, newParent: NodeRef): Promise<void>;
+  remove(ref: NodeRef): Promise<void>;
+  importDataTransfer(parent: NodeRef, dt: DataTransfer, opts?: ImportProgress): Promise<number>;
   readonly reportsChunkedBytes?: boolean;
 }
 
@@ -169,6 +195,7 @@ export class VirtualFS implements Catalog {
     const root = await this.get(ROOT_ID);
     if (!root) {
       await this.put({
+        addr: 'cnid',
         id: ROOT_ID,
         parentId: 1,
         name: '',
@@ -176,8 +203,8 @@ export class VirtualFS implements Catalog {
         data: new Uint8Array(),
         resource: new Uint8Array(),
         finderInfo: new Uint8Array(32),
-        createDate: macTime(),
-        modDate: macTime(),
+        createDate: Date.now(),
+        modDate: Date.now(),
       });
     }
     const meta = await this.db.get('meta', 'nextId');
@@ -193,7 +220,7 @@ export class VirtualFS implements Catalog {
     const kids = await this.children(ROOT_ID);
     this.beginBatch();
     try {
-      for (const k of kids) await this.remove(k.id);
+      for (const k of kids) await this.remove(nodeRef(k));
     } finally {
       this.endBatch();
     }
@@ -208,26 +235,77 @@ export class VirtualFS implements Catalog {
     await this.db.put('meta', { key, value });
   }
 
-  rootId(): number {
+  capabilities(): CatalogCapabilities {
+    return afpVolumeCaps;
+  }
+
+  rootId(): NodeRef {
     return ROOT_ID;
   }
 
-  async get(id: number): Promise<VNode | undefined> {
-    const n = await this.db.get('nodes', id);
+  async get(ref: NodeRef): Promise<VNode | undefined> {
+    if (typeof ref === 'string') return this.resolvePath(ref);
+    const n = await this.db.get('nodes', ref);
     return n ? revive(n) : undefined;
   }
 
   async put(node: VNode): Promise<void> {
-    await this.db.put('nodes', serialize(node));
-    this.rememberName(node.parentId, node.name, node.id);
-    this.notifyChange(node.parentId);
+    const n = requireCnid(node);
+    await this.db.put('nodes', serialize(n));
+    this.rememberName(n.parentId, n.name, n.id);
+    this.notifyChange(n.parentId);
   }
 
-  async remove(id: number): Promise<void> {
+  private async requireNode(ref: NodeRef): Promise<VNode> {
+    const n = await this.get(ref);
+    if (!n) throw new Error('not found');
+    return n;
+  }
+
+  async resolvePath(path: string): Promise<VNode | undefined> {
+    const parts = path.split('/').filter(Boolean);
+    let cur: VNode | undefined = await this.get(ROOT_ID);
+    for (const part of parts) {
+      if (!cur) return undefined;
+      cur = await this.lookup(nodeRef(cur), part);
+    }
+    return cur;
+  }
+
+  async pathOf(ref: NodeRef): Promise<string> {
+    const id = requireCnidRef(ref);
+    const names: string[] = [];
+    let cur = await this.get(id);
+    while (cur && cur.addr === 'cnid' && cur.id !== ROOT_ID) {
+      if (cur.name) names.unshift(cur.name);
+      if (!cur.parentId || cur.parentId === cur.id) break;
+      cur = await this.get(cur.parentId);
+    }
+    return names.join('/');
+  }
+
+  async setAttrs(ref: NodeRef, patch: Record<string, boolean>): Promise<void> {
+    const node = await this.get(ref);
+    if (!node) throw new Error('not found');
+    node.attrs = { ...(node.attrs ?? {}), ...patch };
+    if (node.finderInfo.length >= 10) {
+      const fi = new Uint8Array(node.finderInfo);
+      let flags = finderFlags(fi);
+      if (patch.invisible != null) flags = patch.invisible ? flags | kIsInvisible : flags & ~kIsInvisible;
+      if (patch.locked != null) flags = patch.locked ? flags | kNameLocked : flags & ~kNameLocked;
+      fi[8] = (flags >> 8) & 0xff;
+      fi[9] = flags & 0xff;
+      node.finderInfo = fi;
+    }
+    await this.put(node);
+  }
+
+  async remove(ref: NodeRef): Promise<void> {
+    const id = requireCnidRef(ref);
     const node = await this.get(id);
-    const parentId = node?.parentId;
+    const parentId = node && node.addr === 'cnid' ? node.parentId : undefined;
     const kids = await this.children(id);
-    for (const k of kids) await this.removeQuiet(k.id);
+    for (const k of kids) await this.removeQuiet(requireCnid(k).id);
     await this.db.delete('nodes', id);
     if (node && parentId != null) this.forgetName(parentId, node.name);
     if (parentId != null) this.notifyChange(parentId);
@@ -236,20 +314,22 @@ export class VirtualFS implements Catalog {
   /** Recursive delete without per-node notifications (parent remove notifies once). */
   private async removeQuiet(id: number): Promise<void> {
     const kids = await this.children(id);
-    for (const k of kids) await this.removeQuiet(k.id);
+    for (const k of kids) await this.removeQuiet(requireCnid(k).id);
     await this.db.delete('nodes', id);
   }
 
-  async children(parentId: number, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]> {
+  async children(parent: NodeRef, onBatch?: ChildrenBatchListener, signal?: AbortSignal): Promise<VNode[]> {
     throwIfAborted(signal);
+    const parentId = requireCnidRef(parent);
     const all = await this.db.getAllFromIndex('nodes', 'parentId', parentId);
     const kids = all.map(revive);
     await onBatch?.(kids);
     return kids;
   }
 
-  async lookup(parentId: number, name: string, signal?: AbortSignal): Promise<VNode | undefined> {
+  async lookup(parent: NodeRef, name: string, signal?: AbortSignal): Promise<VNode | undefined> {
     throwIfAborted(signal);
+    const parentId = requireCnidRef(parent);
     const lower = name.toLowerCase();
     if (this.nameCache) {
       await this.ensureParentNameCache(parentId);
@@ -280,10 +360,12 @@ export class VirtualFS implements Catalog {
     this.nameCacheLoadedParents.add(parentId);
   }
 
-  async mkdir(parentId: number, name: string): Promise<VNode> {
+  async mkdir(parent: NodeRef, name: string): Promise<VNode> {
+    const parentId = requireCnidRef(parent);
     const existing = await this.lookup(parentId, name);
     if (existing) throw new Error('exists');
     const node: VNode = {
+      addr: 'cnid',
       id: await this.allocId(),
       parentId,
       name,
@@ -291,15 +373,16 @@ export class VirtualFS implements Catalog {
       data: new Uint8Array(),
       resource: new Uint8Array(),
       finderInfo: new Uint8Array(32),
-      createDate: macTime(),
-      modDate: macTime(),
+      createDate: Date.now(),
+      modDate: Date.now(),
     };
     await this.put(node);
     return node;
   }
 
   /** Get or create a directory under parent (merge into existing dirs). */
-  async ensureDir(parentId: number, name: string): Promise<VNode> {
+  async ensureDir(parent: NodeRef, name: string): Promise<VNode> {
+    const parentId = requireCnidRef(parent);
     const existing = await this.lookup(parentId, name);
     if (existing?.isDir) return existing;
     if (existing) throw new Error('exists');
@@ -307,7 +390,7 @@ export class VirtualFS implements Catalog {
   }
 
   async createFile(
-    parentId: number,
+    parent: NodeRef,
     name: string,
     data: Uint8Array,
     resource = new Uint8Array(),
@@ -316,16 +399,18 @@ export class VirtualFS implements Catalog {
     signal?: AbortSignal,
   ): Promise<VNode> {
     throwIfAborted(signal);
+    const parentId = requireCnidRef(parent);
     const existing = await this.lookup(parentId, name);
     if (existing) {
       existing.data = data;
       existing.resource = resource;
       existing.finderInfo = finderInfo;
-      existing.modDate = macTime();
+      existing.modDate = Date.now();
       await this.put(existing);
       return existing;
     }
     const node: VNode = {
+      addr: 'cnid',
       id: await this.allocId(),
       parentId,
       name,
@@ -333,20 +418,21 @@ export class VirtualFS implements Catalog {
       data,
       resource,
       finderInfo,
-      createDate: macTime(),
-      modDate: macTime(),
+      createDate: Date.now(),
+      modDate: Date.now(),
     };
     await this.put(node);
     return node;
   }
 
   async importBlob(
-    parentId: number,
+    parent: NodeRef,
     file: File,
     onBytes?: (n: number) => void,
     resource?: Uint8Array,
     signal?: AbortSignal,
   ): Promise<VNode> {
+    const parentId = requireCnidRef(parent);
     const buf = await readBlobProgress(file, onBytes, signal);
     throwIfAborted(signal);
     // Host FS may store reserved Mac chars as ClassicStack "0xNN" tokens (Icon\r → Icon0x0D).
@@ -360,7 +446,7 @@ export class VirtualFS implements Catalog {
         const leftover =
           (await this.lookup(parentId, name)) ?? (await this.lookup(parentId, file.name));
         const node = await this.applyAppleDoubleSidecar(parentId, target, ad);
-        if (leftover && leftover.id !== node.id) await this.remove(leftover.id);
+        if (leftover && nodeRef(leftover) !== nodeRef(node)) await this.remove(nodeRef(leftover));
         return node;
       }
     }
@@ -385,7 +471,7 @@ export class VirtualFS implements Catalog {
     if (existing && !existing.isDir) {
       existing.data = buf;
       if (hostResource && existing.resource.length === 0) existing.resource = hostResource;
-      existing.modDate = macTime();
+      existing.modDate = Date.now();
       await this.put(existing);
       await this.consumeNamedSidecar(parentId, name, existing);
       return existing;
@@ -407,7 +493,7 @@ export class VirtualFS implements Catalog {
     if (existing) {
       existing.resource = ad.resource;
       existing.finderInfo = ad.finderInfo;
-      existing.modDate = macTime();
+      existing.modDate = Date.now();
       await this.put(existing);
       return existing;
     }
@@ -425,15 +511,15 @@ export class VirtualFS implements Catalog {
     if (ad) {
       into.resource = ad.resource;
       into.finderInfo = ad.finderInfo;
-      into.modDate = macTime();
+      into.modDate = Date.now();
       await this.put(into);
     }
-    await this.remove(sidecar.id);
+    await this.remove(nodeRef(sidecar));
   }
 
-  async ensureContent(id: number, _onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined> {
+  async ensureContent(ref: NodeRef, _onBytes?: (n: number) => void, signal?: AbortSignal): Promise<VNode | undefined> {
     throwIfAborted(signal);
-    return this.get(id);
+    return this.get(requireCnidRef(ref));
   }
 
   async withRangeReader<T>(
@@ -442,7 +528,7 @@ export class VirtualFS implements Catalog {
     opts?: { resource?: boolean; signal?: AbortSignal },
   ): Promise<T> {
     throwIfAborted(opts?.signal);
-    const full = (await this.ensureContent(node.id, undefined, opts?.signal)) ?? node;
+    const full = (await this.ensureContent(nodeRef(node), undefined, opts?.signal)) ?? node;
     const bytes = opts?.resource ? full.resource : full.data;
     return fn(bufferRangeReader(bytes));
   }
@@ -476,32 +562,32 @@ export class VirtualFS implements Catalog {
    * + webkitRelativePath. Returns the number of top-level items imported.
    * Notifications are batched for the whole import.
    */
-  async importDataTransfer(parentId: number, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
+  async importDataTransfer(parent: NodeRef, dt: DataTransfer, opts?: ImportProgress): Promise<number> {
+    const parentId = requireCnidRef(parent);
     return importDataTransferInto(this, parentId, dt, (p, file, onBytes, resource, signal) => this.importBlob(p, file, onBytes, resource, signal), opts);
   }
 
-  async rename(id: number, newName: string): Promise<void> {
-    const n = await this.get(id);
-    if (!n) throw new Error('not found');
+  async rename(ref: NodeRef, newName: string): Promise<void> {
+    const n = requireCnid(await this.requireNode(ref));
     const oldName = n.name;
     n.name = newName;
-    n.modDate = macTime();
+    n.modDate = Date.now();
     if (oldName.toLowerCase() !== newName.toLowerCase()) {
       this.forgetName(n.parentId, oldName);
     }
     await this.put(n);
   }
 
-  async move(id: number, newParent: number): Promise<void> {
-    const n = await this.get(id);
-    if (!n) throw new Error('not found');
+  async move(ref: NodeRef, newParent: NodeRef): Promise<void> {
+    const n = requireCnid(await this.requireNode(ref));
+    const dest = requireCnidRef(newParent);
     const oldParent = n.parentId;
-    n.parentId = newParent;
-    n.modDate = macTime();
+    n.parentId = dest;
+    n.modDate = Date.now();
     await this.db.put('nodes', serialize(n));
     this.forgetName(oldParent, n.name);
-    this.rememberName(newParent, n.name, n.id);
-    this.notifyChange(oldParent, newParent);
+    this.rememberName(dest, n.name, n.id);
+    this.notifyChange(oldParent, dest);
   }
 
   private async allocId(): Promise<number> {
@@ -525,10 +611,16 @@ function nameCacheKey(parentId: number, lowerName: string): string {
   return `${parentId}\0${lowerName}`;
 }
 
-function serialize(n: VNode): Record<string, unknown> {
+function requireCnidRef(ref: NodeRef): number {
+  if (typeof ref === 'string') throw new Error('virtual-fs: cnid catalog requires numeric id');
+  return ref;
+}
+
+function serialize(n: CnidVNode): Record<string, unknown> {
   // Store forks as binary (Uint8Array). IndexedDB structured-clone handles this
   // without the huge cost of Array.from → number[] → revive.
   return {
+    addr: 'cnid',
     id: n.id,
     parentId: n.parentId,
     name: n.name,
@@ -539,6 +631,7 @@ function serialize(n: VNode): Record<string, unknown> {
     createDate: n.createDate,
     modDate: n.modDate,
     ...(n.attributes ? { attributes: n.attributes } : {}),
+    ...(n.attrs ? { attrs: n.attrs } : {}),
   };
 }
 
@@ -569,8 +662,10 @@ function padUint8(src: Uint8Array, len: number): Uint8Array {
   return out;
 }
 
-function revive(raw: Record<string, unknown>): VNode {
+function revive(raw: Record<string, unknown>): CnidVNode {
+  const attrs = raw.attrs && typeof raw.attrs === 'object' ? (raw.attrs as Record<string, boolean>) : undefined;
   return {
+    addr: 'cnid',
     id: raw.id as number,
     parentId: raw.parentId as number,
     name: raw.name as string,
@@ -578,8 +673,9 @@ function revive(raw: Record<string, unknown>): VNode {
     data: toUint8(raw.data),
     resource: toUint8(raw.resource),
     finderInfo: toUint8(raw.finderInfo, 32),
-    createDate: raw.createDate as number,
-    modDate: raw.modDate as number,
+    createDate: toUnixMs(Number(raw.createDate) || 0),
+    modDate: toUnixMs(Number(raw.modDate) || 0),
     ...(typeof raw.attributes === 'number' ? { attributes: raw.attributes } : {}),
+    ...(attrs ? { attrs } : {}),
   };
 }

@@ -1,4 +1,4 @@
-/** High-level AFP client: session login, then one open volume. */
+/** High-level AFP client: login, then one or more open volumes. */
 
 import { AspSession } from '../asp-client';
 import type { AtpClient } from '../atp-client';
@@ -427,6 +427,46 @@ export class AfpClient {
     return volId;
   }
 
+  /**
+   * FPCloseDT + FPCloseVol for one opened volume. The AFP login stays up so
+   * other volumes can still be opened; classic servers have few volume/DT slots.
+   */
+  async closeVolume(name: string): Promise<void> {
+    const volId = this.openVolIds.get(name);
+    if (volId == null) return;
+    await this.releaseVolume(name, volId);
+  }
+
+  private async releaseVolume(name: string, volId: number): Promise<void> {
+    const dtRef = this.dtRefs.get(volId);
+    if (dtRef != null) {
+      log.info(`FPCloseDT “${name}” (dt ${dtRef})`, 'afp');
+      await this.fp(cmd.closeDT(dtRef)).catch(() => undefined);
+      this.dtRefs.delete(volId);
+    }
+    this.dtUnavailable.delete(volId);
+    this.dropDesktopCaches(volId);
+    log.info(`FPCloseVol “${name}” (id ${volId})`, 'afp');
+    await this.fp(cmd.closeVol(volId)).catch(() => undefined);
+    this.openVolIds.delete(name);
+    if (this.volId === volId || this.volumeName === name) {
+      this.volId = 0;
+      this.volumeName = '';
+    }
+  }
+
+  private dropDesktopCaches(volId: number): void {
+    const prefix = `${volId}:`;
+    const drop = <T>(map: Map<string, T>) => {
+      for (const key of [...map.keys()]) {
+        if (key.startsWith(prefix)) map.delete(key);
+      }
+    };
+    drop(this.desktopInfo);
+    drop(this.desktopInfoInflight);
+    drop(this.desktopIconInflight);
+  }
+
   /** Volume id for an already-opened volume name. */
   volumeId(name: string): number {
     return this.openVolIds.get(name) ?? 0;
@@ -642,6 +682,26 @@ export class AfpClient {
     log.trace(`rename “${path}” → “${newName}” did=${dirId} vol=${this.vid(volId)}`, 'afp');
     const r = await this.fp(cmd.rename(this.vid(volId), dirId, path, newName));
     if (r.result !== C.NoErr) throw new Error(`FPRename ${r.result}`);
+  }
+
+  async copyFile(
+    srcDir: number,
+    srcName: string,
+    dstVolId: number,
+    dstDir: number,
+    newName: string,
+    srcVolId?: number,
+  ): Promise<void> {
+    log.trace(
+      `copyFile “${srcName}” src=${srcDir} dstVol=${dstVolId} dst=${dstDir} “${newName}” vol=${this.vid(srcVolId)}`,
+      'afp',
+    );
+    const r = await this.fp(
+      cmd.copyFile(this.vid(srcVolId), srcDir, srcName, dstVolId, dstDir, newName),
+    );
+    if (r.result !== C.NoErr) {
+      throw new Error(`FPCopyFile ${C.afpResultName(r.result)} (${r.result})`);
+    }
   }
 
   async moveAndRename(
@@ -959,12 +1019,14 @@ export class AfpClient {
 
   async close(): Promise<void> {
     log.trace('close', 'afp');
-    for (const dtRef of this.dtRefs.values()) {
-      await this.fp(cmd.closeDT(dtRef)).catch(() => undefined);
+    for (const [name, volId] of [...this.openVolIds]) {
+      await this.releaseVolume(name, volId);
     }
     this.dtRefs.clear();
     this.dtUnavailable.clear();
     this.desktopInfo.clear();
+    this.desktopInfoInflight.clear();
+    this.desktopIconInflight.clear();
     if (this.loggedIn) {
       await this.fp(cmd.logout()).catch(() => undefined);
       this.loggedIn = false;

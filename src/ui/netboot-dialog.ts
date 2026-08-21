@@ -41,6 +41,12 @@ export class NetbootDialog extends HTMLElement {
     return { ...this.state };
   }
 
+  setState(state: NetbootState): void {
+    this.state = { ...state };
+    this.emit();
+    if (!this.hidden) this.render();
+  }
+
   open(): void {
     this.hidden = false;
     this.render();

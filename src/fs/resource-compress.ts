@@ -4,6 +4,11 @@
  */
 
 import { be16, be32s, concat } from '../protocol/binary';
+import {
+  RESOURCE_DECOMPRESSOR_DCMP,
+  registerResourceDecompressor,
+  registeredResourceDecompressors,
+} from './codecs';
 
 /** Resource attribute bit: data is compressed (KSFL / ResEdit extended header). */
 export const RES_COMPRESSED = 1 << 0;
@@ -52,12 +57,15 @@ function signaturePrefix(data: Uint8Array): boolean {
 
 /** Decompress if this looks like a compressed resource; otherwise return `data`. */
 export function maybeDecompressResource(data: Uint8Array, attributes = 0): Uint8Array {
-  if (!isCompressedResource(data, attributes)) return data;
-  try {
-    return decompressResource(data);
-  } catch {
-    return data;
+  for (const d of registeredResourceDecompressors()) {
+    if (!d.sniff(data, attributes)) continue;
+    try {
+      return d.decompress(data);
+    } catch {
+      return data;
+    }
   }
+  return data;
 }
 
 export function decompressResource(data: Uint8Array): Uint8Array {
@@ -410,3 +418,9 @@ function tablePairs(hex: string): Uint8Array[] {
   for (let i = 0; i < bytes.length; i += 2) out.push(bytes.subarray(i, i + 2));
   return out;
 }
+
+registerResourceDecompressor({
+  id: RESOURCE_DECOMPRESSOR_DCMP,
+  sniff: (data, attributes = 0) => isCompressedResource(data, attributes),
+  decompress: decompressResource,
+});

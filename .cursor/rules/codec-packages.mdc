@@ -1,0 +1,25 @@
+---
+description: Split Macintosh codecs from Finder UI; keep SIT/rez/dcmp pluggable
+alwaysApply: true
+---
+
+# Codec packages (ClassicStack-web)
+
+When splitting ClassicStack-web into packages, **do not** put StuffIt, BinHex, MacBinary, ZIP, resource-fork parsing, `dcmp` decompress, icon/BNDL/vers decoders, or rez in the Finder UI package.
+
+Intended packages (names are indicative):
+
+- `@classicstack/finder-ui` — FinderWindow, dialogs, tokens
+- `@classicstack/catalog` — Catalog / VNode
+- `@classicstack/expand` — expander registry + `expandIncoming`
+- `@classicstack/stuffit` — bundled SIT (replaceable)
+- `@classicstack/resource-fork` — map parse, SparseBytes
+- `@classicstack/resource-types` — ICON/icl8/BNDL/vers
+- `@classicstack/appledouble` — AppleSingle / AppleDouble / zip sidecars
+
+Rules:
+
+- Finder depends on `Catalog` + codec **registries** (`src/fs/codecs.ts`), not on a specific SIT or rez implementation.
+- Bundled ids: `sit`, `binhex`, `macbinary`, `zip`, `applesingle`, `dcmp`. Re-register the same id to replace the default.
+- Third parties add formats via `registerArchiveCodec`, `registerResourceDecompressor`, `registerResourceTypeDecoder`, `registerRezCodec`.
+- New archive or resource formats register a codec; do not add `if (ext === …)` branches in `finder-window.ts`.

@@ -1,3 +1,10 @@
+/** Format a count of files/folders, e.g. "1 item" or "12 items". */
+export function formatItems(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '—';
+  const count = Math.round(n);
+  return count === 1 ? '1 item' : `${count} items`;
+}
+
 /** Format byte counts for display; sorting should use the raw number. */
 export function formatBytes(n: number): string {
   if (!Number.isFinite(n) || n < 0) return '—';

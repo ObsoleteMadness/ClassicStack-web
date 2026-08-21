@@ -7,6 +7,8 @@ import { encodeMacRoman, decodeMacRoman } from '../../protocol/macroman';
 import { AtpServer, type AtpIncoming, type AtpResponse } from '../atp-server';
 import type { LocalTalkStack } from '../../net/stack';
 import type { VirtualFS, VNode } from '../../fs/virtual-fs';
+import { cnidOf, requireCnid } from '../../fs/virtual-fs';
+import { fromUnixMs } from '../../fs/catalog-caps';
 import { log } from '../../util/logger';
 import * as atp from '../../protocol/atp';
 
@@ -689,7 +691,7 @@ export class AfpServer {
     const records: Uint8Array[] = [];
     for (const n of slice) {
       const bm = n.isDir ? dirBitmap : fileBitmap;
-      const offspring = n.isDir ? (await this.fs.children(n.id)).length : 0;
+      const offspring = n.isDir ? (await this.fs.children(cnidOf(n))).length : 0;
       records.push(this.buildEnumRecord(n, bm, n.name, offspring));
     }
     const body: number[] = [];
@@ -739,19 +741,19 @@ export class AfpServer {
     };
 
     if (bitmap & C.FDBitmapAttributes) appendBe16(fixed, 0);
-    if (bitmap & C.FDBitmapParentDID) appendBe32(fixed, n.parentId);
-    if (bitmap & C.FDBitmapCreateDate) appendBe32(fixed, n.createDate);
-    if (bitmap & C.FDBitmapModDate) appendBe32(fixed, n.modDate);
+    if (bitmap & C.FDBitmapParentDID) appendBe32(fixed, requireCnid(n).parentId);
+    if (bitmap & C.FDBitmapCreateDate) appendBe32(fixed, fromUnixMs(n.createDate));
+    if (bitmap & C.FDBitmapModDate) appendBe32(fixed, fromUnixMs(n.modDate));
     if (bitmap & C.FDBitmapBackupDate) appendBe32(fixed, C.NoBackupDate);
     if (bitmap & C.FDBitmapFinderInfo) fixed.push(...n.finderInfo.subarray(0, 32));
     if (bitmap & C.FDBitmapLongName) appendName(longName);
     if (bitmap & C.FDBitmapShortName) appendName(shortName);
     if (!n.isDir) {
-      if (bitmap & C.FileBitmapFileNum) appendBe32(fixed, n.id);
+      if (bitmap & C.FileBitmapFileNum) appendBe32(fixed, cnidOf(n));
       if (bitmap & C.FileBitmapDataForkLen) appendBe32(fixed, n.data.length);
       if (bitmap & C.FileBitmapRsrcForkLen) appendBe32(fixed, n.resource.length);
     } else {
-      if (bitmap & C.DirBitmapDirID) appendBe32(fixed, n.id);
+      if (bitmap & C.DirBitmapDirID) appendBe32(fixed, cnidOf(n));
       if (bitmap & C.DirBitmapOffspring) appendBe16(fixed, offspring);
       if (bitmap & C.DirBitmapOwnerID) appendBe32(fixed, 0);
       if (bitmap & C.DirBitmapGroupID) appendBe32(fixed, 0);
@@ -791,7 +793,7 @@ export class AfpServer {
 
   /** Catalog display name: root uses the share/volume name (Finder window title). */
   private displayNameFor(n: VNode): string {
-    if (n.id === C.CNIDRoot || n.parentId === 1) return this.volumeName;
+    if (cnidOf(n) === C.CNIDRoot || requireCnid(n).parentId === 1) return this.volumeName;
     return n.name;
   }
 
@@ -800,7 +802,7 @@ export class AfpServer {
     const name = this.readPathName(block, 8);
     const n = await this.fs.mkdir(dirId || C.CNIDRoot, name);
     const out = new Uint8Array(4);
-    writeBe32(out, 0, n.id);
+    writeBe32(out, 0, cnidOf(n));
     return [out, C.NoErr];
   }
 
@@ -816,7 +818,7 @@ export class AfpServer {
     const name = this.readPathName(block, 8);
     const n = await this.fs.lookup(dirId || C.CNIDRoot, name);
     if (!n) return [new Uint8Array(), C.ErrObjectNotFnd];
-    await this.fs.remove(n.id);
+    await this.fs.remove(cnidOf(n));
     return [new Uint8Array(), C.NoErr];
   }
 
@@ -832,7 +834,7 @@ export class AfpServer {
     const newName = this.readPathAt(block, o);
     const n = await this.fs.lookup(dirId || C.CNIDRoot, oldName.name);
     if (!n) return [new Uint8Array(), C.ErrObjectNotFnd];
-    await this.fs.rename(n.id, newName.name);
+    await this.fs.rename(cnidOf(n), newName.name);
     return [new Uint8Array(), C.NoErr];
   }
 
@@ -852,7 +854,7 @@ export class AfpServer {
     if (ref === 0) sess.nextFork = 1;
     const resource = (forkFlag & C.ForkFlagResource) !== 0;
     sess.forks.set(ref, {
-      nodeId: n.id,
+      nodeId: cnidOf(n),
       resource,
       offset: 0,
       name: n.name,
@@ -1029,7 +1031,7 @@ export class AfpServer {
     if (!n) return [new Uint8Array(), C.ErrObjectNotFnd];
 
     const bm = n.isDir ? dirBitmap : fileBitmap;
-    const offspring = n.isDir ? (await this.fs.children(n.id)).length : 0;
+    const offspring = n.isDir ? (await this.fs.children(cnidOf(n))).length : 0;
     const params = this.packParms(n, bm, this.displayNameFor(n), offspring);
     const out = new Uint8Array(6 + params.length);
     writeBe16(out, 0, fileBitmap);
