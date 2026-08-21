@@ -127,6 +127,14 @@ export class AfpFinderHost implements FinderHost {
 
   async beginRemote(ep: RemoteEndpoint): Promise<SessionInfo> {
     if (!this.atp) throw new Error('not connected');
+    // Callers re-enter this to refresh a server’s name and volumes. Opening a
+    // second ASP session would log the first one out, so a live authenticated
+    // session answers from what it already knows — otherwise the next FPOpenVol
+    // lands on a fresh unauthenticated session and comes back UserNotAuth.
+    if (this.remote?.loggedIn && this.matchesRemote(ep)) {
+      log.trace(`AFP session to “${this.remoteNbpName}” still open; reusing it`, 'afp');
+      return this.sessionInfo(this.remote);
+    }
     const list = this.nbp ? await this.nbp.lookup('=', 'AFPServer') : [];
     const h =
       list.find((x) => x.object === ep.id || x.object === ep.title) ??
@@ -137,11 +145,22 @@ export class AfpFinderHost implements FinderHost {
     this.remote = await AfpClient.openSession(this.atp, h.network, h.node, h.socket || asp.DefaultSLS);
     this.remoteNbpName = h.object;
     this.attachRemoteNotices(this.remote);
+    return this.sessionInfo(this.remote);
+  }
+
+  /** Does `ep` name the server the current session is open to? */
+  private matchesRemote(ep: RemoteEndpoint): boolean {
+    const name = this.remoteNbpName;
+    if (!name) return false;
+    return name === ep.id || name === ep.title || name.toLowerCase() === ep.title.toLowerCase();
+  }
+
+  private sessionInfo(client: AfpClient): SessionInfo {
     return {
-      serverName: this.remote.serverName,
-      volumes: [],
-      allowGuest: this.remote.uams.some((u) => /no user authent/i.test(u)),
-      uams: this.remote.uams,
+      serverName: client.serverName,
+      volumes: client.volumes.map((v) => v.name),
+      allowGuest: client.uams.some((u) => /no user authent/i.test(u)),
+      uams: client.uams,
     };
   }
 

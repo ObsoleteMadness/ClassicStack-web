@@ -4606,7 +4606,7 @@ export class FinderWindow extends HTMLElement {
         this.remoteLoggedIn = true;
         try {
           const info = await this.host.beginRemote(s);
-          this.knownVolumes.set(s.id, [...(info.volumes ?? [])]);
+          if (info.volumes.length) this.knownVolumes.set(s.id, [...info.volumes]);
           this.adoptEndpoint(s, { title: info.serverName || s.title });
         } catch {
           /* keep cached volumes */
@@ -4616,29 +4616,39 @@ export class FinderWindow extends HTMLElement {
           this.remoteVolumes = [...this.remoteVolumes, wantVol];
           this.knownVolumes.set(s.id, [...this.remoteVolumes]);
         }
-        if (wantVol) {
-          await this.mountRemoteVolume(wantVol);
+        if (!wantVol) {
+          if (isCatalogEndpoint(s)) {
+            try {
+              await this.openCatalogVolume(s);
+              ok = true;
+              return true;
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              log.error(`Open volume failed: ${msg}`, s.kind);
+              this.setStatus(`Open volume failed: ${msg}`);
+              await this.restoreAfterFailedConnect();
+              return false;
+            }
+          }
+          this.remoteOpen = false;
+          this.renderSidebar();
+          await this.restoreListingIfIdle();
           ok = true;
           return true;
         }
-        if (isCatalogEndpoint(s)) {
-          try {
-            await this.openCatalogVolume(s);
-            ok = true;
-            return true;
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            log.error(`Open volume failed: ${msg}`, s.kind);
-            this.setStatus(`Open volume failed: ${msg}`);
-            await this.restoreAfterFailedConnect();
-            return false;
-          }
+        try {
+          await this.mountRemoteVolume(wantVol);
+          ok = true;
+          return true;
+        } catch (err) {
+          // The remembered login is no longer good — the server dropped the
+          // session, or the host had to reopen it. Sign in again rather than
+          // leaving the share unopenable until the user disconnects by hand.
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`Cached session for “${s.title}” is stale (${msg}); signing in again`, s.kind);
+          this.loggedInEndpoints.delete(s.id);
+          await this.host.closeRemote().catch(() => undefined);
         }
-        this.remoteOpen = false;
-        this.renderSidebar();
-        await this.restoreListingIfIdle();
-        ok = true;
-        return true;
       }
 
       log.info(`Connecting to ${s.kind} “${s.title}” (${s.id})`, s.kind);
