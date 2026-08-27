@@ -1233,6 +1233,10 @@ finder-window.is-dragging .finder-chrome {
   background: linear-gradient(160deg, #7a9bbe, #45627a);
 }
 
+.preview-glyph--multi {
+  background: linear-gradient(160deg, #8a8f99, #565c66);
+}
+
 .preview-title {
   font-size: 13px;
   font-weight: 600;

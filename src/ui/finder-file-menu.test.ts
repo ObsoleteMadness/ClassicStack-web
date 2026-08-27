@@ -6,6 +6,7 @@ function host() {
     finder: {
       selectionSupportsPreview: () => true,
       canCloseMountedShare: () => false,
+      selectionCount: () => 1,
       menuNewFolder: vi.fn(),
       menuOpenPreview: vi.fn(),
       menuDownloadZip: vi.fn(),
@@ -33,5 +34,13 @@ describe('File menu', () => {
   it('shows close share for mounted volumes', () => {
     const html = fileMenuInnerHTML({ finder: { ...host().finder, canCloseMountedShare: () => true } as never }, false);
     expect(html).toContain('Close Share');
+  });
+
+  it('disables rename and relabels bulk actions when multiple items are selected', () => {
+    const html = fileMenuInnerHTML({ finder: { ...host().finder, selectionCount: () => 3 } as never }, false);
+    expect(html).toContain('Get Info (3 items)');
+    expect(html).toContain('Delete 3 Items');
+    const renameMatch = html.match(/data-act="rename"[^>]*/);
+    expect(renameMatch?.[0]).toContain('disabled');
   });
 });

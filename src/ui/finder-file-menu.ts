@@ -39,6 +39,8 @@ export function fileMenuInnerHTML(host: FileMenuHost, open: boolean): string {
   const finder = host.finder;
   const previewOk = finder.selectionSupportsPreview();
   const closeShare = finder.canCloseMountedShare();
+  const count = finder.selectionCount();
+  const multi = count > 1;
   return `
       <button type="button" class="app-menu__trigger" data-act="toggle-file" aria-haspopup="true" aria-expanded="${open}">
         File
@@ -48,9 +50,9 @@ export function fileMenuInnerHTML(host: FileMenuHost, open: boolean): string {
         ${menuItem({ act: 'open-preview', label: 'Open Preview', disabled: !previewOk, shortcut: ['Space'] })}
         ${menuItem({ act: 'download-zip', label: 'Download Zip' })}
         <hr />
-        ${menuItem({ act: 'get-info', label: 'Get Info', shortcut: ['mod', 'I'] })}
-        ${menuItem({ act: 'rename', label: 'Rename', shortcut: ['Enter'] })}
-        ${menuItem({ act: 'delete', label: 'Delete', shortcut: ['mod', 'Backspace'] })}
+        ${menuItem({ act: 'get-info', label: multi ? `Get Info (${count} items)` : 'Get Info', shortcut: ['mod', 'I'] })}
+        ${menuItem({ act: 'rename', label: 'Rename', disabled: multi, shortcut: ['Enter'] })}
+        ${menuItem({ act: 'delete', label: multi ? `Delete ${count} Items` : 'Delete', shortcut: ['mod', 'Backspace'] })}
         ${closeShare ? `<hr />${menuItem({ act: 'close-share', label: 'Close Share' })}` : ''}
       </div>
     `;

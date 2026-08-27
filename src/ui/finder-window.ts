@@ -16,7 +16,7 @@ import type {
 } from './finder-host';
 import { decodeMacRoman } from '../protocol/macroman';
 import { buildAppleDouble, zipSidecarPath, zipStore, type ZipExportStyle } from '../fs/appledouble';
-import { collectZipEntries, enumerateZipFiles } from '../fs/zip-export';
+import { collectZipEntries, enumerateZipFiles, type ZipFilePlan } from '../fs/zip-export';
 import { formatBytes } from './format-bytes';
 import {
   iconCache,
@@ -195,6 +195,10 @@ export class FinderWindow extends HTMLElement {
   /** For column view: one column of children per pathStack entry. */
   private columnChildren: VNode[][] = [];
   private selectedId: NodeRef | null = null;
+  /** Full multi-selection; always a superset containing `selectedId` (the anchor/primary item). */
+  private selectedIds = new Set<NodeRef>();
+  /** Range-select (shift-click) start; separate from `selectedId` so repeated shift-clicks re-range from it. */
+  private selectionAnchorId: NodeRef | null = null;
   private nodes: VNode[] = [];
   private servers: RemoteEndpoint[] = [];
   private source: 'local' | 'remote' = 'local';
@@ -447,7 +451,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   selectionSupportsPreview(): boolean {
-    if (this.selectedId == null) return false;
+    if (this.selectedId == null || this.selectedIds.size > 1) return false;
     const node = this.findNodeAnywhere(this.selectedId);
     return this.isPreviewable(node);
   }
@@ -565,7 +569,7 @@ export class FinderWindow extends HTMLElement {
     this.source = source;
     this.cwd = cat.rootId();
     this.pathStack = [{ id: this.cwd, name: rootName }];
-    this.selectedId = null;
+    this.clearSelection();
     this.renamingId = null;
     this.showProps = false;
   }
@@ -1078,7 +1082,7 @@ export class FinderWindow extends HTMLElement {
     let bounceToLocal = false;
     try {
       this.view = state.view;
-      this.selectedId = null;
+      this.clearSelection();
       if (state.source === 'remote') {
         const target = state.vol ? `${state.share}:${state.vol}` : state.share || 'remote share';
         if (!state.share || !state.vol) {
@@ -1166,7 +1170,7 @@ export class FinderWindow extends HTMLElement {
     this.remoteOpen = false;
     this.cwd = this.vfs.rootId();
     this.pathStack = [{ id: this.cwd, name: '' }];
-    this.selectedId = null;
+    this.clearSelection();
     this.renamingId = null;
     this.showProps = false;
     this.nodes = [];
@@ -1492,6 +1496,104 @@ export class FinderWindow extends HTMLElement {
   private selectedNode(): VNode | null {
     if (this.selectedId == null) return null;
     return this.findNodeAnywhere(this.selectedId);
+  }
+
+  /** Number of items in the current multi-selection (0, 1, or many). */
+  selectionCount(): number {
+    return this.selectedIds.size;
+  }
+
+  /** Resolved VNodes for every selected id (skips ids that can't be resolved, e.g. stale). */
+  private selectedNodes(): VNode[] {
+    const out: VNode[] = [];
+    for (const id of this.selectedIds) {
+      const n = this.findNodeAnywhere(id);
+      if (n) out.push(n);
+    }
+    return out;
+  }
+
+  private clearSelection(): void {
+    this.selectedId = null;
+    this.selectedIds.clear();
+    this.selectionAnchorId = null;
+  }
+
+  private selectOnly(id: NodeRef | null): void {
+    if (id == null) {
+      this.clearSelection();
+      return;
+    }
+    this.selectedId = id;
+    this.selectedIds = new Set([id]);
+    this.selectionAnchorId = id;
+  }
+
+  /** All ids in DOM order among `[data-id]` elements under `scope` (used for shift-range select). */
+  private orderedIdsInScope(scope: Element): NodeRef[] {
+    const out: NodeRef[] = [];
+    scope.querySelectorAll('[data-id]').forEach((el) => {
+      const id = dataRef(el);
+      if (id != null) out.push(id);
+    });
+    return out;
+  }
+
+  /** Apply a ⌘/Ctrl-click (toggle) or Shift-click (range) selection change within `scope`. */
+  private applyMultiSelectClick(id: NodeRef, scope: Element, opts: { mod: boolean; range: boolean }): void {
+    if (opts.range) {
+      const anchor = this.selectionAnchorId ?? this.selectedId ?? id;
+      const ids = this.orderedIdsInScope(scope);
+      const a = ids.indexOf(anchor);
+      const b = ids.indexOf(id);
+      if (a >= 0 && b >= 0) {
+        const [lo, hi] = a <= b ? [a, b] : [b, a];
+        this.selectedIds = new Set(ids.slice(lo, hi + 1));
+      } else {
+        this.selectedIds = new Set([id]);
+      }
+      this.selectedId = id;
+    } else {
+      if (this.selectedIds.has(id)) {
+        this.selectedIds.delete(id);
+        const remaining = [...this.selectedIds];
+        this.selectedId = remaining.length ? remaining[remaining.length - 1]! : null;
+      } else {
+        this.selectedIds.add(id);
+        this.selectedId = id;
+      }
+      this.selectionAnchorId = id;
+    }
+    this.paintMultiSelection(scope);
+  }
+
+  /** Repaint selection highlighting within `scope` after a multi-select click, without a full re-render. */
+  private paintMultiSelection(scope: Element): void {
+    const keys = new Set(Array.from(this.selectedIds, refKey));
+    scope.querySelectorAll('[data-id]').forEach((el) => {
+      const k = el.getAttribute('data-id');
+      el.classList.toggle('selected', !!k && keys.has(k));
+    });
+    this.syncClipboardButtons();
+    this.syncResourceExplorer();
+    if (this.showProps) this.refreshPropsPanel();
+  }
+
+  /** True only when every selected item is an expandable archive (and at least one is selected). */
+  private allSelectedExpandable(): boolean {
+    const nodes = this.selectedNodes();
+    return nodes.length > 0 && nodes.every((n) => this.isExpandableArchive(n));
+  }
+
+  /** Is `key` (a ListItem/NodeRef key) part of the current selection — single or multi. */
+  private isKeySelected(key: string): boolean {
+    if (this.selectedIds.size > 1) {
+      for (const id of this.selectedIds) {
+        if (refKey(id) === key) return true;
+      }
+      return false;
+    }
+    return this.selectedId != null && key === refKey(this.selectedId);
   }
 
   private findNodeAnywhere(id: NodeRef): VNode | null {
@@ -1986,7 +2088,7 @@ export class FinderWindow extends HTMLElement {
         </table>`;
       } else {
         content.innerHTML = `<div class="column-view"><div class="column">${items
-          .map((it) => this.colItemHtml(it, 0, this.selectedId))
+          .map((it) => this.colItemHtml(it, 0, this.selectedIds))
           .join('')}</div></div>`;
       }
     }
@@ -2027,6 +2129,11 @@ export class FinderWindow extends HTMLElement {
     }
     const win = this.getInfoWindow;
     if (!win) return;
+    if (this.selectedIds.size > 1) {
+      win.setBody(this.multiSelectionInfoHtml({ variant: 'dialog' }));
+      win.show();
+      return;
+    }
     const sel = this.selectedNode();
     win.setBody(
       sel
@@ -2120,16 +2227,20 @@ export class FinderWindow extends HTMLElement {
 
     for (let colIndex = 0; colIndex < listColCount; colIndex++) {
       const kids = this.columnChildren[colIndex]!;
-      const selectedInColumn = this.columnSelectionId(colIndex, kids, listColCount);
+      const selectedInColumn = this.columnSelectionIds(colIndex, kids, listColCount);
       view.querySelectorAll(`[data-col-index="${colIndex}"] .col-item[data-id]`).forEach((el) => {
         const id = dataRef(el);
-        el.classList.toggle('selected', selectedInColumn != null && id === selectedInColumn);
+        el.classList.toggle('selected', id != null && selectedInColumn.has(id));
       });
     }
 
-    const preview = this.columnLoading ? null : this.columnPreviewNode();
+    const multi = this.selectedIds.size > 1;
+    const preview = this.columnLoading || multi ? null : this.columnPreviewNode();
     const existing = view.querySelector('[data-preview]') as HTMLElement | null;
-    if (!preview) {
+    if (multi) {
+      existing?.remove();
+      view.insertAdjacentHTML('beforeend', this.multiSelectionInfoHtml({ variant: 'column' }));
+    } else if (!preview) {
       existing?.remove();
     } else if (existing?.getAttribute('data-id') !== refKey(nodeRef(preview))) {
       existing?.remove();
@@ -2167,7 +2278,7 @@ export class FinderWindow extends HTMLElement {
       <div class="icon-name"><span class="item-label">Loading…</span></div>
     </div>`;
     }
-    const sel = this.selectedId != null && it.key === refKey(this.selectedId) ? 'selected' : '';
+    const sel = this.isKeySelected(it.key) ? 'selected' : '';
     const drag = it.writing && !it.node ? '' : 'draggable="true"';
     const write = this.writeItemAttrs(it);
     return `<div class="icon-item ${sel}${it.writing ? ' writing' : ''}" data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" ${write} ${drag}>
@@ -2184,7 +2295,7 @@ export class FinderWindow extends HTMLElement {
       <td></td>
     </tr>`;
     }
-    const sel = this.selectedId != null && it.key === refKey(this.selectedId) ? 'selected' : '';
+    const sel = this.isKeySelected(it.key) ? 'selected' : '';
     const id = itemAddr(it);
     const expanded = it.isDir && id != null && this.expandedIds.has(id);
     const loading = it.isDir && id != null && this.loadingIds.has(id);
@@ -2202,13 +2313,14 @@ export class FinderWindow extends HTMLElement {
     </tr>`;
   }
 
-  private colItemHtml(it: ListItem, colIndex: number, selectedInColumn: NodeRef | null): string {
+  private colItemHtml(it: ListItem, colIndex: number, selectedInColumn: Set<NodeRef>): string {
     if (it.placeholder) {
       return `<div class="col-item col-item--listing" aria-busy="true" aria-label="Loading">
       ${this.listingSpinnerHtml('col')}<span class="col-name item-label">Loading…</span>
     </div>`;
     }
-    const sel = selectedInColumn != null && it.key === refKey(selectedInColumn) ? 'selected' : '';
+    const id = itemAddr(it);
+    const sel = id != null && selectedInColumn.has(id) ? 'selected' : '';
     const drag = it.writing && !it.node ? '' : 'draggable="true"';
     const write = this.writeItemAttrs(it);
     const label = this.nameLabelHtml(it, 'col-name');
@@ -2490,14 +2602,19 @@ export class FinderWindow extends HTMLElement {
     }
   }
 
-  /** Id to highlight in a column: path crumb, or leaf file selection in the deepest list column. */
-  private columnSelectionId(colIndex: number, kids: VNode[], listColCount: number): NodeRef | null {
+  /** Ids to highlight in a column: the path crumb, or the (possibly multi-) selection in the deepest list column. */
+  private columnSelectionIds(colIndex: number, kids: VNode[], listColCount: number): Set<NodeRef> {
     const pathSel = this.pathStack[colIndex + 1]?.id ?? null;
-    if (pathSel != null) return pathSel;
-    if (colIndex === listColCount - 1 && this.selectedId != null) {
-      if (kids.some((k) => nodeRef(k) === this.selectedId)) return this.selectedId;
+    if (pathSel != null) return new Set([pathSel]);
+    if (colIndex === listColCount - 1 && this.selectedIds.size > 0) {
+      const kidIds = new Set(kids.map((k) => nodeRef(k)));
+      const out = new Set<NodeRef>();
+      for (const id of this.selectedIds) {
+        if (kidIds.has(id)) out.add(id);
+      }
+      return out;
     }
-    return null;
+    return new Set();
   }
 
   private columnPreviewNode(): VNode | null {
@@ -2639,6 +2756,50 @@ export class FinderWindow extends HTMLElement {
         <div data-role="comment-slot">${caps.resourceFork ? this.commentRowHtml(node) : ''}</div>
       </div>
       ${typeCreatorFields}
+      ${paneClose}
+      ${resizer}
+    </div>`;
+  }
+
+  /** Info/preview panel shown in place of `itemInfoHtml` when multiple items are selected. */
+  private multiSelectionInfoHtml(opts: { variant: 'column' | 'dialog' }): string {
+    const nodes = this.selectedNodes();
+    const count = this.selectedIds.size;
+    const caps = this.vfs.capabilities();
+    const folders = nodes.filter((n) => n.isDir).length;
+    const files = nodes.length - folders;
+    const kindLabel =
+      files && folders
+        ? `${files} file${files === 1 ? '' : 's'}, ${folders} folder${folders === 1 ? '' : 's'}`
+        : folders
+          ? `${folders} folder${folders === 1 ? '' : 's'}`
+          : `${files} file${files === 1 ? '' : 's'}`;
+    const totalBytes = nodes.reduce((sum, n) => sum + nodeByteSize(n, caps.resourceFork), 0);
+    const shellClass =
+      opts.variant === 'column' ? 'column column-preview item-info' : 'item-info item-info--dialog';
+    const colAttrs = opts.variant === 'column' ? ` style="${this.colWidthStyle('preview')}"` : '';
+    const resizer = opts.variant === 'column' ? this.colResizerHtml('preview') : '';
+    const paneOpen = opts.variant === 'column' ? `<div class="column-pane">` : '';
+    const paneClose = opts.variant === 'column' ? `</div>` : '';
+    const expandBtn = this.allSelectedExpandable()
+      ? `<button type="button" class="btn" data-act="expand">Expand</button>`
+      : '';
+    return `<div class="${shellClass}" data-preview data-preview-multi="1"${colAttrs}>
+      ${paneOpen}
+      <div class="preview-hero">
+        <div class="preview-glyph preview-glyph--multi"></div>
+        <div class="preview-title">${count} items selected</div>
+      </div>
+      <div class="preview-meta">
+        <div class="preview-row"><span>Kind</span><span>${this.escape(kindLabel)}</span></div>
+        <div class="preview-row"><span>Size</span><span>${formatBytes(totalBytes)}</span></div>
+      </div>
+      <div class="preview-fields">
+        <div class="preview-actions">
+          ${expandBtn}
+          <button type="button" class="btn" data-act="download">Download Zip</button>
+        </div>
+      </div>
       ${paneClose}
       ${resizer}
     </div>`;
@@ -2880,19 +3041,19 @@ export class FinderWindow extends HTMLElement {
     return el;
   }
 
-  private columnPaneBody(kids: VNode[], colIndex: number, selectedId: NodeRef | null): string {
+  private columnPaneBody(kids: VNode[], colIndex: number, selectedIds: Set<NodeRef>): string {
     const parentId = this.pathStack[colIndex]?.id ?? this.cwd;
     const items = this.mergeWritingItems(parentId, kids.map((n) => this.listItemFromNode(n)));
     if (items.length === 0) {
       return `<div class="empty" style="padding:16px;font-size:12px">Empty</div>`;
     }
-    return items.map((it) => this.colItemHtml(it, colIndex, selectedId)).join('');
+    return items.map((it) => this.colItemHtml(it, colIndex, selectedIds)).join('');
   }
 
   /** Replace a loading column (or refresh its pane) without remounting earlier columns. */
   private paintColumnKids(view: Element, parentColIndex: number, kids: VNode[]): void {
     const colIndex = parentColIndex + 1;
-    const body = this.columnPaneBody(kids, colIndex, null);
+    const body = this.columnPaneBody(kids, colIndex, new Set());
     const loadingCol = view.querySelector('.column--loading');
     if (loadingCol) {
       loadingCol.replaceWith(this.mountColumnEl(colIndex, body));
@@ -2959,7 +3120,7 @@ export class FinderWindow extends HTMLElement {
     const listColCount = this.columnChildren.length;
     const cols = this.columnChildren
       .map((kids, colIndex) => {
-        const selectedInColumn = this.columnSelectionId(colIndex, kids, listColCount);
+        const selectedInColumn = this.columnSelectionIds(colIndex, kids, listColCount);
         const parentId = this.pathStack[colIndex]?.id ?? this.cwd;
         const items = this.mergeWritingItems(parentId, kids.map((n) => this.listItemFromNode(n)));
         const body =
@@ -2973,8 +3134,13 @@ export class FinderWindow extends HTMLElement {
     const loadingCol = this.columnLoading
       ? this.columnLoadingHtml(listColCount)
       : '';
-    const preview = this.columnLoading ? null : this.columnPreviewNode();
-    const previewCol = preview ? this.itemInfoHtml(preview, { variant: 'column' }) : '';
+    const multi = this.selectedIds.size > 1;
+    const preview = this.columnLoading || multi ? null : this.columnPreviewNode();
+    const previewCol = multi
+      ? this.multiSelectionInfoHtml({ variant: 'column' })
+      : preview
+        ? this.itemInfoHtml(preview, { variant: 'column' })
+        : '';
     return `<div class="column-view">${cols}${loadingCol}${previewCol}</div>`;
   }
 
@@ -2986,7 +3152,7 @@ export class FinderWindow extends HTMLElement {
     const parentId = this.pathStack[colIndex]?.id ?? this.enumeratingFolderId ?? this.cwd;
     const items = this.mergeWritingItems(parentId, []);
     const body = [...items, this.listingPlaceholderItem()]
-      .map((it) => this.colItemHtml(it, colIndex, null))
+      .map((it) => this.colItemHtml(it, colIndex, new Set()))
       .join('');
     return this.columnHtml(colIndex, body, 'column--loading');
   }
@@ -3207,7 +3373,7 @@ export class FinderWindow extends HTMLElement {
       e.stopPropagation();
       const id = parseRefKey(disclose.getAttribute('data-disclose'));
       if (id == null) return;
-      this.selectedId = id;
+      this.selectOnly(id);
       const row = disclose.closest('[data-id]') as HTMLElement | null;
       if (row) this.paintSelection(row);
       await this.toggleExpand(id);
@@ -3221,8 +3387,18 @@ export class FinderWindow extends HTMLElement {
     const id = dataRef(item);
     if (id == null) return;
     const isDir = item.getAttribute('data-dir') === '1';
-    const wasSelected = this.selectedId === id;
-    this.selectedId = id;
+    const mod = e.metaKey || e.ctrlKey;
+    const range = e.shiftKey && !mod;
+
+    if (mod || range) {
+      const scope =
+        this.view === 'column' ? (item.closest('[data-col-index]') ?? this.contentEl()) : this.contentEl();
+      if (scope) this.applyMultiSelectClick(id, scope, { mod, range });
+      return;
+    }
+
+    const wasSelected = this.selectedId === id && this.selectedIds.size === 1;
+    this.selectOnly(id);
 
     if (isCompactUi() && this.view !== 'column' && isDir && wasSelected) {
       const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
@@ -3337,7 +3513,7 @@ export class FinderWindow extends HTMLElement {
       return;
     }
     this.expandedIds.add(id);
-    this.selectedId = id;
+    this.selectOnly(id);
     if (row) {
       this.paintSelection(row);
       if (this.dragDepth === 0 && this.dragNodeId == null) row.classList.remove('drop-target');
@@ -3467,7 +3643,7 @@ export class FinderWindow extends HTMLElement {
     const openedId = nodeRef(node);
     this.cwd = nodeRef(node);
     this.pathStack.push({ id: nodeRef(node), name: node.name });
-    this.selectedId = null;
+    this.clearSelection();
     this.syncResourceExplorer();
     this.expandedIds.clear();
     this.folderOpening = true;
@@ -3510,7 +3686,9 @@ export class FinderWindow extends HTMLElement {
     this.dragNodeId = id;
     this.dragNode = this.findNodeAnywhere(id);
     this.dragCatalog = this.vfs;
-    this.selectedId = id;
+    // Dragging an item outside the current multi-selection replaces it; dragging
+    // a selected item keeps the whole selection intact (matches Finder/Explorer).
+    if (!this.selectedIds.has(id)) this.selectOnly(id);
     e.dataTransfer?.setData('application/x-cs-node', String(id));
     e.dataTransfer!.effectAllowed = 'copyMove';
     item.classList.add('dragging');
@@ -4033,7 +4211,7 @@ export class FinderWindow extends HTMLElement {
     const openedId = nodeRef(node);
     this.cwd = nodeRef(node);
     this.pathStack.push({ id: nodeRef(node), name: node.name });
-    this.selectedId = null;
+    this.clearSelection();
     this.expandedIds.clear();
     await this.reload();
     if (this.cwd !== openedId) return;
@@ -4058,7 +4236,7 @@ export class FinderWindow extends HTMLElement {
     this.pathStack = this.pathStack.slice(0, colIndex + 1);
     this.pathStack.push({ id: nodeRef(node), name: node.name });
     this.cwd = nodeRef(node);
-    this.selectedId = null;
+    this.clearSelection();
     this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
 
     const view = this.querySelector('.column-view');
@@ -4536,7 +4714,7 @@ export class FinderWindow extends HTMLElement {
     this.remoteBusy = true;
     this.folderOpening = true;
     this.nodes = [];
-    this.selectedId = null;
+    this.clearSelection();
     if (this.view === 'column') {
       this.columnLoading = true;
       this.columnChildren = [];
@@ -4898,6 +5076,7 @@ export class FinderWindow extends HTMLElement {
     if (this.view === next) return;
     this.view = next;
     const keep = this.selectedId;
+    const keepIds = this.selectedIds;
     const node =
       keep != null ? (this.findNodeAnywhere(keep) ?? (await this.vfs.get(keep))) : null;
     if (node) {
@@ -4908,6 +5087,7 @@ export class FinderWindow extends HTMLElement {
       await this.refreshColumns(this.cwd);
     }
     this.selectedId = keep;
+    this.selectedIds = keepIds;
     this.syncHistory(replaceHistory);
     this.render();
     this.scrollSelectedIntoView();
@@ -4968,11 +5148,13 @@ export class FinderWindow extends HTMLElement {
 
   private async enterFolderKeepingSelection(folder: VNode): Promise<void> {
     const keep = this.selectedId;
+    const keepIds = this.selectedIds;
     if (this.cwd === nodeRef(folder) && this.pathStack[this.pathStack.length - 1]?.id === nodeRef(folder)) {
       if (this.view === 'column' && this.columnChildren.length === 0) {
         await this.refreshColumns(this.cwd);
       }
       this.selectedId = keep;
+      this.selectedIds = keepIds;
       return;
     }
     this.pathStack = await this.pathStackToFolder(nodeRef(folder));
@@ -4980,6 +5162,7 @@ export class FinderWindow extends HTMLElement {
     this.expandedIds.clear();
     await this.reload();
     this.selectedId = keep;
+    this.selectedIds = keepIds;
   }
 
   private async pathStackToFolder(folderId: NodeRef): Promise<{ id: NodeRef; name: string }[]> {
@@ -5012,7 +5195,7 @@ export class FinderWindow extends HTMLElement {
     this.pathStack = this.pathStack.slice(0, index + 1);
     const destId = this.pathStack[this.pathStack.length - 1]!.id;
     this.cwd = destId;
-    this.selectedId = null;
+    this.clearSelection();
     await this.reload();
     if (this.cwd !== destId) return;
     this.renderPath();
@@ -5052,7 +5235,9 @@ export class FinderWindow extends HTMLElement {
   }
 
   private startRename(): void {
-    if (this.selectedId == null) return;
+    // Renaming only makes sense for a single item — matches Finder, which
+    // disables Rename whenever more than one item is selected.
+    if (this.selectedId == null || this.selectedIds.size > 1) return;
     this.renamingId = this.selectedId;
     this.renderContent();
   }
@@ -5067,8 +5252,20 @@ export class FinderWindow extends HTMLElement {
     return isExpandableArchive(node.name, node.finderInfo, node.data);
   }
 
-  private async expandArchive(id: NodeRef | null = this.selectedId): Promise<void> {
-    if (id == null) return;
+  /** Expand the given target — or, when it's part of the current multi-selection and every
+   * selected item is an expandable archive, expand all of them in turn. */
+  private async expandArchive(targetId: NodeRef | null = this.selectedId): Promise<void> {
+    if (targetId == null) return;
+    const ids =
+      this.selectedIds.size > 1 && this.selectedIds.has(targetId) && this.allSelectedExpandable()
+        ? [...this.selectedIds]
+        : [targetId];
+    for (const id of ids) {
+      await this.expandOne(id);
+    }
+  }
+
+  private async expandOne(id: NodeRef): Promise<void> {
     const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
     if (!node || node.isDir) return;
     const fail = (err?: unknown): void => {
@@ -5344,38 +5541,50 @@ export class FinderWindow extends HTMLElement {
 
   private async captureSelection(mode: 'cut' | 'copy'): Promise<void> {
     if (this.selectedId == null) return;
-    const node = this.findNodeAnywhere(this.selectedId) ?? (await this.vfs.get(this.selectedId));
-    if (!node) return;
+    const ids = this.selectedIds.size > 1 ? [...this.selectedIds] : [this.selectedId];
+    const nodes: VNode[] = [];
+    for (const id of ids) {
+      const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+      if (node) nodes.push(node);
+    }
+    if (!nodes.length) return;
     this.setStatus(mode === 'cut' ? 'Cutting…' : 'Copying…', { busy: true });
-    const jobId = this.startTransfer(node.name, node.isDir, nodeByteSize(node), node.finderInfo);
-    const signal = transferActivity.signal(jobId);
+    const items: ClipNode[] = [];
+    const sourceIds: NodeRef[] = [];
     try {
-      const item = await transferActivity.withCopySlot(jobId, () =>
-        this.snapshotNode(
-          this.vfs,
-          node,
-          this.vfs.reportsChunkedBytes
-            ? (n) => {
-                throwIfAborted(signal);
-                transferActivity.addBytes(jobId, n);
-              }
-            : undefined,
-          signal,
-        ),
-      );
-      await transferActivity.settle(jobId);
-      this.clipboard = {
-        mode,
-        items: [item],
-        source: this.vfs,
-        sourceIds: [nodeRef(node)],
-      };
+      for (const node of nodes) {
+        const jobId = this.startTransfer(node.name, node.isDir, nodeByteSize(node), node.finderInfo);
+        const signal = transferActivity.signal(jobId);
+        try {
+          const item = await transferActivity.withCopySlot(jobId, () =>
+            this.snapshotNode(
+              this.vfs,
+              node,
+              this.vfs.reportsChunkedBytes
+                ? (n) => {
+                    throwIfAborted(signal);
+                    transferActivity.addBytes(jobId, n);
+                  }
+                : undefined,
+              signal,
+            ),
+          );
+          await transferActivity.settle(jobId);
+          items.push(item);
+          sourceIds.push(nodeRef(node));
+        } catch (err) {
+          await transferActivity.settle(jobId, err);
+          throw err;
+        }
+      }
+      this.clipboard = { mode, items, source: this.vfs, sourceIds };
       this.syncClipboardButtons();
       this.setStatus(
-        `${mode === 'cut' ? 'Cut' : 'Copied'} “${node.name}” — paste in this share or another`,
+        nodes.length === 1
+          ? `${mode === 'cut' ? 'Cut' : 'Copied'} “${nodes[0]!.name}” — paste in this share or another`
+          : `${mode === 'cut' ? 'Cut' : 'Copied'} ${nodes.length} items — paste in this share or another`,
       );
     } catch (err) {
-      await transferActivity.settle(jobId, err);
       if (isTransferCancelled(err)) {
         this.setStatus('Transfer cancelled');
         return;
@@ -5430,7 +5639,7 @@ export class FinderWindow extends HTMLElement {
   private async onMkdir(): Promise<void> {
     const name = await this.uniqueChildName(this.cwd, this.catalogName('New folder'));
     const node = await this.withOwnVfsMutation(() => this.vfs.mkdir(this.cwd, name));
-    this.selectedId = nodeRef(node);
+    this.selectOnly(nodeRef(node));
     this.renamingId = nodeRef(node);
     await this.reload();
     this.renderContent();
@@ -5447,12 +5656,20 @@ export class FinderWindow extends HTMLElement {
 
   private async onDelete(): Promise<void> {
     if (this.selectedId == null) return;
-    const id = this.selectedId;
-    const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
-    if (!node) return;
-    if (!confirm(`Delete “${node.name}”?`)) return;
-    await this.withOwnVfsMutation(() => this.vfs.remove(id));
-    this.selectedId = null;
+    const ids = this.selectedIds.size > 1 ? [...this.selectedIds] : [this.selectedId];
+    const nodes: { id: NodeRef; node: VNode }[] = [];
+    for (const id of ids) {
+      const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+      if (node) nodes.push({ id, node });
+    }
+    if (!nodes.length) return;
+    const prompt =
+      nodes.length === 1 ? `Delete “${nodes[0]!.node.name}”?` : `Delete ${nodes.length} items?`;
+    if (!confirm(prompt)) return;
+    for (const { id } of nodes) {
+      await this.withOwnVfsMutation(() => this.vfs.remove(id));
+    }
+    this.clearSelection();
     this.showProps = false;
     this.closePreview();
     this.syncPropsButton();
@@ -5461,39 +5678,71 @@ export class FinderWindow extends HTMLElement {
     this.renderContent();
   }
 
+  /** Selected nodes to act on, or (when nothing's selected) the current folder itself. */
+  private async downloadTargets(): Promise<VNode[]> {
+    const ids = this.selectedIds.size > 1 ? [...this.selectedIds] : this.selectedId != null ? [this.selectedId] : [];
+    const nodes: VNode[] = [];
+    for (const id of ids) {
+      const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+      if (node) nodes.push(node);
+    }
+    if (nodes.length) return nodes;
+    const cur = await this.vfs.get(this.cwd);
+    return cur ? [cur] : [];
+  }
+
   private async onDownload(): Promise<void> {
-    const node =
-      this.selectedId != null
-        ? (this.findNodeAnywhere(this.selectedId) ?? (await this.vfs.get(this.selectedId)))
-        : await this.vfs.get(this.cwd);
-    if (!node) {
+    const nodes = await this.downloadTargets();
+    if (!nodes.length) {
       this.setStatus('Nothing to download');
       return;
     }
-    const zipName = node.name || 'archive';
-    const jobId = this.startTransfer(zipName, node.isDir, node.isDir ? 0 : nodeByteSize(node), node.finderInfo);
+    const single = nodes.length === 1 ? nodes[0]! : null;
+    const zipName = single?.name || 'Archive';
+    const guessBytes = nodes.reduce((sum, n) => sum + (n.isDir ? 0 : nodeByteSize(n)), 0);
+    const jobId = this.startTransfer(
+      zipName,
+      single ? single.isDir : true,
+      single && !single.isDir ? guessBytes : 0,
+      single?.finderInfo,
+    );
     const signal = transferActivity.signal(jobId);
     try {
       const entries = await transferActivity.withCopySlot(jobId, async () => {
         throwIfAborted(signal);
-        let files;
-        if (node.isDir) {
-          transferActivity.setDetail(jobId, TRANSFER_DETAIL_SEARCHING);
-          const listed = await enumerateZipFiles(
-            this.vfs,
-            node,
-            '',
-            (p) => {
-              throwIfAborted(signal);
-              transferActivity.setFound(jobId, p.items, p.bytes);
-            },
-            signal,
-          );
-          throwIfAborted(signal);
-          transferActivity.setBytes(jobId, 0, listed.bytes, '');
-          files = listed.files;
+        let files: ZipFilePlan[];
+        if (single && !single.isDir) {
+          files = [{ node: single, path: single.name, bytes: nodeByteSize(single) }];
         } else {
-          files = [{ node, path: node.name, bytes: nodeByteSize(node) }];
+          transferActivity.setDetail(jobId, TRANSFER_DETAIL_SEARCHING);
+          files = [];
+          let items = 0;
+          let bytes = 0;
+          for (const node of nodes) {
+            if (node.isDir) {
+              const listed = await enumerateZipFiles(
+                this.vfs,
+                node,
+                '',
+                (p) => {
+                  throwIfAborted(signal);
+                  transferActivity.setFound(jobId, items + p.items, bytes + p.bytes);
+                },
+                signal,
+              );
+              throwIfAborted(signal);
+              files.push(...listed.files);
+              items += listed.items;
+              bytes += listed.bytes;
+            } else {
+              const size = nodeByteSize(node);
+              files.push({ node, path: node.name, bytes: size });
+              items++;
+              bytes += size;
+              transferActivity.setFound(jobId, items, bytes);
+            }
+          }
+          transferActivity.setBytes(jobId, 0, bytes, '');
         }
         return collectZipEntries(
           this.vfs,
@@ -5687,20 +5936,22 @@ export class FinderWindow extends HTMLElement {
       return;
     }
     const sel = this.selectedNode();
+    const multi = this.selectedIds.size > 1;
+    const count = this.selectedIds.size;
     const items =
       sel != null
         ? [
-            this.isExpandableArchive(sel)
+            (multi ? this.allSelectedExpandable() : this.isExpandableArchive(sel))
               ? `<button type="button" class="callout__item" data-callout-act="expand">Expand</button>`
               : '',
-            this.isPreviewable(sel) ? `<button type="button" class="callout__item" data-callout-act="preview">Preview…</button>` : '',
-            `<button type="button" class="callout__item" data-callout-act="rename">Rename</button>`,
-            `<button type="button" class="callout__item" data-callout-act="delete">Delete…</button>`,
-            `<button type="button" class="callout__item" data-callout-act="props">Get Info…</button>`,
-            sel && !sel.isDir && showsResourceFork(this.vfs.capabilities())
+            !multi && this.isPreviewable(sel) ? `<button type="button" class="callout__item" data-callout-act="preview">Preview…</button>` : '',
+            multi ? '' : `<button type="button" class="callout__item" data-callout-act="rename">Rename</button>`,
+            `<button type="button" class="callout__item" data-callout-act="delete">${multi ? `Delete ${count} Items…` : 'Delete…'}</button>`,
+            `<button type="button" class="callout__item" data-callout-act="props">${multi ? `Get Info (${count} items)…` : 'Get Info…'}</button>`,
+            !multi && sel && !sel.isDir && showsResourceFork(this.vfs.capabilities())
               ? `<button type="button" class="callout__item" data-callout-act="resources">Resources…</button>`
               : '',
-            sel && !sel.isDir && isWinResourceName(sel.name)
+            !multi && sel && !sel.isDir && isWinResourceName(sel.name)
               ? `<button type="button" class="callout__item" data-callout-act="win-resources">Windows Resources…</button>`
               : '',
             `<hr/>`,
@@ -5829,9 +6080,13 @@ export class FinderWindow extends HTMLElement {
       this.contextMenu = { x: e.clientX, y: e.clientY, targetId: this.selectedId };
     } else if (item) {
       const id = dataRef(item);
-      this.selectedId = id;
-      this.paintSelection(item);
-      if (this.showProps) this.refreshPropsPanel();
+      // Right-clicking an item already in the multi-selection keeps the whole
+      // selection (so actions apply to all of it); otherwise select just this item.
+      if (id == null || !this.selectedIds.has(id)) {
+        this.selectOnly(id);
+        this.paintSelection(item);
+        if (this.showProps) this.refreshPropsPanel();
+      }
       this.contextMenu = { x: e.clientX, y: e.clientY, targetId: id };
     } else {
       this.contextMenu = { x: e.clientX, y: e.clientY, targetId: null };
@@ -5848,7 +6103,10 @@ export class FinderWindow extends HTMLElement {
     }
     const { x, y, targetId, local, sidebar } = this.contextMenu;
     const targetNode = targetId != null ? this.findNodeAnywhere(targetId) : null;
-    const canPreview = this.isPreviewable(targetNode);
+    const multi = this.selectedIds.size > 1 && targetId != null && this.selectedIds.has(targetId);
+    const count = multi ? this.selectedIds.size : 1;
+    const canPreview = !multi && this.isPreviewable(targetNode);
+    const canExpand = multi ? this.allSelectedExpandable() : this.isExpandableArchive(targetNode);
     const items = sidebar
       ? sidebar.actions.map((a) => `<button type="button" data-ctx="${this.escape(a.id)}">${this.escape(a.label)}</button>`)
       : local
@@ -5859,18 +6117,16 @@ export class FinderWindow extends HTMLElement {
           ]
         : targetId != null
           ? [
-              this.isExpandableArchive(targetNode)
-                ? `<button type="button" data-ctx="expand">Expand</button>`
-                : '',
+              canExpand ? `<button type="button" data-ctx="expand">Expand</button>` : '',
               `<button type="button" data-ctx="download">Download Zip</button>`,
               canPreview ? `<button type="button" data-ctx="preview">Preview…</button>` : '',
-              `<button type="button" data-ctx="rename">Rename</button>`,
-              `<button type="button" data-ctx="delete">Delete…</button>`,
-              `<button type="button" data-ctx="props">Get Info…</button>`,
-              targetNode && !targetNode.isDir && showsResourceFork(this.vfs.capabilities())
+              multi ? '' : `<button type="button" data-ctx="rename">Rename</button>`,
+              `<button type="button" data-ctx="delete">${multi ? `Delete ${count} Items…` : 'Delete…'}</button>`,
+              `<button type="button" data-ctx="props">${multi ? `Get Info (${count} items)…` : 'Get Info…'}</button>`,
+              !multi && targetNode && !targetNode.isDir && showsResourceFork(this.vfs.capabilities())
                 ? `<button type="button" data-ctx="resources">Resources…</button>`
                 : '',
-              targetNode && !targetNode.isDir && isWinResourceName(targetNode.name)
+              !multi && targetNode && !targetNode.isDir && isWinResourceName(targetNode.name)
                 ? `<button type="button" data-ctx="win-resources">Windows Resources…</button>`
                 : '',
               `<hr/>`,
@@ -5892,7 +6148,6 @@ export class FinderWindow extends HTMLElement {
         await this.expandArchive(targetId);
         break;
       case 'download':
-        if (targetId != null) this.selectedId = targetId;
         await this.onDownload();
         break;
       case 'preview':
@@ -5917,7 +6172,7 @@ export class FinderWindow extends HTMLElement {
         this.showProps = true;
         if (this.selectedId == null) {
           const folder = await this.vfs.get(this.cwd);
-          if (folder) this.selectedId = nodeRef(folder);
+          if (folder) this.selectOnly(nodeRef(folder));
         }
         this.syncPropsButton();
         this.refreshPropsPanel();
@@ -6000,7 +6255,7 @@ export class FinderWindow extends HTMLElement {
     if (this.source === 'local') {
       this.cwd = root;
       this.pathStack = [{ id: root, name: this.localShareTitle() }];
-      this.selectedId = null;
+      this.clearSelection();
       this.expandedIds.clear();
       this.loadingIds.clear();
       this.listChildCache.clear();
@@ -6252,6 +6507,7 @@ export class FinderWindow extends HTMLElement {
     // Quick Look: Space
     if (key === ' ' && !mod && !e.altKey) {
       e.preventDefault();
+      if (!this.selectionSupportsPreview()) return;
       await this.openPreview();
       return;
     }
