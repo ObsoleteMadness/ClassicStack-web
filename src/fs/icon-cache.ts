@@ -253,6 +253,8 @@ const DEFAULT_EXTENSION_ICONS: Record<string, string> = {
   jpeg: 'icons8-image-file-96.png',
   gif: 'icons8-image-file-96.png',
   png: 'icons8-image-file-96.png',
+  ico: 'icons8-image-file-96.png',
+  cur: 'icons8-image-file-96.png',
   com: 'icons8-command-line-96.png',
   bat: 'icons8-command-line-96.png',
   cmd: 'icons8-command-line-96.png',

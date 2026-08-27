@@ -35,9 +35,12 @@ import type { WelcomePackProgress } from '../fs/welcome-pack';
 import { importExpandedTree, type ImportItemTrack } from '../fs/import-transfer';
 import { decodeVers1, versInfoForGetInfo, type VersGetInfo, type VersRec } from '../fs/resource-types/vers';
 import {
+  decodeBmp,
+  decodeIco,
   extractWinVersion,
   isWinResourceName,
   isWinVersionName,
+  pickIconNear,
   type WinVersionGetInfo,
 } from '../fs/winicon';
 import {
@@ -79,9 +82,8 @@ import {
   type PlacementPlan,
 } from '../fs/name-conflict';
 import { decodePict, pictToSvg } from '../fs/pict/pict';
-import { decodeBmp } from '../fs/winicon';
 import { decodedIconToDataUrl } from '../fs/resource-types/icon-decoder';
-import { isBmpPreview, previewKindFor, previewMime, type FilePreviewKind } from './file-preview';
+import { isBmpPreview, isIcoPreview, previewKindFor, previewMime, type FilePreviewKind } from './file-preview';
 import { isCatalogWithBackend } from '../finder/api';
 import {
   SIDEBAR_GROUP_NETWORK,
@@ -5484,6 +5486,17 @@ export class FinderWindow extends HTMLElement {
           return;
         }
       }
+      if (kind === 'image' && isIcoPreview(full.name, type)) {
+        const icons = await decodeIco(full.data);
+        const picked = pickIconNear(icons, 128);
+        const dataUrl = picked ? await decodedIconToDataUrl(picked) : null;
+        if (gen !== this.previewGen) return;
+        if (dataUrl) {
+          this.preview = { id: nodeRef(full), name: full.name, kind, text: 'ok', url: dataUrl };
+          this.renderPreview();
+          return;
+        }
+      }
       const mime = previewMime(kind, full.name, type);
       const copy = full.data.slice();
       const url = URL.createObjectURL(
@@ -5542,9 +5555,15 @@ export class FinderWindow extends HTMLElement {
     } else if (preview.kind === 'audio' && preview.url) {
       bodyClass += ' quicklook__body--media';
       body = `<audio class="quicklook__audio" controls src="${this.escape(preview.url)}"></audio>`;
+    } else if (preview.kind === 'video' && preview.url) {
+      bodyClass += ' quicklook__body--media';
+      body = `<video class="quicklook__video" controls src="${this.escape(preview.url)}"></video>`;
     } else if (preview.kind === 'pict' && preview.url) {
       bodyClass += ' quicklook__body--media';
       body = `<img class="quicklook__image" alt="${this.escape(preview.name)}" src="${this.escape(preview.url)}" />`;
+    } else if (preview.kind === 'html' && preview.url) {
+      bodyClass += ' quicklook__body--html';
+      body = `<iframe class="quicklook__html" sandbox src="${this.escape(preview.url)}" title="${this.escape(preview.name)}" referrerpolicy="no-referrer"></iframe>`;
     } else if (preview.kind === 'pdf' && preview.url) {
       bodyClass += ' quicklook__body--pdf';
       body = `<iframe class="quicklook__pdf" src="${this.escape(preview.url)}" title="${this.escape(preview.name)}"></iframe>`;
