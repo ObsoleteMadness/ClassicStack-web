@@ -1948,10 +1948,16 @@ export class FinderWindow extends HTMLElement {
                 ? `<button type="button" class="side-eject" data-eject="${vi}" data-vol-name="${this.escape(v)}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
                 : '';
               const volSpinner = connectingVol ? this.spinnerHtml('side-item-spinner') : '';
+              // A volume already connected elsewhere (s.knownVolumes, not this tab's
+              // own live login) carries a friendly path so the row shows where it
+              // points, the way a Get Info / URI hint would for a mounted share.
+              const path = s.knownVolumes?.find((k) => k.name === v)?.path;
+              const pathAttr = path ? ` title="${this.escape(path)}"` : '';
+              const pathMeta = path ? `<span class="side-item-host">${this.escape(path)}</span>` : '';
               return `
-      <div class="side-item side-item--child ${glyphClass} ${selected}" data-vol="${vi}" data-vol-name="${this.escape(v)}" data-server-parent="${i}" data-share-key="${this.escape(shareKey)}" data-share-name="${this.escape(v)}"${connectingVol ? ' aria-busy="true"' : ''}>
+      <div class="side-item side-item--child ${glyphClass} ${selected}" data-vol="${vi}" data-vol-name="${this.escape(v)}" data-server-parent="${i}" data-share-key="${this.escape(shareKey)}" data-share-name="${this.escape(v)}"${pathAttr}${connectingVol ? ' aria-busy="true"' : ''}>
         <span class="dot"></span>
-        <span class="side-item-label" aria-label="${this.escape(v)}">${this.escape(v)}</span>
+        <span class="side-item-label" aria-label="${this.escape(v)}">${this.escape(v)}${pathMeta}</span>
         ${volSpinner}
         ${eject}
       </div>`;

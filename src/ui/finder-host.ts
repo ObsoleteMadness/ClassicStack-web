@@ -57,7 +57,22 @@ export interface RemoteEndpoint {
   role?: 'server' | 'volume';
   /** Copyable connect URI (no volume, no trailing slash). */
   uri?: string;
+  /**
+   * Volumes this host already knows are open on this server — from another
+   * tab/session, not necessarily one this Finder window has logged into —
+   * so they render as children under the server row the same way volumes
+   * from this tab's own live login do (`FinderWindow.volumesFor`).
+   */
+  knownVolumes?: KnownVolume[];
 }
+
+/** One volume a host already has open on a server, for `RemoteEndpoint.knownVolumes`. */
+export type KnownVolume = {
+  name: string;
+  /** Friendly connect URL for this open volume (server + volume), if known. */
+  path?: string;
+  sessionId: string;
+};
 
 /** Result of contacting a remote (or local) endpoint before / after login. */
 export interface SessionInfo {

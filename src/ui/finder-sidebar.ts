@@ -116,7 +116,7 @@ export function volumesForEndpoint(
 ): string[] {
   if (known.has(ep.id)) return known.get(ep.id) ?? [];
   if (remoteLoggedIn && ep.id === currentId) return remoteVolumes;
-  return [];
+  return ep.knownVolumes?.map((v) => v.name) ?? [];
 }
 
 export type ShareDrop = { key: string; name: string };
