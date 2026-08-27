@@ -3,7 +3,7 @@ import { nodeRef, parentRef } from '../fs/virtual-fs';
 import { EmptyCatalog } from '../fs/empty-catalog';
 import type { CatalogCapabilities, NodeRef } from '../fs/catalog-caps';
 import { parseRefKey, refKey, refsEqual, showsResourceFork, showsTypeCreator } from '../fs/catalog-caps';
-import { formatStorePath, volumeChrome } from '../fs/volume-chrome';
+import { formatStorePath, sidebarGlyphSrc, volumeChrome, type SidebarGlyphRole } from '../fs/volume-chrome';
 import type { ByteRangeReader } from '../fs/byte-range';
 import type {
   Credentials,
@@ -17,6 +17,7 @@ import type {
 import { decodeMacRoman } from '../protocol/macroman';
 import { buildAppleDouble, zipSidecarPath, zipStore, type ZipExportStyle } from '../fs/appledouble';
 import { collectZipEntries, enumerateZipFiles, type ZipFilePlan } from '../fs/zip-export';
+import { downloadBytes } from '../util/pcap';
 import { formatBytes } from './format-bytes';
 import {
   iconCache,
@@ -87,6 +88,7 @@ import {
   assignSidebarGroup,
   badgeText,
   badgeTitle,
+  connectedEndpointTitle,
   endpointsByGroup,
   isCatalogEndpoint,
   LOCAL_SHARE_KEY,
@@ -161,6 +163,11 @@ function nodeByteSize(n: VNode, includeResource = true): number {
   const data = n.dataBytes ?? n.data.length;
   if (!includeResource) return data;
   return data + (n.resourceBytes ?? n.resource.length);
+}
+
+function nodeHasResourceFork(n: VNode): boolean {
+  if (n.isDir) return false;
+  return (n.resourceBytes ?? n.resource.length) > 0;
 }
 
 function clipByteSize(item: ClipNode): number {
@@ -1865,6 +1872,11 @@ export class FinderWindow extends HTMLElement {
     return `<span class="side-badge"${tip}>${this.escape(text)}</span>`;
   }
 
+  private sidebarGlyphHtml(src: string | undefined): string {
+    if (!src) return '<span class="dot"></span>';
+    return `<img class="side-item-icon" src="${this.escape(src)}" width="16" height="16" alt="" draggable="false" />`;
+  }
+
   private volumesFor(s: RemoteEndpoint): string[] {
     return volumesForEndpoint(
       s,
@@ -1926,6 +1938,10 @@ export class FinderWindow extends HTMLElement {
       identity: { shareKind: s.kind, protocol: s.protocol as typeof s.kind },
     });
     const glyphClass = `side-item--${chrome.volumeIcon}`;
+    const protocol = (s.protocol || (localShare ? '' : s.kind)).toLowerCase();
+    const rowRole: SidebarGlyphRole = localShare ? 'share' : volumeRow ? 'volume' : 'server';
+    const serverGlyph = this.sidebarGlyphHtml(sidebarGlyphSrc(protocol, rowRole));
+    const volumeGlyph = this.sidebarGlyphHtml(sidebarGlyphSrc(protocol, 'volume'));
     const isCurrent = s.id === opts.connectedId;
     const connectingHere = this.connectingEndpointId === s.id;
     const connectingServer = connectingHere && !this.connectingVolume;
@@ -1956,7 +1972,7 @@ export class FinderWindow extends HTMLElement {
               const pathMeta = path ? `<span class="side-item-host">${this.escape(path)}</span>` : '';
               return `
       <div class="side-item side-item--child ${glyphClass} ${selected}" data-vol="${vi}" data-vol-name="${this.escape(v)}" data-server-parent="${i}" data-share-key="${this.escape(shareKey)}" data-share-name="${this.escape(v)}"${pathAttr}${connectingVol ? ' aria-busy="true"' : ''}>
-        <span class="dot"></span>
+        ${volumeGlyph}
         <span class="side-item-label" aria-label="${this.escape(v)}">${this.escape(v)}${pathMeta}</span>
         ${volSpinner}
         ${eject}
@@ -1984,7 +2000,7 @@ export class FinderWindow extends HTMLElement {
         : '';
     return `
       <div class="side-item ${glyphClass} ${serverSel}" data-server="${i}"${subtitle}${shareAttrs}${serverBusy ? ' aria-busy="true"' : ''}>
-        <span class="dot"></span>
+        ${serverGlyph}
         <span class="side-item-label" aria-label="${this.escape(s.title)}">${hostLabel}${hostMeta}</span>
         ${serverSpinner}
         ${this.sidebarBadgeHtml(s.badge)}
@@ -2638,6 +2654,10 @@ export class FinderWindow extends HTMLElement {
     return null;
   }
 
+  private forkDownloadBtn(act: 'download-data' | 'download-resource', label: string): string {
+    return `<button type="button" class="preview-fork-dl" data-act="${act}" title="${this.escape(label)}" aria-label="${this.escape(label)}">${uiIcons.download}</button>`;
+  }
+
   /** Shared item info card — used by column-view preview and Properties. */
   private itemInfoHtml(node: VNode, opts: { variant: 'column' | 'dialog' }): string {
     const caps = this.vfs.capabilities();
@@ -2684,20 +2704,27 @@ export class FinderWindow extends HTMLElement {
       caps.finderInfo || caps.attributes.some((a) => a.editable !== false)
         ? `<button type="button" class="btn primary" data-act="apply-props">Apply</button>`
         : '';
-    const rsrcBtn = showsResourceFork(caps)
-      ? `<button type="button" class="btn" data-act="resources">Resources…</button>`
-      : '';
+    const rsrcBtn =
+      !node.isDir && showsResourceFork(caps)
+        ? `<button type="button" class="btn" data-act="resources">Resources…</button>`
+        : '';
     const winRsrcBtn =
       !node.isDir && isWinResourceName(node.name)
         ? `<button type="button" class="btn" data-act="win-resources">Windows Resources…</button>`
         : '';
+    const hasRsrc = nodeHasResourceFork(node);
+    const showForkDownloads = !node.isDir && hasRsrc && caps.resourceFork;
+    const downloadBtn =
+      node.isDir || showForkDownloads
+        ? `<button type="button" class="btn" data-act="download">${uiIcons.download} Zip</button>`
+        : `<button type="button" class="btn" data-act="download-file">${uiIcons.download} Download</button>`;
     const typeCreatorFields = `<div class="preview-fields">
         ${typeInputs}
         ${attrBoxes ? `<div class="preview-attrs">${attrBoxes}</div>` : ''}
         <div class="preview-actions">
           ${expandBtn}
           ${previewBtn}
-          <button type="button" class="btn" data-act="download">Download Zip</button>
+          ${downloadBtn}
           ${applyBtn}
           ${rsrcBtn}
           ${winRsrcBtn}
@@ -2739,9 +2766,15 @@ export class FinderWindow extends HTMLElement {
       })
       .join('');
     const sizeBytes = node.isDir ? 0 : nodeByteSize(node, caps.resourceFork);
+    const dataDl = showForkDownloads
+      ? this.forkDownloadBtn('download-data', 'Download data fork')
+      : '';
+    const resDl = showForkDownloads
+      ? this.forkDownloadBtn('download-resource', 'Download resource fork')
+      : '';
     const resRow =
       !node.isDir && caps.resourceFork
-        ? `<div class="preview-row"><span>Resource</span><span>${formatBytes(node.resourceBytes ?? node.resource.length)}</span></div>`
+        ? `<div class="preview-row"><span>Resource</span><span class="preview-row__value">${formatBytes(node.resourceBytes ?? node.resource.length)}${resDl}</span></div>`
         : '';
     const flagRows = caps.finderInfo ? this.finderFlagRowsHtml(node) : '';
     return `<div class="${shellClass}" data-preview data-id="${refKey(nodeRef(node))}"${colAttrs}>
@@ -2753,7 +2786,7 @@ export class FinderWindow extends HTMLElement {
       <div class="preview-meta">
         <div class="preview-row"><span>Kind</span><span>${kind}</span></div>
         <div class="preview-row"><span>Where</span><span>${this.escape(this.displayStorePath(node))}</span></div>
-        <div class="preview-row"><span>Size</span><span>${node.isDir ? '—' : formatBytes(sizeBytes)}</span></div>
+        <div class="preview-row"><span>Size</span><span class="preview-row__value">${node.isDir ? '—' : formatBytes(sizeBytes)}${dataDl}</span></div>
         ${resRow}
         ${dateRows}
         ${extraNames}
@@ -4629,6 +4662,13 @@ export class FinderWindow extends HTMLElement {
       case 'download':
         await this.onDownload();
         break;
+      case 'download-file':
+      case 'download-data':
+        await this.downloadSelectedFork('data');
+        break;
+      case 'download-resource':
+        await this.downloadSelectedFork('resource');
+        break;
       case 'preview':
         await this.openPreview();
         break;
@@ -4791,7 +4831,7 @@ export class FinderWindow extends HTMLElement {
         try {
           const info = await this.host.beginRemote(s);
           if (info.volumes.length) this.knownVolumes.set(s.id, [...info.volumes]);
-          this.adoptEndpoint(s, { title: info.serverName || s.title });
+          this.adoptEndpoint(s, { title: connectedEndpointTitle(s, info.serverName) });
         } catch {
           /* keep cached volumes */
         }
@@ -4880,7 +4920,7 @@ export class FinderWindow extends HTMLElement {
             this.remoteVolumes = [...this.remoteVolumes, wantVol];
           }
           this.remoteNbpName = s.id;
-          this.adoptEndpoint(s, { title: info.serverName || s.title });
+          this.adoptEndpoint(s, { title: connectedEndpointTitle(s, info.serverName) });
           this.remoteOpen = false;
           this.knownVolumes.set(s.id, [...this.remoteVolumes]);
           this.loggedInEndpoints.add(s.id);
@@ -5505,6 +5545,9 @@ export class FinderWindow extends HTMLElement {
     } else if (preview.kind === 'pict' && preview.url) {
       bodyClass += ' quicklook__body--media';
       body = `<img class="quicklook__image" alt="${this.escape(preview.name)}" src="${this.escape(preview.url)}" />`;
+    } else if (preview.kind === 'pdf' && preview.url) {
+      bodyClass += ' quicklook__body--pdf';
+      body = `<iframe class="quicklook__pdf" src="${this.escape(preview.url)}" title="${this.escape(preview.name)}"></iframe>`;
     } else if (!preview.text) {
       body = `<p class="quicklook__empty">This file is empty</p>`;
     } else {
@@ -5695,6 +5738,28 @@ export class FinderWindow extends HTMLElement {
     if (nodes.length) return nodes;
     const cur = await this.vfs.get(this.cwd);
     return cur ? [cur] : [];
+  }
+
+  private async downloadSelectedFork(fork: 'data' | 'resource'): Promise<void> {
+    if (this.selectedId == null || this.selectedIds.size > 1) {
+      this.setStatus('Select a file to download');
+      return;
+    }
+    const node = this.findNodeAnywhere(this.selectedId) ?? (await this.vfs.get(this.selectedId));
+    if (!node || node.isDir) {
+      this.setStatus('Select a file to download');
+      return;
+    }
+    try {
+      const full = (await this.vfs.ensureContent(nodeRef(node))) ?? node;
+      const bytes = fork === 'resource' ? full.resource : full.data;
+      const filename = fork === 'resource' ? `${full.name}.rsrc` : full.name;
+      downloadBytes(bytes, filename);
+      this.setStatus(`Downloaded ${filename}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.setStatus(`Download failed: ${msg}`);
+    }
   }
 
   private async onDownload(): Promise<void> {
@@ -6451,6 +6516,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async onKeyDown(e: KeyboardEvent): Promise<void> {
+    if (this.inert) return;
     const t = e.target as HTMLElement;
 
     if (t instanceof HTMLInputElement && t.hasAttribute('data-rename')) {

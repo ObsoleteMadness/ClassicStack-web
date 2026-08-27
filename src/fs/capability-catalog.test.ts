@@ -8,7 +8,7 @@ import {
   showsResourceFork,
   showsTypeCreator,
 } from './catalog-caps';
-import { formatStorePath, volumeChrome } from './volume-chrome';
+import { formatStorePath, sidebarGlyphSrc, volumeChrome } from './volume-chrome';
 
 describe('CapabilityCatalog CNID vs path', () => {
   it('AFP preset is CNID-addressed with no path identity fields', async () => {
@@ -88,6 +88,22 @@ describe('volume chrome', () => {
     });
     expect(chrome.volumeIcon).toBe('windows');
     expect(chrome.kindLabel).toMatch(/Windows/i);
+  });
+
+  it('picks Finder sidebar glyphs by protocol and role', () => {
+    expect(sidebarGlyphSrc('afp', 'share')).toBe('/icons/classic/AppleShare.gif');
+    expect(sidebarGlyphSrc('smb', 'share')).toBe('/icons/classic/windows-share3.png');
+    expect(sidebarGlyphSrc('ncp', 'share')).toBe('/icons/classic/NovellShare.png');
+    expect(sidebarGlyphSrc('etherdfs', 'share')).toBe('/icons/classic/ibmshare.png');
+    expect(sidebarGlyphSrc('afp', 'server')).toBe('/icons/ui/icons8-happy-mac-50.png');
+    expect(sidebarGlyphSrc('ncp', 'server')).toBe('/icons/classic/ncp-server.png');
+    expect(sidebarGlyphSrc('smb', 'server')).toBe('/icons/classic/win-pc2.png');
+    expect(sidebarGlyphSrc('edfs', 'server')).toBe('/icons/classic/dos1.png');
+    expect(sidebarGlyphSrc('ncp', 'volume')).toBe('/icons/classic/netware-share.png');
+    expect(sidebarGlyphSrc('smb', 'volume')).toBe('/icons/classic/windows-share2.png');
+    expect(sidebarGlyphSrc('afp', 'volume')).toBe('/icons/icl8_-3978.png');
+    expect(sidebarGlyphSrc('etherdfs', 'volume')).toBe('/icons/ui/icons8-c-drive-2-50.png');
+    expect(sidebarGlyphSrc('local', 'share')).toBeUndefined();
   });
 });
 

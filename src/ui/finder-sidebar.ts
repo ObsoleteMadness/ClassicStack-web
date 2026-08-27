@@ -80,6 +80,15 @@ export function isCatalogEndpoint(ep: RemoteEndpoint): boolean {
   return ep.kind === 'local' || ep.role === 'volume';
 }
 
+/**
+ * Sidebar label after connect. Hosted shares and mounts keep their configured
+ * name; `serverName` is the AFP/SMB/NCP server identity (often “ClassicStack”).
+ */
+export function connectedEndpointTitle(ep: RemoteEndpoint, serverName?: string): string {
+  if (isCatalogEndpoint(ep) || !serverName) return ep.title;
+  return serverName;
+}
+
 /** Stable Finder catalog key for an endpoint and optional volume child. */
 export function shareKeyForEndpoint(ep: RemoteEndpoint, volume?: string): string {
   if (isCatalogEndpoint(ep)) return `endpoint:${ep.id}`;

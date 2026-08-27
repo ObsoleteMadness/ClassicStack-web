@@ -429,6 +429,16 @@ finder-window.is-dragging .finder-chrome {
 .side-item--appleshare .dot { background: var(--ok); }
 .side-item--disk .dot { background: var(--ok); }
 
+.side-item-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  object-fit: contain;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  display: block;
+}
+
 .preview-attrs {
   display: flex;
   flex-wrap: wrap;
@@ -1264,6 +1274,37 @@ finder-window.is-dragging .finder-chrome {
   font-size: 11px;
 }
 
+.preview-row__value {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.preview-fork-dl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.preview-fork-dl:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.preview-fork-dl svg {
+  display: block;
+}
+
 .preview-row--block {
   flex-direction: column;
   align-items: flex-start;
@@ -1332,6 +1373,10 @@ finder-window.is-dragging .finder-chrome {
 
 .preview-actions .btn {
   width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .empty {
@@ -1543,6 +1588,24 @@ finder-window.is-dragging .finder-chrome {
   width: min(100%, 480px);
 }
 
+.quicklook__card:has(.quicklook__pdf) {
+  width: min(900px, 100%);
+  height: min(720px, 100%);
+}
+
+.quicklook__body--pdf {
+  padding: 0;
+  background: #12161b;
+}
+
+.quicklook__pdf {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff;
+}
+
 /* —— Screen menu bar (outside Finder window) —— */
 
 .app-menubar {
@@ -1615,6 +1678,15 @@ finder-window.is-dragging .finder-chrome {
 .app-menu.open .app-menu__trigger,
 .app-menu__trigger:hover {
   background: var(--accent-soft);
+}
+
+.app-menu__trigger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.app-menu__trigger:disabled:hover {
+  background: transparent;
 }
 
 .app-menu__dropdown {
@@ -2696,6 +2768,11 @@ settings-window[hidden],
   object-fit: contain;
 }
 
+.settings-nav__icon img {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
 .settings-nav__label {
   min-width: 0;
   overflow: hidden;
@@ -2738,6 +2815,11 @@ settings-window[hidden],
   width: 36px;
   height: 36px;
   object-fit: contain;
+}
+
+.settings-panel__heading-icon img {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
 }
 
 .settings-panel__heading-text {

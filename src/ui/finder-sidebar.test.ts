@@ -5,6 +5,7 @@ import {
   assignSidebarGroup,
   endpointsByGroup,
   isCatalogEndpoint,
+  connectedEndpointTitle,
   shareKeyForEndpoint,
   viewingCatalogEndpoint,
   visibleSidebarGroups,
@@ -74,6 +75,16 @@ describe('share keys and drop targets', () => {
     expect(shareKeyForEndpoint(share)).toBe('endpoint:local:afp:HD');
     expect(shareKeyForEndpoint(mounted)).toBe('endpoint:mounted:abc');
     expect(shareKeyForEndpoint(server, 'Mac HD')).toBe('Mac:Mac HD');
+  });
+
+  it('does not rename hosted shares to the server identity after connect', () => {
+    const share = ep({ id: 'local:afp:HD', title: 'HD', kind: 'local' });
+    const mounted = ep({ id: 'mounted:abc', title: 'SYS', kind: 'ncp', role: 'volume' });
+    const server = ep({ id: 'Mac', title: 'Mac' });
+    expect(connectedEndpointTitle(share, 'ClassicStack')).toBe('HD');
+    expect(connectedEndpointTitle(mounted, 'FILESERVER')).toBe('SYS');
+    expect(connectedEndpointTitle(server, 'PowerMac')).toBe('PowerMac');
+    expect(connectedEndpointTitle(server, '')).toBe('Mac');
   });
 
   it('switches to a ClassicStack share when another remote catalog is on screen', () => {

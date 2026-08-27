@@ -28,4 +28,7 @@ export const settingsBitmapIcons = {
   ncp: settingsIconImg(ui('icons8-netware-logo-100.png')),
   netboot: settingsIconImg(ui('icons8-work-boot-100.png')),
   router: settingsIconImg(ui('icons8-router-symbol-100.png')),
+  macip: settingsIconImg(classic('apple-ip-gw.png')),
+  ipxgw: settingsIconImg(classic('macipx-cp.png')),
+  users: settingsIconImg(classic('users.png')),
 } as const;

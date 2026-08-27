@@ -9,6 +9,9 @@ export type VolumeChrome = {
   pathFormat: PathFormat;
 };
 
+/** Sidebar row kind: hosted share, discovered server, or a volume on that server. */
+export type SidebarGlyphRole = 'share' | 'server' | 'volume';
+
 const CHROME: Record<string, VolumeChrome> = {
   afp: { volumeIcon: 'appleshare', kindLabel: 'AppleShare', pathFormat: 'mac' },
   smb: { volumeIcon: 'windows', kindLabel: 'Windows share', pathFormat: 'dos' },
@@ -18,6 +21,39 @@ const CHROME: Record<string, VolumeChrome> = {
 };
 
 const GENERIC: VolumeChrome = { volumeIcon: 'disk', kindLabel: 'Volume', pathFormat: 'posix' };
+
+const SHARE_GLYPHS: Record<string, string> = {
+  afp: '/icons/classic/AppleShare.gif',
+  smb: '/icons/classic/windows-share3.png',
+  ncp: '/icons/classic/NovellShare.png',
+  etherdfs: '/icons/classic/ibmshare.png',
+};
+
+const SERVER_GLYPHS: Record<string, string> = {
+  afp: '/icons/ui/icons8-happy-mac-50.png',
+  smb: '/icons/classic/win-pc2.png',
+  ncp: '/icons/classic/ncp-server.png',
+  etherdfs: '/icons/classic/dos1.png',
+};
+
+const VOLUME_GLYPHS: Record<string, string> = {
+  afp: '/icons/icl8_-3978.png',
+  smb: '/icons/classic/windows-share2.png',
+  ncp: '/icons/classic/netware-share.png',
+  etherdfs: '/icons/ui/icons8-c-drive-2-50.png',
+};
+
+function protocolKey(protocol: string): string {
+  const key = protocol.toLowerCase();
+  return key === 'edfs' ? 'etherdfs' : key;
+}
+
+/** Classic glyph for a Finder sidebar row, or undefined to keep the colored dot. */
+export function sidebarGlyphSrc(protocol: string, role: SidebarGlyphRole): string | undefined {
+  const key = protocolKey(protocol);
+  const map = role === 'share' ? SHARE_GLYPHS : role === 'server' ? SERVER_GLYPHS : VOLUME_GLYPHS;
+  return map[key];
+}
 
 /** Chrome for a volume: local shares use protocol so local+smb still looks Windows. */
 export function volumeChrome(caps: CatalogCapabilities): VolumeChrome {

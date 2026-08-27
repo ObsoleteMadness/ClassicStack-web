@@ -17,6 +17,9 @@ describe('file preview kinds', () => {
     expect(previewKindFor(node('loop.aiff'))).toBe('audio');
     expect(previewKindFor(node('hit.wav'))).toBe('audio');
     expect(previewKindFor(node('Read Me.txt'))).toBe('text');
+    expect(previewKindFor(node('AUTOEXEC.BAT'))).toBe('text');
+    expect(previewKindFor(node('readme.doc'))).toBe('text');
+    expect(previewKindFor(node('manual.pdf'))).toBe('pdf');
     expect(previewKindFor(node('folder', true))).toBeNull();
     expect(previewKindFor(node('app'))).toBeNull();
   });
@@ -26,5 +29,6 @@ describe('file preview kinds', () => {
     expect(previewMime('image', 'x.bmp', 'BMPp')).toBe('image/bmp');
     expect(previewMime('audio', 'x.mp3', 'MPG3')).toBe('audio/mpeg');
     expect(previewMime('audio', 'x.aif', 'AIFF')).toBe('audio/aiff');
+    expect(previewMime('pdf', 'x.pdf', 'PDF ')).toBe('application/pdf');
   });
 });
