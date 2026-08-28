@@ -21,6 +21,68 @@ export function bitmapForPayload(bytes: number): number {
   return (1 << n) - 1;
 }
 
+/**
+ * Split payload into ATP slots (at least one, possibly empty). Caps at
+ * MaxResponsePackets — ClassicStack `atpRequest.respond`.
+ */
+export function splitPayload(data: Uint8Array): Uint8Array[] {
+  let n = Math.ceil(data.length / MaxATPData);
+  if (n < 1) n = 1;
+  if (n > MaxResponsePackets) n = MaxResponsePackets;
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < n; i++) {
+    const start = i * MaxATPData;
+    chunks.push(data.subarray(start, Math.min(start + MaxATPData, data.length)));
+  }
+  return chunks;
+}
+
+/**
+ * TReq bitmap bits as slot numbers (0..7). A zero bitmap is packet 0 only so a
+ * malformed request still gets a reply (ClassicStack `atpRequest.respond`).
+ */
+export function slotsFromBitmap(bitmap: number): number[] {
+  const mask = bitmap & ((1 << MaxResponsePackets) - 1);
+  if (mask === 0) return [0];
+  const slots: number[] = [];
+  for (let i = 0; i < MaxResponsePackets; i++) {
+    if (mask & (1 << i)) slots.push(i);
+  }
+  return slots;
+}
+
+/**
+ * Encode TResp packets for `data`, sending only slots the TReq bitmap asked for.
+ * EOM is set on the last slot of the *message*, not the last packet of this
+ * retransmission (a bitmap-0x01 retry of an 8-slot write must not set EOM).
+ */
+export function encodeTRespPackets(
+  transId: number,
+  userData: number,
+  data: Uint8Array,
+  bitmap: number,
+): Uint8Array[] {
+  const chunks = splitPayload(data);
+  const lastSeq = chunks.length - 1;
+  const out: Uint8Array[] = [];
+  for (const seq of slotsFromBitmap(bitmap)) {
+    if (seq > lastSeq) continue;
+    const eom = seq === lastSeq ? EOM : 0;
+    out.push(
+      encodePacket(
+        {
+          control: TRESP | eom,
+          bitmap: seq,
+          transId,
+          userData: seq === 0 ? userData : 0,
+        },
+        chunks[seq]!,
+      ),
+    );
+  }
+  return out;
+}
+
 /** 3-bit TRel timeout in the low bits of an XO TReq control byte (ClassicStack TRel30s). */
 export const TRel30s = 0;
 

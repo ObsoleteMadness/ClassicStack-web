@@ -1,5 +1,6 @@
 /** WebSerial transport for TashTalk at 1 Mbaud 8N1 with RTS/CTS. */
 
+import { chunkBytes, waitClearToSend } from './cts';
 import {
   buildInitSequence,
   encodeOutbound,
@@ -44,7 +45,9 @@ export class WebSerialPort {
       throw new Error('WebSerial is not available in this browser');
     }
     const port = await navigator.serial.requestPort({ filters });
-    // rtscts=True in tashrouter; TashTalk deasserts CTS when its 128-byte UART queue is half-full.
+    // rtscts=True in tashrouter; TashTalk deasserts CTS when its 128-byte UART
+    // queue is half-full. Chrome hardware flow-control is necessary but not
+    // sufficient — writeRaw also polls getSignals().clearToSend (see cts.ts).
     await port.open({
       baudRate: 1_000_000,
       dataBits: 8,
@@ -85,7 +88,7 @@ export class WebSerialPort {
 
   async writeLlap(frame: Uint8Array): Promise<void> {
     this.emitTap(frame, 'tx');
-    await this.writeRaw(encodeOutbound(frame));
+    await this.writeRaw(encodeOutbound(frame), true);
   }
 
   /**
@@ -97,10 +100,38 @@ export class WebSerialPort {
     await this.writeRaw(encodeSetNodeIds(nodes));
   }
 
-  private writeRaw(data: Uint8Array): Promise<void> {
+  /**
+   * Probe USB-serial CTS. `null` means getSignals is missing or threw — skip the
+   * software wait and rely on flowControl:'hardware' alone.
+   */
+  private async probeCts(): Promise<boolean | null> {
+    const port = this.port;
+    if (!port || typeof port.getSignals !== 'function') return null;
+    try {
+      return (await port.getSignals()).clearToSend;
+    } catch {
+      return null;
+    }
+  }
+
+  private waitMcuCts(): Promise<void> {
+    return waitClearToSend(() => this.probeCts());
+  }
+
+  /**
+   * Serialize host→device bytes. `drainCts` waits for MCU CTS after the last chunk
+   * so the next LLAP cannot start until this frame has left the UART (1 in-flight).
+   */
+  private writeRaw(data: Uint8Array, drainCts = false): Promise<void> {
     if (!this.writer) return Promise.reject(new Error('serial not connected'));
     const writer = this.writer;
-    const next = this.writeChain.then(() => writer.write(data));
+    const next = this.writeChain.then(async () => {
+      for (const chunk of chunkBytes(data)) {
+        await this.waitMcuCts();
+        await writer.write(chunk);
+      }
+      if (drainCts) await this.waitMcuCts();
+    });
     // Keep the chain alive across failures so a later write still runs.
     this.writeChain = next.catch(() => undefined);
     return next;

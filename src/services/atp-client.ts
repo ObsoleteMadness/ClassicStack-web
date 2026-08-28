@@ -60,6 +60,8 @@ export class AtpClient {
   private listening = new Set<number>();
   /** Server-initiated TReq handlers (ASP WriteContinue / Tickle / Attention on WSS). */
   private tReqHandlers = new Map<number, (req: AtpInboundTReq) => void | Promise<void>>();
+  /** In-flight TResp send per TID — a WriteContinue retry must not overlap the first blast. */
+  private tRespByTid = new Map<number, Promise<void>>();
 
   constructor(stack: LocalTalkStack) {
     this.stack = stack;
@@ -77,27 +79,32 @@ export class AtpClient {
     this.tReqHandlers.set(socket, handler);
   }
 
-  /** Reply to an inbound TReq (chunked ATP TResp, same framing as AtpServer). */
+  /** Reply to an inbound TReq (chunked ATP TResp, bitmap-honouring, one frame at a time). */
   async replyTReq(dg: Datagram, header: atp.Header, userData: number, data: Uint8Array): Promise<void> {
-    const chunks: Uint8Array[] = [];
-    for (let i = 0; i < data.length || chunks.length === 0; i += atp.MaxATPData) {
-      chunks.push(data.subarray(i, Math.min(i + atp.MaxATPData, data.length)));
-      if (i + atp.MaxATPData >= data.length && data.length > 0) break;
-      if (data.length === 0) break;
+    const tid = header.transId;
+    const run = () => this.sendTRespPackets(dg, header, userData, data);
+    const prev = this.tRespByTid.get(tid) ?? Promise.resolve();
+    const next = prev.then(run, run);
+    this.tRespByTid.set(tid, next);
+    try {
+      await next;
+    } finally {
+      if (this.tRespByTid.get(tid) === next) this.tRespByTid.delete(tid);
     }
-    if (chunks.length === 0) chunks.push(new Uint8Array());
+  }
 
-    for (let seq = 0; seq < chunks.length; seq++) {
-      const eom = seq === chunks.length - 1 ? atp.EOM : 0;
-      const pkt = atp.encodePacket(
-        {
-          control: atp.TRESP | eom,
-          bitmap: seq,
-          transId: header.transId,
-          userData: seq === 0 ? userData : 0,
-        },
-        chunks[seq]!,
-      );
+  private async sendTRespPackets(
+    dg: Datagram,
+    header: atp.Header,
+    userData: number,
+    data: Uint8Array,
+  ): Promise<void> {
+    const packets = atp.encodeTRespPackets(header.transId, userData, data, header.bitmap);
+    log.trace(
+      `ATP TResp tid=${header.transId} bm=0x${(header.bitmap & 0xff).toString(16)} n=${packets.length}`,
+      'atp',
+    );
+    for (const pkt of packets) {
       await this.stack.send({
         hops: 0,
         destNetwork: dg.srcNetwork,

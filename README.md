@@ -75,6 +75,6 @@ ClassicStack is indebted to the following source code and authors:
 - Resource Fork explorer (View → Resource Fork…) dumps types, ids, BNDL/FREF mappings, and decoded icon previews — omitted when the volume has no resource forks
 - Windows resource explorer (View → Windows Resources…) dumps PE/NE RT_* types from the data fork (icons, bitmaps, version info, string tables, manifests) with a hex dump, modeled on the Macintosh viewer
 - Desktop DB Add/GetIcon is implemented on the server
-- AFP Write uses a simplified path; full WriteContinue parity may need tuning against specific Mac OS versions
+- AFP Write uses ASP WriteContinue; TResp honours the TReq bitmap, serializes retries per ATP TID, and waits for TashTalk serial CTS between frames so a large write cannot overrun the MCU
 - Netboot ChainBoot keeps the selected HFS image in browser memory for the session (writes are not persisted back to the file)
 - Default Browser Share files live in `public/welcome/` (see that folder’s README); new pack files are imported on next load, archives are expanded (wrappers are not kept), existing names are never overwritten

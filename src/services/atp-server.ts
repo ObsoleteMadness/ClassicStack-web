@@ -26,6 +26,8 @@ export class AtpServer {
   private socket: number;
   private handler: AtpServerHandler;
   private onResponse: AtpResponseHandler | null = null;
+  /** In-flight TResp send per TID — a retry must not overlap the first blast. */
+  private tRespByTid = new Map<number, Promise<void>>();
 
   constructor(stack: LocalTalkStack, socket: number, handler: AtpServerHandler) {
     this.stack = stack;
@@ -86,39 +88,40 @@ export class AtpServer {
     if (fn !== atp.TREQ) return;
 
     const reply = async (userData: number, data: Uint8Array) => {
-      const chunks: Uint8Array[] = [];
-      for (let i = 0; i < data.length || chunks.length === 0; i += atp.MaxATPData) {
-        chunks.push(data.subarray(i, Math.min(i + atp.MaxATPData, data.length)));
-        if (i + atp.MaxATPData >= data.length && data.length > 0) break;
-        if (data.length === 0) break;
-      }
-      if (chunks.length === 0) chunks.push(new Uint8Array());
-
-      for (let seq = 0; seq < chunks.length; seq++) {
-        const eom = seq === chunks.length - 1 ? atp.EOM : 0;
-        const pkt = atp.encodePacket(
-          {
-            control: atp.TRESP | eom,
-            bitmap: seq,
-            transId: decoded.header.transId,
-            userData: seq === 0 ? userData : 0,
-          },
-          chunks[seq]!,
-        );
-        await this.stack.send({
-          hops: 0,
-          destNetwork: dg.srcNetwork,
-          srcNetwork: this.stack.network,
-          destNode: dg.srcNode,
-          srcNode: this.stack.node,
-          destSocket: dg.srcSocket,
-          srcSocket: this.socket,
-          ddpType: atp.DDPType,
-          data: pkt,
-        });
+      const tid = decoded.header.transId;
+      const run = () => this.sendTRespPackets(dg, decoded.header, userData, data);
+      const prev = this.tRespByTid.get(tid) ?? Promise.resolve();
+      const next = prev.then(run, run);
+      this.tRespByTid.set(tid, next);
+      try {
+        await next;
+      } finally {
+        if (this.tRespByTid.get(tid) === next) this.tRespByTid.delete(tid);
       }
     };
 
     await this.handler({ dg, header: decoded.header, data: decoded.data, reply });
+  }
+
+  private async sendTRespPackets(
+    dg: Datagram,
+    header: atp.Header,
+    userData: number,
+    data: Uint8Array,
+  ): Promise<void> {
+    const packets = atp.encodeTRespPackets(header.transId, userData, data, header.bitmap);
+    for (const pkt of packets) {
+      await this.stack.send({
+        hops: 0,
+        destNetwork: dg.srcNetwork,
+        srcNetwork: this.stack.network,
+        destNode: dg.srcNode,
+        srcNode: this.stack.node,
+        destSocket: dg.srcSocket,
+        srcSocket: this.socket,
+        ddpType: atp.DDPType,
+        data: pkt,
+      });
+    }
   }
 }
