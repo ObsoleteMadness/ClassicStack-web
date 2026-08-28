@@ -156,7 +156,11 @@ export class AspSession {
     log.trace(`ASP WSS TReq fn=${spFunc} sess=${b1} word=${word}`, 'asp');
     switch (spFunc) {
       case asp.SPFuncWriteContinue: {
-        let data = this.pendingWrites.get(word) ?? new Uint8Array();
+        let data = this.pendingWrites.get(word);
+        if (!data) {
+          log.warn(`ASP WriteContinue seq=${word} with no pending write`, 'asp');
+          data = new Uint8Array();
+        }
         const bufSize = req.data.length >= 2 ? be16(req.data, 0) : 0;
         if (bufSize > 0 && bufSize < data.length) data = data.subarray(0, bufSize);
         await this.atp.replyTReq(req.dg, req.header, req.header.userData, data);
@@ -181,6 +185,7 @@ export class AspSession {
         log.info(`ASP CloseSess from server sess=${this.sessionId}`, 'asp');
         this.stopTickle();
         this.opened = false;
+        this.pendingWrites.clear();
         this.onServerClose?.();
         break;
       default:
@@ -270,9 +275,17 @@ export class AspSession {
           timeoutMs: 15000,
           bitmap: 0x01,
         });
-        return { result: u32ToI32(resp.userData), data: resp.data };
-      } finally {
         this.pendingWrites.delete(seq);
+        return { result: u32ToI32(resp.userData), data: resp.data };
+      } catch (err) {
+        // Keep the payload. AppleShare retries WriteContinue with a shrunk bitmap
+        // (0xfc = slots 2–7) after our Write TReq has already timed out; dropping
+        // the buffer here sends zero TResps and the Mac never answers later Commands.
+        log.warn(
+          `ASP Write seq=${seq} failed; keeping ${writeData.length}b for WriteContinue`,
+          'asp',
+        );
+        throw err;
       }
     });
   }
@@ -300,5 +313,6 @@ export class AspSession {
       /* ignore */
     }
     this.opened = false;
+    this.pendingWrites.clear();
   }
 }

@@ -4,10 +4,13 @@ import type { AtpClient, AtpInboundTReq, AtpRequest, AtpResponse } from './atp-c
 import {
   packClose,
   packOpenReply,
+  packWriteContinue,
   unpackUserData,
+  writeContinuePayload,
   SPFuncOpenSess,
   SPFuncCommand,
   SPFuncTickle,
+  SPFuncWrite,
 } from '../protocol/asp';
 
 class FakeAtp {
@@ -21,6 +24,8 @@ class FakeAtp {
   wssHandler: ((req: AtpInboundTReq) => void | Promise<void>) | null = null;
   wssSocket = 0;
   replies: number[] = [];
+  replyPayloads: Uint8Array[] = [];
+  writeShouldTimeout = false;
 
   async request(req: AtpRequest): Promise<AtpResponse> {
     this.inflight++;
@@ -38,6 +43,9 @@ class FakeAtp {
     if (parsed.spFunc === SPFuncOpenSess) {
       return { userData: packOpenReply(249, 9, 0), data: new Uint8Array(), transId: 1 };
     }
+    if (parsed.spFunc === SPFuncWrite && this.writeShouldTimeout) {
+      throw new Error('atp: timeout');
+    }
     return { userData: 0, data: new Uint8Array(), transId: 1 };
   }
 
@@ -46,8 +54,9 @@ class FakeAtp {
     this.wssHandler = handler;
   }
 
-  async replyTReq(_dg: unknown, _header: unknown, userData: number): Promise<void> {
+  async replyTReq(_dg: unknown, _header: unknown, userData: number, data?: Uint8Array): Promise<void> {
     this.replies.push(userData);
+    this.replyPayloads.push(data ?? new Uint8Array());
   }
 
   ensureListen(): void {}
@@ -139,5 +148,33 @@ describe('ASP server CloseSession', () => {
 
     await atp.injectClose(9);
     expect(sess.opened).toBe(false);
+  });
+});
+
+describe('ASP WriteContinue after Write timeout', () => {
+  it('still answers a shrunk-bitmap retry with the write payload', async () => {
+    const atp = new FakeAtp();
+    atp.writeShouldTimeout = true;
+    const sess = new AspSession(atp as unknown as AtpClient, 0, 1, 251);
+    await sess.open();
+    const payload = new Uint8Array(4624).fill(0xab);
+    await expect(sess.write(new Uint8Array(12), payload)).rejects.toThrow('atp: timeout');
+
+    await atp.wssHandler!({
+      dg: {
+        hops: 0,
+        destNetwork: 0,
+        srcNetwork: 0,
+        destNode: 1,
+        srcNode: 2,
+        destSocket: atp.wssSocket,
+        srcSocket: 249,
+        ddpType: 3,
+        data: writeContinuePayload(4624),
+      },
+      header: { control: 0x60, bitmap: 0xfc, transId: 962, userData: packWriteContinue(9, 0) },
+      data: writeContinuePayload(4624),
+    });
+    expect(atp.replyPayloads.at(-1)).toEqual(payload);
   });
 });

@@ -103,6 +103,15 @@ describe('encodeTRespPackets', () => {
     expect(header.control & atp.EOM).toBe(atp.EOM);
     expect(data.length).toBe(0);
   });
+
+  it('empty buffer + retry bitmap 0xfc still emits slots 2–7 so the requester unblocks', () => {
+    const pkts = atp.encodeTRespPackets(962, 0, new Uint8Array(), 0xfc);
+    expect(pkts).toHaveLength(6);
+    const decoded = pkts.map((p) => atp.decodePacket(p));
+    expect(decoded.map((d) => d.header.bitmap)).toEqual([2, 3, 4, 5, 6, 7]);
+    expect(decoded[5]!.header.control & atp.EOM).toBe(atp.EOM);
+    expect(decoded[0]!.header.control & atp.EOM).toBe(0);
+  });
 });
 
 describe('splitPayload', () => {

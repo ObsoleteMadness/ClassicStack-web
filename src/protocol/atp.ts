@@ -55,6 +55,10 @@ export function slotsFromBitmap(bitmap: number): number[] {
  * Encode TResp packets for `data`, sending only slots the TReq bitmap asked for.
  * EOM is set on the last slot of the *message*, not the last packet of this
  * retransmission (a bitmap-0x01 retry of an 8-slot write must not set EOM).
+ *
+ * If the bitmap names only slots past the payload (empty buffer + AppleShare
+ * retry bitmap 0xfc after we already sent slots 0–1), still emit those slots as
+ * empty TResps with EOM on the last requested slot so the requester unblocks.
  */
 export function encodeTRespPackets(
   transId: number,
@@ -64,21 +68,30 @@ export function encodeTRespPackets(
 ): Uint8Array[] {
   const chunks = splitPayload(data);
   const lastSeq = chunks.length - 1;
+  const slots = slotsFromBitmap(bitmap);
   const out: Uint8Array[] = [];
-  for (const seq of slotsFromBitmap(bitmap)) {
-    if (seq > lastSeq) continue;
-    const eom = seq === lastSeq ? EOM : 0;
+  const push = (seq: number, chunk: Uint8Array, eom: boolean) => {
     out.push(
       encodePacket(
         {
-          control: TRESP | eom,
+          control: TRESP | (eom ? EOM : 0),
           bitmap: seq,
           transId,
           userData: seq === 0 ? userData : 0,
         },
-        chunks[seq]!,
+        chunk,
       ),
     );
+  };
+  for (const seq of slots) {
+    if (seq > lastSeq) continue;
+    push(seq, chunks[seq]!, seq === lastSeq);
+  }
+  if (out.length === 0) {
+    const last = slots[slots.length - 1] ?? 0;
+    for (const seq of slots) {
+      push(seq, new Uint8Array(), seq === last);
+    }
   }
   return out;
 }
