@@ -15,6 +15,7 @@ import type {
   FinderHost,
   RemoteEndpoint,
   SessionInfo,
+  ShareKind,
 } from '../ui/finder-host';
 import type { LoginDialog } from '../ui/login-dialog';
 import type { AlertDialog } from '../ui/alert-dialog';
@@ -78,6 +79,14 @@ export class AfpFinderHost implements FinderHost {
     return this.stack && this.stack.node
       ? `node ${this.stack.node.toString(16).padStart(2, '0').toUpperCase()} net ${this.stack.network}`
       : '';
+  }
+
+  networkBrowserEnabled(): boolean {
+    return this.isConnected();
+  }
+
+  networkSchemes(): ShareKind[] {
+    return this.isConnected() ? ['afp'] : [];
   }
 
   localTitle(): string {
@@ -238,11 +247,13 @@ export class AfpFinderHost implements FinderHost {
   }
 
   private toEndpoint(s: LookupResult): RemoteEndpoint {
+    const zone = s.zone && s.zone !== '*' ? s.zone : '';
     return {
       id: s.object,
       kind: 'afp',
       title: s.object,
-      subtitle: s.zone && s.zone !== '*' ? s.zone : `${s.network}.${s.node}`,
+      subtitle: zone || `${s.network}.${s.node}`,
+      neighborhood: zone || 'TashTalk Network',
       badge: 'NBP',
       transport: 'nbp',
     };

@@ -51,6 +51,11 @@ export interface RemoteEndpoint {
   /** How this client was reached (`tcp`, `ddp`, `ipx`, `nbp`, `etherdfs`). */
   transport?: string;
   /**
+   * Workgroup, AppleTalk zone, or transport network this server was found on.
+   * Network Browser groups servers under this name (Browse Network → AFP → zone).
+   */
+  neighborhood?: string;
+  /**
    * `volume` is a mounted share (eject on this row). Default `server` lists
    * volumes as children after login and shows Disconnect on this row.
    */
@@ -64,7 +69,26 @@ export interface RemoteEndpoint {
    * from this tab's own live login do (`FinderWindow.volumesFor`).
    */
   knownVolumes?: KnownVolume[];
+  /**
+   * Extra Chooser objects this host advertises besides file shares (PAP
+   * printers, MacIP gateway, …). Network Browser lists them under the server.
+   */
+  services?: NetworkService[];
+  /** Protocol-native address for Get Info (DDP net.node, IP, MAC, …). */
+  address?: string;
+  os?: string;
+  version?: string;
+  /** True when this row is *this* ClassicStack instance (Network Browser only). */
+  own?: boolean;
 }
+
+/** One non-volume service a server may advertise in the Network Browser. */
+export type NetworkServiceKind = 'share' | 'printer' | 'macipgw' | 'service';
+
+export type NetworkService = {
+  kind: NetworkServiceKind;
+  name: string;
+};
 
 /** One volume a host already has open on a server, for `RemoteEndpoint.knownVolumes`. */
 export type KnownVolume = {
@@ -131,6 +155,17 @@ export interface FinderHost {
    * FUSE-mounted volume while another catalog is on screen.
    */
   openEndpointCatalog?(ep: RemoteEndpoint): Promise<Catalog>;
+  /**
+   * True when the in-process / in-browser file client is configured and running.
+   * Finder shows the Network sidebar row and enables View → Network Browser.
+   * Omitted: PWA uses `isConnected()`; ClassicStack treats the client as on.
+   */
+  networkBrowserEnabled?(): boolean;
+  /**
+   * File-sharing schemes the Network Browser lists as protocol folders.
+   * Omitted: inferred from discovered endpoints.
+   */
+  networkSchemes?(): ShareKind[];
   /** IndexedDB Browser Share on the web PWA; null in the Go SPA. */
   localCatalog(): Catalog | null;
   promptCredentials(opts: CredentialPromptOptions): Promise<Credentials | null>;
@@ -151,6 +186,14 @@ export interface FinderHost {
   onSidebarAction?(ep: RemoteEndpoint, action: string, volume?: string): void | Promise<void>;
   /** Display name for the local catalog (default “Browser Share”). */
   localTitle?(): string;
+  /**
+   * Extra Get Info fields for a sidebar server or volume (UAMs, FUSE mount
+   * point) that are not on `RemoteEndpoint`.
+   */
+  endpointInfoExtras?(
+    ep: RemoteEndpoint,
+    volume?: string,
+  ): { uams?: string[]; mountpoint?: string; volumes?: string[]; os?: string; dialect?: string } | undefined;
   dismissLogin?(): void;
   /** TashTalk / Web Serial — omitted on the Go SPA. */
   connectTransport?(): Promise<void>;

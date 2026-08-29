@@ -55,6 +55,32 @@ export function sidebarGlyphSrc(protocol: string, role: SidebarGlyphRole): strin
   return map[key];
 }
 
+const NETWORK_ROOT_GLYPH = '/icons/classic/mac-network.png';
+const NETWORK_GROUP_GLYPH = '/icons/classic/mac-group.png';
+
+/** Glyph for a Network Browser container (same art as the matching sidebar row). */
+export function networkGlyphSrc(
+  role: 'root' | 'protocol' | 'neighborhood' | 'server' | 'share' | 'service',
+  protocol?: string,
+  serviceKind?: string,
+): string {
+  switch (role) {
+    case 'root':
+      return NETWORK_ROOT_GLYPH;
+    case 'protocol':
+      return sidebarGlyphSrc(protocol || 'afp', 'share') || NETWORK_ROOT_GLYPH;
+    case 'neighborhood':
+      return NETWORK_GROUP_GLYPH;
+    case 'server':
+      return sidebarGlyphSrc(protocol || 'afp', 'server') || NETWORK_ROOT_GLYPH;
+    case 'share':
+      return sidebarGlyphSrc(protocol || 'afp', 'volume') || NETWORK_ROOT_GLYPH;
+    case 'service':
+      if (serviceKind === 'macipgw') return NETWORK_ROOT_GLYPH;
+      return NETWORK_GROUP_GLYPH;
+  }
+}
+
 /** Chrome for a volume: local shares use protocol so local+smb still looks Windows. */
 export function volumeChrome(caps: CatalogCapabilities): VolumeChrome {
   const kind: ShareKind | string = caps.identity.shareKind === 'local'

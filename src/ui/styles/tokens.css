@@ -1281,6 +1281,15 @@ finder-window.is-dragging .finder-chrome {
   gap: 6px;
 }
 
+.info-uri {
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  user-select: all;
+  word-break: break-all;
+  text-align: left;
+}
+
 .preview-fork-dl {
   display: inline-flex;
   align-items: center;

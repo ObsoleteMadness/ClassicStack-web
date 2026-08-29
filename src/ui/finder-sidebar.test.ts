@@ -10,6 +10,7 @@ import {
   viewingCatalogEndpoint,
   visibleSidebarGroups,
   volumesForEndpoint,
+  resolveSidebarActive,
 } from './finder-sidebar';
 
 function ep(partial: Partial<RemoteEndpoint> & Pick<RemoteEndpoint, 'id' | 'title'>): RemoteEndpoint {
@@ -109,5 +110,46 @@ describe('volumesForEndpoint', () => {
     const win98 = ep({ id: 'smb://WIN98-1,nbipx/', title: 'WIN98-1', kind: 'smb' });
     expect(volumesForEndpoint(win98, new Map(), win98.id, true, ['C'])).toEqual(['C']);
     expect(volumesForEndpoint(win98, new Map(), 'other', true, ['C'])).toEqual([]);
+  });
+});
+
+describe('resolveSidebarActive', () => {
+  it('selects at most one row', () => {
+    expect(
+      resolveSidebarActive({
+        connectingEndpointId: null,
+        viewingLocal: false,
+        networkCatalog: true,
+        networkRole: 'protocol',
+        remoteOpen: false,
+        openVolume: '',
+        remoteEndpointId: 'afp://snow/',
+      }),
+    ).toEqual({ kind: 'network' });
+
+    expect(
+      resolveSidebarActive({
+        connectingEndpointId: 'afp://snow/',
+        viewingLocal: false,
+        networkCatalog: true,
+        networkRole: 'server',
+        networkServerId: 'afp://snow/',
+        remoteOpen: false,
+        openVolume: '',
+        remoteEndpointId: 'afp://snow/',
+      }),
+    ).toEqual({ kind: 'network' });
+
+    expect(
+      resolveSidebarActive({
+        connectingEndpointId: null,
+        viewingLocal: false,
+        networkCatalog: false,
+        networkRole: '',
+        remoteOpen: true,
+        openVolume: 'OpenSCSI Volume',
+        remoteEndpointId: 'afp://snow/',
+      }),
+    ).toEqual({ kind: 'volume', id: 'afp://snow/', volume: 'OpenSCSI Volume' });
   });
 });

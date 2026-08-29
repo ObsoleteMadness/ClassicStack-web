@@ -52,6 +52,8 @@
     "./fs/remote-vfs": "./src/fs/remote-vfs.ts",
     "./fs/catalog-caps": "./src/fs/catalog-caps.ts",
     "./fs/volume-chrome": "./src/fs/volume-chrome.ts",
+    "./fs/network-catalog": "./src/fs/network-catalog.ts",
+    "./fs/network-tree": "./src/fs/network-tree.ts",
     "./fs/capability-catalog": "./src/fs/capability-catalog.ts",
     "./fs/extension-map": "./src/fs/extension-map.ts",
     "./fs/extension-map-netatalk": "./src/fs/extension-map-netatalk.ts",

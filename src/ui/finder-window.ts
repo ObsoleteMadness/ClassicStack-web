@@ -3,7 +3,26 @@ import { nodeRef, parentRef } from '../fs/virtual-fs';
 import { EmptyCatalog } from '../fs/empty-catalog';
 import type { CatalogCapabilities, NodeRef } from '../fs/catalog-caps';
 import { parseRefKey, refKey, refsEqual, showsResourceFork, showsTypeCreator } from '../fs/catalog-caps';
-import { formatStorePath, sidebarGlyphSrc, volumeChrome, type SidebarGlyphRole } from '../fs/volume-chrome';
+import { formatStorePath, networkGlyphSrc, sidebarGlyphSrc, volumeChrome, type SidebarGlyphRole } from '../fs/volume-chrome';
+import { isNetworkCatalog, NetworkCatalog } from '../fs/network-catalog';
+import {
+  matchNetworkServer,
+  NETWORK_ROOT_NAME,
+  NETWORK_SHARE_KEY,
+  parseNetworkPath,
+  serverNetworkPath,
+} from '../fs/network-tree';
+import {
+  isNetworkContainer,
+  isNetworkNavigable,
+  isNetworkOpenable,
+  opsForNetworkNode,
+  overlayNativeOf,
+  selectionAllowsMutate,
+  selectionAllowsZip,
+} from '../fs/network-ops';
+import { buildLocationCrumbs, type LocationMode } from './finder-location';
+import { modelFromEndpoint, networkInfoHtml, type NetworkInfoModel } from './network-info';
 import type { ByteRangeReader } from '../fs/byte-range';
 import type {
   Credentials,
@@ -99,6 +118,7 @@ import {
   viewingCatalogEndpoint,
   visibleSidebarGroups,
   volumesForEndpoint,
+  resolveSidebarActive,
 } from './finder-sidebar';
 
 /** Empty Finder pane when no sidebar volume is open. */
@@ -127,12 +147,37 @@ export type OpenRemoteOptions = {
   credentials?: Credentials;
   /**
    * When no `volume` is given, open the only advertised share automatically.
-   * Default true (sidebar click). Path-open without a volume passes false.
+   * Default true (path-open / URI). Sidebar clicks pass false and list shares.
    */
   autoOpenSingle?: boolean;
+  /**
+   * After login with no volume, show this server’s shares in the Finder pane
+   * (Network Browser folder). Default false — sidebar server clicks pass true.
+   */
+  listShares?: boolean;
   /** Folder path inside the volume (`csclient` URI path after the share). */
   folderPath?: string;
+  /** Typed client URI to show in the path bar (Advanced → Open by Path). */
+  locationUri?: string;
+  /** How this open should appear in the path bar. */
+  locationMode?: LocationMode;
+  /**
+   * Login / open a volume without replacing the Network Browser catalog.
+   * Used when expanding zone → server → share in place.
+   */
+  attachOnly?: boolean;
 };
+
+class NetworkAuthCancelled extends Error {
+  constructor() {
+    super('Network authentication cancelled');
+    this.name = 'NetworkAuthCancelled';
+  }
+}
+
+function isListingCancelled(err: unknown): boolean {
+  return isAbortError(err) || (err instanceof Error && err.name === 'NetworkAuthCancelled');
+}
 
 interface ListItem {
   key: string;
@@ -197,6 +242,7 @@ function itemAddr(it: ListItem): NodeRef | null {
 export class FinderWindow extends HTMLElement {
   private vfs!: Catalog;
   private localVfs: Catalog | null = null;
+  private networkCatalog: NetworkCatalog | null = null;
   private host!: FinderHost;
   private view: ViewMode = 'icon';
   private cwd: NodeRef = 2;
@@ -231,6 +277,11 @@ export class FinderWindow extends HTMLElement {
   private connectingVolume: string | null = null;
   private remoteNbpName = '';
   private remoteEndpoint: RemoteEndpoint | null = null;
+  /** How the current location was entered — drives path-bar crumbs. */
+  private locationMode: LocationMode = 'local';
+  private locationUri = '';
+  /** Network Browser crumbs kept when a share is mounted from that trail. */
+  private networkPrefix: { name: string; path: string; iconSrc?: string }[] = [];
   private eventsBound = false;
   private dragDepth = 0;
   /** Folder ids expanded in list-view outline. */
@@ -269,6 +320,7 @@ export class FinderWindow extends HTMLElement {
     sourceIds: NodeRef[];
   } | null = null;
   private catalogs = new Map<string, Catalog>();
+  private volumeUnsubs = new Map<string, () => void>();
   private contextMenu: {
     x: number;
     y: number;
@@ -422,7 +474,7 @@ export class FinderWindow extends HTMLElement {
 
   /** Live volume feature flags (Get Info / View menu). */
   catalogCapabilities(): CatalogCapabilities | null {
-    return this.vfs ? this.vfs.capabilities() : null;
+    return this.vfs ? this.caps() : null;
   }
 
   getDefaultView(): ViewMode {
@@ -457,6 +509,26 @@ export class FinderWindow extends HTMLElement {
 
   async applySortKey(key: SortKey): Promise<void> {
     await this.applySort(key, false);
+  }
+
+  /** True when View → Network Browser and the Network sidebar row should be offered. */
+  networkBrowserEnabled(): boolean {
+    if (this.host?.networkBrowserEnabled) return this.host.networkBrowserEnabled();
+    return this.hasTransport() ? this.host.isConnected() : true;
+  }
+
+  /** Open Browse Network at the root (View → Network Browser). */
+  async openNetworkBrowser(): Promise<void> {
+    if (!this.networkBrowserEnabled()) return;
+    await this.showNetworkBrowser();
+    this.closeSidebar();
+    this.syncHistory();
+    this.render();
+  }
+
+  /** True while the Network Browser catalog is the on-screen listing. */
+  isNetworkBrowserOpen(): boolean {
+    return isNetworkCatalog(this.vfs);
   }
 
   selectionSupportsPreview(): boolean {
@@ -531,6 +603,191 @@ export class FinderWindow extends HTMLElement {
     return typeof this.host?.connectTransport === 'function';
   }
 
+  private ensureNetworkCatalog(): NetworkCatalog {
+    if (!this.networkCatalog) {
+      this.networkCatalog = new NetworkCatalog({
+        endpoints: () => this.servers,
+        schemes: () => {
+          const listed = this.host.networkSchemes?.() ?? [];
+          return listed.filter((k) => k !== 'local');
+        },
+        volumes: (ep) => this.volumesFor(ep),
+        volumeCatalog: (ep, vol) => this.catalogs.get(shareKeyForEndpoint(ep, vol)),
+        volumeCatalogKey: (ep, vol) => {
+          const key = shareKeyForEndpoint(ep, vol);
+          return this.catalogs.has(key) ? key : undefined;
+        },
+      });
+    }
+    return this.networkCatalog;
+  }
+
+  private parseCwdNetwork() {
+    return parseNetworkPath(typeof this.cwd === 'string' ? this.cwd : '', this.servers);
+  }
+
+  /** Volume catalog when the Network Browser cwd is inside a mounted share. */
+  private activeCatalog(): Catalog {
+    if (!isNetworkCatalog(this.vfs)) return this.vfs;
+    const node = this.findNodeAnywhere(this.cwd);
+    const key = node?.chrome?.catalogKey;
+    if (key) {
+      const cat = this.catalogs.get(key);
+      if (cat) return cat;
+    }
+    const info = this.parseCwdNetwork();
+    if (info.share && info.protocol && info.server) {
+      const ep = matchNetworkServer(this.servers, info.protocol, info.neighborhood, info.server);
+      if (ep) {
+        const cat = this.catalogs.get(shareKeyForEndpoint(ep, info.share));
+        if (cat) return cat;
+      }
+    }
+    return this.vfs;
+  }
+
+  private caps(): CatalogCapabilities {
+    return this.activeCatalog().capabilities();
+  }
+
+  private capsForNode(node?: VNode | null): CatalogCapabilities {
+    const key = node?.chrome?.catalogKey;
+    if (key) {
+      const cat = this.catalogs.get(key);
+      if (cat) return cat.capabilities();
+    }
+    return this.caps();
+  }
+
+  private catalogForNode(node?: VNode | null): Catalog {
+    const key = node?.chrome?.catalogKey;
+    if (key) {
+      const cat = this.catalogs.get(key);
+      if (cat) return cat;
+    }
+    return this.activeCatalog();
+  }
+
+  /**
+   * Volume catalog + native ref when `node` is a Network Browser overlay of a
+   * mounted share (or the share itself as a folder destination).
+   */
+  private overlayNative(node?: VNode | null): { cat: Catalog; ref: NodeRef } | null {
+    const hit = overlayNativeOf(node);
+    if (!hit) return null;
+    const cat = this.catalogs.get(hit.catalogKey);
+    if (!cat) return null;
+    return { cat, ref: hit.nativeRef };
+  }
+
+  private async nativeFromNetworkPath(path: string): Promise<{ cat: Catalog; ref: NodeRef } | null> {
+    const info = parseNetworkPath(path, this.servers);
+    if (info.role !== 'share' || !info.share || !info.protocol || !info.server) return null;
+    const ep = matchNetworkServer(this.servers, info.protocol, info.neighborhood, info.server);
+    if (!ep) return null;
+    const cat = this.catalogs.get(shareKeyForEndpoint(ep, info.share));
+    if (!cat) return null;
+    if (!info.volumePath) return { cat, ref: cat.rootId() };
+    const n = await cat.resolvePath(info.volumePath);
+    return n ? { cat, ref: nodeRef(n) } : null;
+  }
+
+  /** Map an overlay path/node to the mounted volume catalog. */
+  private async resolveNative(ref: NodeRef, hint?: VNode | null): Promise<{ cat: Catalog; ref: NodeRef }> {
+    const node = hint ?? this.findNodeAnywhere(ref) ?? (await this.vfs.get(ref));
+    const fromNode = this.overlayNative(node);
+    if (fromNode) return fromNode;
+    if (isNetworkCatalog(this.vfs) && typeof ref === 'string') {
+      const mapped = await this.nativeFromNetworkPath(ref);
+      if (mapped) return mapped;
+    }
+    return { cat: this.vfs, ref };
+  }
+
+  /** Native vnode for zip / snapshot / expand (identity matches the volume catalog). */
+  private async nativeNode(node: VNode): Promise<{ cat: Catalog; node: VNode }> {
+    const handle = this.overlayNative(node);
+    if (!handle) return { cat: this.vfs, node };
+    const n = await handle.cat.get(handle.ref);
+    return n ? { cat: handle.cat, node: n } : { cat: this.vfs, node };
+  }
+
+  private endpointForNetworkNode(node: VNode): RemoteEndpoint | undefined {
+    const id = node.chrome?.endpointId;
+    if (!id) return undefined;
+    return this.servers.find((s) => s.id === id) ?? (this.remoteEndpoint?.id === id ? this.remoteEndpoint : undefined);
+  }
+
+  /** Walk Browse Network to `path` (`AFP/LToUDP Network/snow`). Empty = root. */
+  private async showNetworkBrowser(path = ''): Promise<void> {
+    const cat = this.ensureNetworkCatalog();
+    this.attachCatalog(cat);
+    this.source = 'remote';
+    this.remoteOpen = false;
+    this.locationMode = 'network';
+    this.locationUri = '';
+    this.networkPrefix = [];
+    const parts = path.split('/').filter(Boolean);
+    this.pathStack = [{ id: '', name: NETWORK_ROOT_NAME }];
+    let cur = '';
+    for (const name of parts) {
+      cur = cur ? `${cur}/${name}` : name;
+      this.pathStack.push({ id: cur, name });
+    }
+    this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+    this.clearSelection();
+    this.renamingId = null;
+    this.showProps = false;
+    const info = parseNetworkPath(typeof this.cwd === 'string' ? this.cwd : '', this.servers);
+    if ((info.role === 'server' || info.role === 'share') && info.protocol && info.server) {
+      const ep = matchNetworkServer(this.servers, info.protocol, info.neighborhood, info.server);
+      if (ep) this.adoptEndpoint(ep);
+    } else if (info.role === 'root' || info.role === 'protocol' || info.role === 'neighborhood') {
+      if (!this.loggedInEndpoints.has(this.remoteEndpoint?.id || '')) {
+        this.remoteEndpoint = null;
+      }
+    }
+    this.setStatus(path ? `${NETWORK_ROOT_NAME}:${parts.join(':')}` : NETWORK_ROOT_NAME);
+    await this.reload();
+    this.renderSidebar();
+  }
+
+  private async showServerSharesFolder(s: RemoteEndpoint): Promise<void> {
+    const path = serverNetworkPath(s);
+    this.adoptEndpoint(s);
+    await this.showNetworkBrowser(path || '');
+  }
+
+  private async openNetworkShare(node: VNode): Promise<boolean> {
+    const ep = this.endpointForNetworkNode(node);
+    const name = node.name;
+    if (!ep || !name) return false;
+    this.locationMode = 'network';
+    this.locationUri = '';
+    return this.ensureVolumeAttached(ep, name);
+  }
+
+  /** Login / open a share from a Network Browser node. Returns true when the click is consumed. */
+  private async activateNetworkNode(node: VNode): Promise<boolean> {
+    const role = node.chrome?.networkRole;
+    if (role === 'service') {
+      this.selectOnly(nodeRef(node));
+      this.showPropertiesPanel();
+      return true;
+    }
+    if (role === 'share') {
+      const ok = await this.openNetworkShare(node);
+      return !ok;
+    }
+    if (role === 'server') {
+      const ep = this.endpointForNetworkNode(node);
+      if (!ep) return false;
+      const ok = await this.ensureLoggedIn(ep);
+      return !ok;
+    }
+    return false;
+  }
+
   private attachCatalog(next: Catalog): void {
     if (this.vfs === next) return;
     this.vfsUnsub?.();
@@ -561,6 +818,8 @@ export class FinderWindow extends HTMLElement {
       const cat = this.catalogs.get(key);
       if (this.clipboard && this.clipboard.source === cat) this.clipboard.source = null;
       this.catalogs.delete(key);
+      this.volumeUnsubs.get(key)?.();
+      this.volumeUnsubs.delete(key);
     }
   }
 
@@ -679,7 +938,12 @@ export class FinderWindow extends HTMLElement {
 
   /** Reload the listing only when `dest` is the open catalog and a parent is on screen. */
   private async refreshIfDestVisible(dest: Catalog, ...parentIds: NodeRef[]): Promise<void> {
-    if (this.vfs !== dest) return;
+    if (this.vfs !== dest) {
+      if (isNetworkCatalog(this.vfs) && [...this.catalogs.values()].includes(dest)) {
+        await this.refreshAfterMutation();
+      }
+      return;
+    }
     if (!this.changeImpactsVisibleFolders(parentIds)) return;
     await this.refreshAfterMutation();
   }
@@ -888,6 +1152,7 @@ export class FinderWindow extends HTMLElement {
     ) {
       this.servers = [this.remoteEndpoint, ...list];
     }
+    this.networkCatalog?.notify();
     this.renderSidebar();
   }
 
@@ -905,6 +1170,7 @@ export class FinderWindow extends HTMLElement {
       this.servers = [ep, ...this.servers];
       this.renderSidebar();
     }
+    this.applyLocationOpts(opts);
     const ok = await this.connectServerWithLogin(target, opts?.volume, opts);
     if (!ok) return { ok: false, volumes: this.volumesFor(target) };
     if (opts?.folderPath && this.remoteOpen) {
@@ -1010,6 +1276,15 @@ export class FinderWindow extends HTMLElement {
     path: string[];
   } {
     const metaId = this.remoteEndpoint?.id ?? '';
+    if (isNetworkCatalog(this.vfs)) {
+      return {
+        view: this.view,
+        source: 'remote',
+        share: NETWORK_SHARE_KEY,
+        vol: NETWORK_ROOT_NAME,
+        path: this.pathNamesForUrl(),
+      };
+    }
     return {
       view: this.view,
       source: this.source,
@@ -1093,6 +1368,16 @@ export class FinderWindow extends HTMLElement {
       this.view = state.view;
       this.clearSelection();
       if (state.source === 'remote') {
+        if (state.share === NETWORK_SHARE_KEY) {
+          if (!this.networkBrowserEnabled()) {
+            bounceToLocal = true;
+            this.bounceRemoteNavigation('Network Browser is unavailable until the client is enabled.');
+            await this.reload();
+            return;
+          }
+          await this.showNetworkBrowser(state.path.join('/'));
+          return;
+        }
         const target = state.vol ? `${state.share}:${state.vol}` : state.share || 'remote share';
         if (!state.share || !state.vol) {
           bounceToLocal = true;
@@ -1166,6 +1451,13 @@ export class FinderWindow extends HTMLElement {
   }
 
   private emptyPaneMessage(): string {
+    if (isNetworkCatalog(this.vfs)) {
+      const info = this.parseCwdNetwork();
+      if (info.role === 'server') return 'No shares listed — open this folder to sign in.';
+      if (info.role === 'neighborhood') return 'No servers in this network.';
+      if (info.role === 'protocol') return 'No networks found.';
+      return 'Open a protocol to browse the network.';
+    }
     if (this.isNoVolumeSelected() || !this.hasLocalShare()) return NO_VOLUME_HINT;
     if (this.hasTransport()) return 'Drop files or folders here, or browse the LocalTalk network.';
     return NO_VOLUME_HINT;
@@ -1196,6 +1488,9 @@ export class FinderWindow extends HTMLElement {
     }
     this.mountCatalog(local, 'local', this.localShareTitle());
     this.remoteOpen = false;
+    this.locationMode = 'local';
+    this.locationUri = '';
+    this.networkPrefix = [];
   }
 
   private resetToLocalShare(): void {
@@ -1327,6 +1622,9 @@ export class FinderWindow extends HTMLElement {
       }
       if (signal.aborted || this.cwd !== listedId) return;
       await this.refreshColumns(listedId, signal);
+    } catch (err) {
+      if (isListingCancelled(err)) return;
+      throw err;
     } finally {
       if (!signal.aborted && this.enumeratingFolderId === listedId) {
         this.enumeratingFolderId = null;
@@ -1347,6 +1645,9 @@ export class FinderWindow extends HTMLElement {
     signal?: AbortSignal,
   ): Promise<VNode[]> {
     try {
+      const ready = await this.prepareNetworkListing(parentId, signal);
+      if (signal?.aborted) return [];
+      if (!ready) throw new NetworkAuthCancelled();
       return this.sortNodes(
         await this.vfs.children(
           parentId,
@@ -1378,7 +1679,9 @@ export class FinderWindow extends HTMLElement {
     const list = nodes.filter((n) => this.isVisibleInFinder(n.name, n, n.finderInfo));
     const dir = this.sortDir === 'asc' ? 1 : -1;
     list.sort((a, b) => {
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      const aFold = a.isDir || isNetworkContainer(a);
+      const bFold = b.isDir || isNetworkContainer(b);
+      if (aFold !== bFold) return aFold ? -1 : 1;
       let cmp = 0;
       switch (this.sortKey) {
         case 'modified':
@@ -1404,9 +1707,9 @@ export class FinderWindow extends HTMLElement {
   private isVisibleInFinder(name: string, node?: VNode, finderInfo?: Uint8Array): boolean {
     if (this.showHiddenFiles) return true;
     if (isCustomFolderIconName(name)) return false;
-    const hide = this.vfs.capabilities().hideAttribute;
+    const hide = this.capsForNode(node).hideAttribute;
     if (hide && node?.attrs?.[hide]) return false;
-    if (this.vfs.capabilities().finderInfo && finderInfo && isFinderInvisible(finderInfo)) return false;
+    if (this.capsForNode(node).finderInfo && finderInfo && isFinderInvisible(finderInfo)) return false;
     return true;
   }
 
@@ -1418,12 +1721,20 @@ export class FinderWindow extends HTMLElement {
     return items;
   }
 
+  private itemIsNavigable(it: ListItem): boolean {
+    return it.isDir || isNetworkNavigable(it.node);
+  }
+
+  private itemIsOpenable(it: ListItem): boolean {
+    return it.isDir || isNetworkOpenable(it.node);
+  }
+
   private listItemFromNode(n: VNode): ListItem {
     const item: ListItem = {
       key: refKey(nodeRef(n)),
       name: n.name,
       isDir: n.isDir,
-      size: nodeByteSize(n, this.vfs.capabilities().resourceFork),
+      size: nodeByteSize(n, this.capsForNode(n).resourceFork),
       mod: unixDate(n.modDate),
       node: n,
       finderInfo: n.finderInfo,
@@ -1469,7 +1780,9 @@ export class FinderWindow extends HTMLElement {
     const placeholders = items.filter((it) => it.placeholder);
     const dir = this.sortDir === 'asc' ? 1 : -1;
     list.sort((a, b) => {
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      const aFold = a.isDir || isNetworkContainer(a.node);
+      const bFold = b.isDir || isNetworkContainer(b.node);
+      if (aFold !== bFold) return aFold ? -1 : 1;
       let cmp = 0;
       switch (this.sortKey) {
         case 'modified':
@@ -1744,18 +2057,41 @@ export class FinderWindow extends HTMLElement {
     btn.innerHTML = max ? uiIcons.restore : uiIcons.maximize;
   }
 
+  private selectionNodes(): VNode[] {
+    const ids = this.selectedIds.size > 1 ? [...this.selectedIds] : this.selectedId != null ? [this.selectedId] : [];
+    const nodes: VNode[] = [];
+    for (const id of ids) {
+      const n = this.findNodeAnywhere(id);
+      if (n) nodes.push(n);
+    }
+    return nodes;
+  }
+
+  private networkListingLocked(): boolean {
+    if (!isNetworkCatalog(this.vfs)) return false;
+    const info = this.parseCwdNetwork();
+    return !info.share;
+  }
+
   private syncClipboardButtons(): void {
     const hasSel = this.selectedId != null;
+    const nodes = this.selectionNodes();
+    const canMutate = hasSel && !this.networkListingLocked() && selectionAllowsMutate(nodes);
+    const canZip = hasSel && selectionAllowsZip(nodes);
     const cut = this.querySelector('[data-act="cut"]') as HTMLButtonElement | null;
     const copy = this.querySelector('[data-act="copy"]') as HTMLButtonElement | null;
     const paste = this.querySelector('[data-act="paste"]') as HTMLButtonElement | null;
     const del = this.querySelector('[data-act="delete"]') as HTMLButtonElement | null;
     const props = this.querySelector('[data-act="props"]') as HTMLButtonElement | null;
-    if (cut) cut.disabled = !hasSel;
-    if (copy) copy.disabled = !hasSel;
-    if (paste) paste.disabled = !this.clipboard;
-    if (del) del.disabled = !hasSel;
+    const mkdir = this.querySelector('[data-act="mkdir"]') as HTMLButtonElement | null;
+    const download = this.querySelector('[data-act="download"]') as HTMLButtonElement | null;
+    if (cut) cut.disabled = !canMutate;
+    if (copy) copy.disabled = !canMutate;
+    if (paste) paste.disabled = !this.clipboard || this.networkListingLocked();
+    if (del) del.disabled = !canMutate;
     if (props) props.disabled = !hasSel;
+    if (mkdir) mkdir.disabled = this.caps().readOnly || this.networkListingLocked();
+    if (download) download.disabled = hasSel ? !canZip && this.networkListingLocked() : this.networkListingLocked();
   }
 
   private syncPropsButton(): void {
@@ -1806,14 +2142,39 @@ export class FinderWindow extends HTMLElement {
     const connectedId = this.remoteNbpName || this.remoteEndpoint?.id || '';
     const volumes = this.remoteVolumes;
     const viewingLocal = this.source === 'local' && this.hasLocalShare();
-    const openVol = this.source === 'remote' ? this.pathStack[0]?.name || '' : '';
-    const viewingServer = this.source === 'remote' && !this.remoteOpen;
+    const netInfo = isNetworkCatalog(this.vfs) ? this.parseCwdNetwork() : null;
+    const networkServerId =
+      netInfo && (netInfo.role === 'server' || netInfo.role === 'share')
+        ? this.remoteEndpoint?.id ||
+          this.servers.find(
+            (s) =>
+              s.kind === netInfo.protocol &&
+              s.title.trim().toLowerCase() === (netInfo.server || '').toLowerCase(),
+          )?.id
+        : undefined;
+    const openVol =
+      netInfo?.role === 'share'
+        ? netInfo.share || ''
+        : this.source === 'remote' && this.remoteOpen
+          ? this.pathStack[0]?.name || ''
+          : '';
+    const active = resolveSidebarActive({
+      connectingEndpointId: this.connectingEndpointId,
+      connectingVolume: this.connectingVolume,
+      viewingLocal,
+      networkCatalog: isNetworkCatalog(this.vfs),
+      networkRole: netInfo?.role ?? '',
+      networkServerId,
+      remoteOpen: this.remoteOpen,
+      openVolume: openVol,
+      remoteEndpointId: this.remoteEndpoint?.id || this.remoteNbpName || '',
+    });
     const groups = this.sidebarGroups();
     const byGroup = endpointsByGroup(this.servers, groups);
     const refreshEnabled = this.host?.isConnected() || !this.hasTransport();
     const groupBlocks = visibleSidebarGroups(groups, byGroup)
       .map((g) => {
-        const rows = byGroup.get(g.id) ?? [];
+        const rows = (byGroup.get(g.id) ?? []).filter(({ ep }) => !ep.own);
         const items =
           rows
             .map(({ ep: s, index: i }) =>
@@ -1822,7 +2183,7 @@ export class FinderWindow extends HTMLElement {
                 volumes,
                 viewingLocal,
                 openVol,
-                viewingServer,
+                active,
               }),
             )
             .join('') ||
@@ -1841,14 +2202,22 @@ export class FinderWindow extends HTMLElement {
       .join('');
     const localBlock = this.hasLocalShare()
       ? `<div class="side-label">Local</div>
-      <div class="side-item ${viewingLocal ? 'selected' : ''}" data-local data-share-key="${LOCAL_SHARE_KEY}" data-share-name="${this.escape(this.localShareTitle())}">
+      <div class="side-item ${viewingLocal && active.kind === 'local' ? 'selected' : ''}" data-local data-share-key="${LOCAL_SHARE_KEY}" data-share-name="${this.escape(this.localShareTitle())}">
         <span class="dot"></span>
         <span class="side-item-label" aria-label="${this.escape(this.localShareTitle())}">${this.escape(this.localShareTitle())}</span>
         <button type="button" class="side-more" data-act="share-actions" aria-label="Share actions" title="Share actions">${uiIcons.more}</button>
       </div>`
       : '';
+    const networkBlock = this.networkBrowserEnabled()
+      ? `<div class="side-label">Network</div>
+      <div class="side-item ${active.kind === 'network' ? 'selected' : ''}" data-network>
+        ${this.sidebarGlyphHtml(networkGlyphSrc('root'))}
+        <span class="side-item-label" aria-label="${this.escape(NETWORK_ROOT_NAME)}">${this.escape(NETWORK_ROOT_NAME)}</span>
+      </div>`
+      : '';
     side.innerHTML = `
       ${localBlock}
+      ${networkBlock}
       ${groupBlocks}
     `;
   }
@@ -1895,6 +2264,11 @@ export class FinderWindow extends HTMLElement {
     if (isCatalogEndpoint(s)) {
       return viewingCatalogEndpoint(s, currentId, this.source, this.remoteOpen);
     }
+    if (isNetworkCatalog(this.vfs)) {
+      const info = this.parseCwdNetwork();
+      if (info.role !== 'server' && info.role !== 'share') return false;
+      return currentId === s.id || (info.server === s.title && s.kind === info.protocol);
+    }
     if (this.source !== 'remote' || !this.remoteOpen || currentId !== s.id) return false;
     const openName = this.pathStack[0]?.name;
     return !!openName && this.volumesFor(s).includes(openName);
@@ -1929,14 +2303,14 @@ export class FinderWindow extends HTMLElement {
       volumes: string[];
       viewingLocal: boolean;
       openVol: string;
-      viewingServer: boolean;
+      active: ReturnType<typeof resolveSidebarActive>;
     },
   ): string {
     const connected = this.loggedInEndpoints.has(s.id) || (this.remoteLoggedIn && s.id === opts.connectedId);
     const localShare = s.kind === 'local';
     const volumeRow = s.role === 'volume';
     const chrome = volumeChrome({
-      ...this.vfs.capabilities(),
+      ...this.caps(),
       identity: { shareKind: s.kind, protocol: s.protocol as typeof s.kind },
     });
     const glyphClass = `side-item--${chrome.volumeIcon}`;
@@ -1944,12 +2318,11 @@ export class FinderWindow extends HTMLElement {
     const rowRole: SidebarGlyphRole = localShare ? 'share' : volumeRow ? 'volume' : 'server';
     const serverGlyph = this.sidebarGlyphHtml(sidebarGlyphSrc(protocol, rowRole));
     const volumeGlyph = this.sidebarGlyphHtml(sidebarGlyphSrc(protocol, 'volume'));
-    const isCurrent = s.id === opts.connectedId;
     const connectingHere = this.connectingEndpointId === s.id;
     const connectingServer = connectingHere && !this.connectingVolume;
     const serverSel =
-      connectingServer ||
-      (isCurrent && (localShare ? this.source === 'remote' : opts.viewingServer))
+      (opts.active.kind === 'server' && opts.active.id === s.id) ||
+      (isCatalogEndpoint(s) && opts.active.kind === 'volume' && opts.active.id === s.id)
         ? 'selected'
         : '';
     const serverBusy = connectingServer || (connectingHere && (localShare || volumeRow) && !this.connectingVolume);
@@ -1961,7 +2334,9 @@ export class FinderWindow extends HTMLElement {
               const shareKey = shareKeyForEndpoint(s, v);
               const connectingVol = connectingHere && this.connectingVolume === v;
               const selected =
-                connectingVol || (isCurrent && !opts.viewingLocal && opts.openVol === v) ? 'selected' : '';
+                opts.active.kind === 'volume' && opts.active.id === s.id && opts.active.volume === v
+                  ? 'selected'
+                  : '';
               const eject = this.volumeIsOpen(s, v)
                 ? `<button type="button" class="side-eject" data-eject="${vi}" data-vol-name="${this.escape(v)}" title="Eject" aria-label="Eject">${uiIcons.eject}</button>`
                 : '';
@@ -2011,20 +2386,34 @@ export class FinderWindow extends HTMLElement {
       </div>${kids}`;
   }
 
+  private locationCrumbs() {
+    const volumeMounted = this.remoteOpen && !isNetworkCatalog(this.vfs);
+    const proto = this.remoteEndpoint?.protocol || this.remoteEndpoint?.kind;
+    return buildLocationCrumbs({
+      mode: isNetworkCatalog(this.vfs) ? 'network' : this.locationMode,
+      locationUri: this.locationUri,
+      serverTitle: this.remoteEndpoint?.title || '',
+      protocol: proto,
+      groupTitle: this.catalogGroupTitle(),
+      networkPrefix: this.networkPrefix,
+      pathStack: this.pathStack,
+      volumeMounted,
+    });
+  }
+
+  /** Sidebar group for a hosted share / FUSE mount — not a LAN server name. */
+  private catalogGroupTitle(): string {
+    const ep = this.remoteEndpoint;
+    if (!ep || !isCatalogEndpoint(ep) || isNetworkCatalog(this.vfs)) return '';
+    const groups = this.sidebarGroups();
+    const id = assignSidebarGroup(ep, groups);
+    return groups.find((g) => g.id === id)?.title || '';
+  }
+
   private renderPath(): void {
     const bar = this.querySelector('.pathbar');
     if (!bar) return;
-    type Crumb = { name: string; id?: NodeRef; index: number };
-    const crumbs: Crumb[] = this.isNoVolumeSelected()
-      ? []
-      : this.pathStack.map((p, i) => ({
-          name:
-            i === 0 && this.source === 'remote' && this.remoteNbpName && this.remoteEndpoint?.kind !== 'local'
-              ? `${this.remoteNbpName}:${p.name}`
-              : p.name || (this.hasLocalShare() ? this.localShareTitle() : ''),
-          id: p.id,
-          index: i,
-        }));
+    const crumbs = this.isNoVolumeSelected() ? [] : this.locationCrumbs();
 
     bar.innerHTML =
       `<button type="button" class="locations-btn" data-act="locations" aria-label="Locations" title="Locations">${uiIcons.menu}</button>` +
@@ -2032,23 +2421,40 @@ export class FinderWindow extends HTMLElement {
       .map((p, i) => {
         const label = this.escape(p.name);
         const current = i === crumbs.length - 1;
-        const dropAttr = p.id != null ? `data-path-id="${refKey(p.id)}"` : '';
+        const dropAttr = p.nodeId != null ? `data-path-id="${refKey(p.nodeId)}"` : '';
+        const locAttr = p.networkPath != null
+          ? `data-loc="network" data-network-path="${this.escape(p.networkPath)}"`
+          : p.serverShares
+            ? `data-loc="server"`
+            : p.volumeRoot
+              ? `data-loc="volume"`
+              : p.pathIndex != null
+                ? `data-loc="node" data-path-index="${p.pathIndex}"`
+                : '';
         const sep = i > 0 ? `<span class="crumb-sep" aria-hidden="true">&gt;</span>` : '';
-        const urls = p.id != null ? this.iconUrls.get(refKey(p.id)) : undefined;
+        const urls = p.nodeId != null ? this.iconUrls.get(refKey(p.nodeId)) : undefined;
+        const crumbNode = p.nodeId != null ? this.findNodeAnywhere(p.nodeId) : undefined;
+        let chromeSrc = p.iconSrc || crumbNode?.chrome?.iconSrc;
+        if (!chromeSrc && isNetworkCatalog(this.vfs) && p.nodeId != null) {
+          const info = parseNetworkPath(String(p.nodeId), this.servers);
+          chromeSrc = info.volumePath ? undefined : networkGlyphSrc(info.role, info.protocol);
+        }
         const icon =
-          p.id != null && this.isFolderEnumerating(p.id)
+          p.nodeId != null && this.isFolderEnumerating(p.nodeId)
             ? this.listingSpinnerHtml('crumb')
-            : urls && !isDefaultFolderIcon(urls)
+            : chromeSrc
+              ? `<img class="crumb-icon-img" src="${this.escape(chromeSrc)}" alt="" width="16" height="16" draggable="false" />`
+              : urls && !isDefaultFolderIcon(urls)
               ? `<img class="crumb-icon-img" src="${this.escape(urls.small)}" alt="" width="16" height="16" draggable="false" />`
               : this.folderGlyphHtml('small', 'crumb');
-        return `${sep}<button type="button" class="crumb${current ? ' current' : ''}" data-path-index="${p.index}" ${dropAttr} title="${label}" aria-label="${label}">
+        return `${sep}<button type="button" class="crumb${current ? ' current' : ''}" ${locAttr} ${dropAttr} title="${label}" aria-label="${label}">
           ${icon}
           <span class="crumb-label">${label}</span>
         </button>`;
       })
       .join('');
 
-    this.prefetchPathIcons(crumbs);
+    this.prefetchPathIcons(crumbs.map((c) => ({ id: c.nodeId })));
   }
 
   /** Load 16px folder icons for path crumbs (local share). */
@@ -2282,7 +2688,7 @@ export class FinderWindow extends HTMLElement {
     const items = this.mergeWritingItems(parentId, nodes.map((n) => this.listItemFromNode(n)));
     for (const item of items) {
       rows.push({ item, depth });
-      if (item.node && item.isDir && this.expandedIds.has(nodeRef(item.node))) {
+      if (item.node && this.itemIsNavigable(item) && this.expandedIds.has(nodeRef(item.node))) {
         const id = nodeRef(item.node);
         const kids = this.listChildCache.get(id) ?? [];
         if (kids.length === 0 && this.loadingIds.has(id) && !transferActivity.writesIn(this.vfs, id).length) {
@@ -2303,9 +2709,11 @@ export class FinderWindow extends HTMLElement {
     </div>`;
     }
     const sel = this.isKeySelected(it.key) ? 'selected' : '';
-    const drag = it.writing && !it.node ? '' : 'draggable="true"';
+    const drag = it.writing && !it.node ? '' : isNetworkContainer(it.node) ? '' : 'draggable="true"';
     const write = this.writeItemAttrs(it);
-    return `<div class="icon-item ${sel}${it.writing ? ' writing' : ''}" data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" ${write} ${drag}>
+    const openable = this.itemIsOpenable(it);
+    const navigable = this.itemIsNavigable(it);
+    return `<div class="icon-item ${sel}${it.writing ? ' writing' : ''}" data-id="${it.key}" data-dir="${navigable ? '1' : '0'}" data-open="${openable ? '1' : '0'}" ${write} ${drag}>
       ${this.glyphHtml(it, 'large', 'icon')}
       <div class="icon-name">${this.nameLabelHtml(it)}</div>
     </div>`;
@@ -2321,18 +2729,18 @@ export class FinderWindow extends HTMLElement {
     }
     const sel = this.isKeySelected(it.key) ? 'selected' : '';
     const id = itemAddr(it);
-    const expanded = it.isDir && id != null && this.expandedIds.has(id);
-    const loading = it.isDir && id != null && this.loadingIds.has(id);
-    const drag = it.writing && !it.node ? '' : 'draggable="true"';
+    const expanded = this.itemIsNavigable(it) && id != null && this.expandedIds.has(id);
+    const loading = this.itemIsNavigable(it) && id != null && this.loadingIds.has(id);
+    const drag = it.writing && !it.node ? '' : isNetworkContainer(it.node) ? '' : 'draggable="true"';
     const write = this.writeItemAttrs(it);
-    const disclose = it.isDir && it.node
+    const disclose = this.itemIsNavigable(it) && it.node
       ? `<button type="button" class="disclose ${expanded ? 'open' : ''}${loading ? ' loading' : ''}" data-disclose="${it.key}" aria-busy="${loading}" aria-label="${
           loading ? 'Loading' : expanded ? 'Collapse' : 'Expand'
         }">${uiIcons.disclose}</button>`
       : `<span class="disclose spacer"></span>`;
-    return `<tr data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" class="${sel}${it.writing ? ' writing' : ''}" style="--depth:${depth}" aria-label="${this.escape(it.name)}" ${write} ${drag}>
+    return `<tr data-id="${it.key}" data-dir="${this.itemIsNavigable(it) ? '1' : '0'}" data-open="${this.itemIsOpenable(it) ? '1' : '0'}" class="${sel}${it.writing ? ' writing' : ''}" style="--depth:${depth}" aria-label="${this.escape(it.name)}" ${write} ${drag}>
       <td class="name-cell">${disclose}${this.glyphHtml(it, 'small', 'row')}${this.nameLabelHtml(it)}</td>
-      <td>${it.isDir ? '—' : formatBytes(it.size)}</td>
+      <td>${it.isDir || isNetworkContainer(it.node) ? '—' : formatBytes(it.size)}</td>
       <td>${it.mod.toLocaleString()}</td>
     </tr>`;
   }
@@ -2345,10 +2753,10 @@ export class FinderWindow extends HTMLElement {
     }
     const id = itemAddr(it);
     const sel = id != null && selectedInColumn.has(id) ? 'selected' : '';
-    const drag = it.writing && !it.node ? '' : 'draggable="true"';
+    const drag = it.writing && !it.node ? '' : isNetworkContainer(it.node) ? '' : 'draggable="true"';
     const write = this.writeItemAttrs(it);
     const label = this.nameLabelHtml(it, 'col-name');
-    return `<div class="col-item ${sel}${it.writing ? ' writing' : ''}" data-id="${it.key}" data-dir="${it.isDir ? '1' : '0'}" data-col="${colIndex}" aria-label="${this.escape(it.name)}" ${write} ${drag}>
+    return `<div class="col-item ${sel}${it.writing ? ' writing' : ''}" data-id="${it.key}" data-dir="${this.itemIsNavigable(it) ? '1' : '0'}" data-open="${this.itemIsOpenable(it) ? '1' : '0'}" data-col="${colIndex}" aria-label="${this.escape(it.name)}" ${write} ${drag}>
       ${this.glyphHtml(it, 'small', 'col')}${label}
     </div>`;
   }
@@ -2386,12 +2794,16 @@ export class FinderWindow extends HTMLElement {
   private glyphHtml(it: ListItem, size: 'small' | 'large', kind: 'icon' | 'row' | 'col'): string {
     if (it.placeholder) return this.listingSpinnerHtml(kind);
     const id = itemAddr(it);
-    const enumerating = it.isDir && id != null && this.isFolderEnumerating(id) && !it.writing;
+    const enumerating = this.itemIsNavigable(it) && id != null && this.isFolderEnumerating(id) && !it.writing;
     if (enumerating) return this.listingSpinnerHtml(kind);
     const urls = this.iconUrls.get(it.key);
     const px = size === 'large' ? 32 : 16;
     let inner: string;
-    if (urls && !(it.isDir && isDefaultFolderIcon(urls))) {
+    const chromeSrc = it.node?.chrome?.iconSrc;
+    if (chromeSrc) {
+      const imgCls = kind === 'icon' ? 'icon-glyph-img' : kind === 'col' ? 'col-icon-img' : 'row-icon-img';
+      inner = `<img class="${imgCls}" src="${this.escape(chromeSrc)}" alt="" width="${px}" height="${px}" draggable="false" />`;
+    } else if (urls && !(it.isDir && isDefaultFolderIcon(urls))) {
       const src = size === 'large' ? urls.large : urls.small;
       const imgCls = kind === 'icon' ? 'icon-glyph-img' : kind === 'col' ? 'col-icon-img' : 'row-icon-img';
       inner = `<img class="${imgCls}" src="${this.escape(src)}" alt="" width="${px}" height="${px}" draggable="false" />`;
@@ -2440,8 +2852,8 @@ export class FinderWindow extends HTMLElement {
       this.readFinderIcons ? (n) => this.vfs.loadIconResources(n, signal) : undefined,
       {
         loadDesktopIcons:
-          this.readFinderIcons && this.vfs.loadDesktopIcons
-            ? (type, creator) => this.vfs.loadDesktopIcons!(type, creator, signal)
+          this.readFinderIcons && this.catalogForNode(node).loadDesktopIcons
+            ? (type, creator) => this.catalogForNode(node).loadDesktopIcons!(type, creator, signal)
             : undefined,
         loadDataRange,
         signal,
@@ -2539,6 +2951,7 @@ export class FinderWindow extends HTMLElement {
     const gen = this.iconLoadGen;
     const signal = this.iconAbort?.signal;
     if (it.placeholder || this.iconUrls.has(it.key)) return;
+    if (it.node?.chrome?.iconSrc) return;
     if (gen !== this.iconLoadGen || signal?.aborted) return;
     if (!this.isFinderIconVisible(it.key)) return;
     try {
@@ -2641,6 +3054,63 @@ export class FinderWindow extends HTMLElement {
     return new Set();
   }
 
+  private networkInfoModel(node: VNode): NetworkInfoModel {
+    const role = node.chrome?.networkRole || 'root';
+    const ep = this.endpointForNetworkNode(node);
+    const extras = ep ? this.host.endpointInfoExtras?.(ep, role === 'share' ? node.name : undefined) : undefined;
+    if (ep && (role === 'server' || role === 'share' || role === 'service')) {
+      const model = modelFromEndpoint(ep, {
+        volume: role === 'share' ? node.name : undefined,
+        uams: extras?.uams,
+        mountpoint: extras?.mountpoint,
+        volumes: extras?.volumes ?? this.volumesFor(ep),
+      });
+      model.kind = role === 'service' ? 'service' : model.kind;
+      model.serviceKind = node.chrome?.serviceKind;
+      model.iconSrc = node.chrome?.iconSrc || model.iconSrc;
+      model.name = node.name;
+      return model;
+    }
+    const info = parseNetworkPath(
+      typeof nodeRef(node) === 'string' ? String(nodeRef(node)) : '',
+      this.servers,
+    );
+    return {
+      kind: role,
+      name: node.name,
+      protocol: info.protocol,
+      neighborhood: info.neighborhood,
+      server: info.server,
+      iconSrc: node.chrome?.iconSrc,
+    };
+  }
+
+  private networkItemInfoHtml(node: VNode, opts: { variant: 'column' | 'dialog' }): string {
+    return networkInfoHtml(this.networkInfoModel(node), {
+      variant: opts.variant,
+      zipShare: node.chrome?.networkRole === 'share',
+    });
+  }
+
+  private showEndpointGetInfo(ep: RemoteEndpoint, volume?: string): void {
+    const extras = this.host.endpointInfoExtras?.(ep, volume);
+    const html = networkInfoHtml(
+      modelFromEndpoint(ep, {
+        volume,
+        uams: extras?.uams,
+        mountpoint: extras?.mountpoint,
+        volumes: extras?.volumes ?? this.volumesFor(ep),
+      }),
+      { variant: 'dialog', zipShare: !!volume },
+    );
+    this.showProps = true;
+    this.syncPropsButton();
+    const win = this.getInfoWindow;
+    if (!win) return;
+    win.setBody(html);
+    win.show();
+  }
+
   private columnPreviewNode(): VNode | null {
     if (this.selectedId == null) return null;
     const node = this.findNodeAnywhere(this.selectedId);
@@ -2662,7 +3132,8 @@ export class FinderWindow extends HTMLElement {
 
   /** Shared item info card — used by column-view preview and Properties. */
   private itemInfoHtml(node: VNode, opts: { variant: 'column' | 'dialog' }): string {
-    const caps = this.vfs.capabilities();
+    if (isNetworkContainer(node)) return this.networkItemInfoHtml(node, opts);
+    const caps = this.capsForNode(node);
     const fi = node.finderInfo;
     const { type, creator } = readTypeCreator(fi);
     const kind = node.isDir ? 'Folder' : caps.finderInfo && type === 'APPL' ? 'Application' : 'File';
@@ -2806,7 +3277,7 @@ export class FinderWindow extends HTMLElement {
   private multiSelectionInfoHtml(opts: { variant: 'column' | 'dialog' }): string {
     const nodes = this.selectedNodes();
     const count = this.selectedIds.size;
-    const caps = this.vfs.capabilities();
+    const caps = this.caps();
     const folders = nodes.filter((n) => n.isDir).length;
     const files = nodes.length - folders;
     const kindLabel =
@@ -2847,7 +3318,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   private displayStorePath(node: VNode): string {
-    const caps = this.vfs.capabilities();
+    const caps = this.caps();
     const chrome = volumeChrome(caps);
     const vol = this.pathStack[0]?.name || this.localShareTitle();
     const store =
@@ -2975,7 +3446,8 @@ export class FinderWindow extends HTMLElement {
   private async readGetInfoExtras(
     node: VNode,
   ): Promise<{ vers: VersRec | null; comment: string | null; win: WinVersionGetInfo | null }> {
-    const wantFork = this.vfs.capabilities().resourceFork;
+    const { cat, node: native } = await this.nativeNode(node);
+    const wantFork = this.capsForNode(node).resourceFork;
     let vers: VersRec | null = null;
     let comment: string | null = null;
     if (wantFork) {
@@ -2985,8 +3457,8 @@ export class FinderWindow extends HTMLElement {
         if (type !== 'FCMT') return false;
         return id === 1 || (cid !== 0 && id === cid);
       };
-      let rf = await this.vfs.loadResourceFork(node, { want });
-      if (!rf) rf = await this.vfs.loadResourceFork(node, { fork: 'data', want });
+      let rf = await cat.loadResourceFork(native, { want });
+      if (!rf) rf = await cat.loadResourceFork(native, { fork: 'data', want });
       if (rf) {
         vers = decodeVers1(rf);
         comment = finderCommentFromFork(rf, node.finderInfo);
@@ -2995,7 +3467,7 @@ export class FinderWindow extends HTMLElement {
     let win: WinVersionGetInfo | null = null;
     if (isWinVersionName(node.name)) {
       try {
-        win = await this.vfs.withRangeReader(node, (read) => extractWinVersion(read), { resource: false });
+        win = await cat.withRangeReader(native, (read) => extractWinVersion(read), { resource: false });
       } catch {
         win = null;
       }
@@ -3244,6 +3716,10 @@ export class FinderWindow extends HTMLElement {
           else if (ep) await this.ejectEndpoint(ep);
           return;
         }
+        if (action === 'info' || action === 'share-info') {
+          if (ep) this.showEndpointGetInfo(ep, sidebar.volume);
+          return;
+        }
         if (ep) await this.host.onSidebarAction?.(ep, action, sidebar.volume);
         return;
       }
@@ -3255,6 +3731,36 @@ export class FinderWindow extends HTMLElement {
       this.renderContextMenu();
     }
 
+    const locCrumb = t.closest('[data-loc]') as HTMLElement | null;
+    if (locCrumb) {
+      e.preventDefault();
+      if (locCrumb.classList.contains('current')) return;
+      const kind = locCrumb.getAttribute('data-loc');
+      if (kind === 'network') {
+        await this.showNetworkBrowser(locCrumb.getAttribute('data-network-path') || '');
+        this.syncHistory();
+        this.render();
+        return;
+      }
+      if (kind === 'server') {
+        if (this.remoteEndpoint) {
+          await this.showServerSharesFolder(this.remoteEndpoint);
+          this.syncHistory();
+          this.render();
+        }
+        return;
+      }
+      if (kind === 'volume') {
+        await this.navigateToPathIndex(0);
+        return;
+      }
+      if (kind === 'node') {
+        const index = Number(locCrumb.getAttribute('data-path-index'));
+        if (Number.isFinite(index)) await this.navigateToPathIndex(index);
+        return;
+      }
+      return;
+    }
     const pathCrumb = t.closest('[data-path-index]') as HTMLElement | null;
     if (pathCrumb) {
       e.preventDefault();
@@ -3316,6 +3822,14 @@ export class FinderWindow extends HTMLElement {
       this.render();
       return;
     }
+    if (t.closest('[data-network]')) {
+      if (!this.networkBrowserEnabled()) return;
+      await this.showNetworkBrowser();
+      this.closeSidebar();
+      this.syncHistory();
+      this.render();
+      return;
+    }
     const ejectEl = t.closest('[data-eject]');
     if (ejectEl) {
       e.preventDefault();
@@ -3360,7 +3874,7 @@ export class FinderWindow extends HTMLElement {
       if (!name || !parent) return;
       if (this.remoteBusy) return;
       try {
-        const ok = await this.connectServerWithLogin(parent, name);
+        const ok = await this.connectServerWithLogin(parent, name, { locationMode: 'server' });
         if (!ok) return;
         this.closeSidebar();
         if (this.remoteOpen) {
@@ -3388,19 +3902,19 @@ export class FinderWindow extends HTMLElement {
         this.render();
         return;
       }
-      if (!isCatalogEndpoint(s) && this.remoteLoggedIn && this.remoteNbpName === s.id) {
-        if (this.remoteOpen) {
-          this.closeSidebar();
-          await this.reload();
-          this.render();
-        } else {
-          this.renderSidebar();
-        }
+      if (!isCatalogEndpoint(s) && this.loggedInEndpoints.has(s.id) && !this.remoteBusy) {
+        await this.showServerSharesFolder(s);
+        this.closeSidebar();
+        this.syncHistory();
+        this.render();
         return;
       }
-      await this.connectServerWithLogin(s);
+      const openOpts = isCatalogEndpoint(s)
+        ? { autoOpenSingle: true, listShares: false, locationMode: 'local' as const }
+        : { autoOpenSingle: false, listShares: true };
+      await this.connectServerWithLogin(s, undefined, openOpts);
       this.closeSidebar();
-      if (this.remoteOpen) {
+      if (this.remoteOpen || isNetworkCatalog(this.vfs)) {
         await this.reload();
         this.syncHistory();
       }
@@ -3428,6 +3942,7 @@ export class FinderWindow extends HTMLElement {
     const id = dataRef(item);
     if (id == null) return;
     const isDir = item.getAttribute('data-dir') === '1';
+    const isOpen = isDir || item.getAttribute('data-open') === '1';
     const mod = e.metaKey || e.ctrlKey;
     const range = e.shiftKey && !mod;
 
@@ -3441,9 +3956,9 @@ export class FinderWindow extends HTMLElement {
     const wasSelected = this.selectedId === id && this.selectedIds.size === 1;
     this.selectOnly(id);
 
-    if (isCompactUi() && this.view !== 'column' && isDir && wasSelected) {
+    if (isCompactUi() && this.view !== 'column' && isOpen && wasSelected) {
       const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
-      if (node?.isDir) await this.openFolder(node);
+      if (node && isNetworkOpenable(node)) await this.openFolder(node);
       return;
     }
 
@@ -3455,7 +3970,8 @@ export class FinderWindow extends HTMLElement {
       this.columnChildren = this.columnChildren.slice(0, colIndex + 1);
       if (isDir) {
         const node = this.findInColumns(id) ?? this.findNodeAnywhere(id);
-        if (node?.isDir) {
+        if (node && (await this.activateNetworkNode(node))) return;
+        if (node && isNetworkNavigable(node)) {
           this.pathStack.push({ id: nodeRef(node), name: node.name });
           this.cwd = nodeRef(node);
           await this.loadColumnFolder(nodeRef(node), colIndex);
@@ -3464,7 +3980,8 @@ export class FinderWindow extends HTMLElement {
           this.renderPath();
           this.renderContent();
           const fetched = await this.vfs.get(id);
-          if (fetched?.isDir) {
+          if (fetched && (await this.activateNetworkNode(fetched))) return;
+          if (fetched && isNetworkNavigable(fetched)) {
             this.pathStack.push({ id: nodeRef(fetched), name: fetched.name });
             this.cwd = nodeRef(fetched);
             await this.loadColumnFolder(nodeRef(fetched), colIndex);
@@ -3476,6 +3993,8 @@ export class FinderWindow extends HTMLElement {
           }
         }
       } else {
+        const node = this.findInColumns(id) ?? this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
+        if (node && (await this.activateNetworkNode(node))) return;
         this.columnLoading = false;
         this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
         this.nodes = this.columnChildren[this.columnChildren.length - 1] ?? this.nodes;
@@ -3518,7 +4037,14 @@ export class FinderWindow extends HTMLElement {
       this.columnChildren.push(kids);
       this.nodes = kids;
     } catch (err) {
-      if (gen !== this.columnLoadGen || isAbortError(err)) return;
+      if (gen !== this.columnLoadGen) return;
+      if (isListingCancelled(err)) {
+        if (!isAbortError(err)) {
+          this.pathStack = this.pathStack.slice(0, parentColIndex + 1);
+          this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+        }
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus(`Couldn’t open folder: ${msg}`);
       this.pathStack = this.pathStack.slice(0, parentColIndex + 1);
@@ -3589,7 +4115,13 @@ export class FinderWindow extends HTMLElement {
       if (!this.folderLoadIsCurrent(id, gen)) return;
       this.listChildCache.set(id, kids);
     } catch (err) {
-      if (!this.folderLoadIsCurrent(id, gen) || isAbortError(err)) return;
+      if (!this.folderLoadIsCurrent(id, gen) || isListingCancelled(err)) {
+        if (this.folderLoadIsCurrent(id, gen) && !isAbortError(err)) {
+          this.expandedIds.delete(id);
+          this.setDiscloseState(disclose, 'closed');
+        }
+        return;
+      }
       this.expandedIds.delete(id);
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus(`Couldn’t expand folder: ${msg}`);
@@ -3667,7 +4199,7 @@ export class FinderWindow extends HTMLElement {
     }
     const item = this.itemFromEvent(e);
     if (!item || !this.querySelector('.content')?.contains(item)) return;
-    if (item.getAttribute('data-dir') !== '1') return;
+    if (item.getAttribute('data-dir') !== '1' && item.getAttribute('data-open') !== '1') return;
     if (this.view === 'column') return;
     if ((e.target as HTMLElement).closest?.('[data-disclose]')) return;
 
@@ -3676,12 +4208,16 @@ export class FinderWindow extends HTMLElement {
     if (id == null) return;
 
     const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
-    if (!node?.isDir) return;
+    if (!node || !isNetworkOpenable(node)) return;
     await this.openFolder(node);
   }
 
   private async openFolder(node: VNode): Promise<void> {
+    if (await this.activateNetworkNode(node)) return;
+    if (!isNetworkNavigable(node)) return;
     const openedId = nodeRef(node);
+    const prevCwd = this.cwd;
+    const prevStack = this.pathStack.slice();
     this.cwd = nodeRef(node);
     this.pathStack.push({ id: nodeRef(node), name: node.name });
     this.clearSelection();
@@ -3694,6 +4230,20 @@ export class FinderWindow extends HTMLElement {
     this.renderContent();
     try {
       await this.reload();
+    } catch (err) {
+      if (this.cwd === openedId) {
+        this.pathStack = prevStack;
+        this.cwd = prevCwd;
+        this.folderOpening = false;
+        this.enumeratingFolderId = null;
+        if (!isListingCancelled(err)) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.setStatus(`Couldn’t open folder: ${msg}`);
+        }
+        this.renderPath();
+        this.renderContent();
+      }
+      return;
     } finally {
       if (this.cwd === openedId) this.folderOpening = false;
     }
@@ -3724,9 +4274,19 @@ export class FinderWindow extends HTMLElement {
       e.preventDefault();
       return;
     }
+    if (isNetworkContainer(this.findNodeAnywhere(id))) {
+      e.preventDefault();
+      return;
+    }
     this.dragNodeId = id;
     this.dragNode = this.findNodeAnywhere(id);
-    this.dragCatalog = this.vfs;
+    const handle = this.overlayNative(this.dragNode);
+    if (handle) {
+      this.dragNodeId = handle.ref;
+      this.dragCatalog = handle.cat;
+    } else {
+      this.dragCatalog = this.vfs;
+    }
     // Dragging an item outside the current multi-selection replaces it; dragging
     // a selected item keeps the whole selection intact (matches Finder/Explorer).
     if (!this.selectedIds.has(id)) this.selectOnly(id);
@@ -3881,7 +4441,7 @@ export class FinderWindow extends HTMLElement {
       const ep = this.servers.find((s) => s.id === id);
       if (!ep || !this.host.openEndpointCatalog) return null;
       const cat = await this.host.openEndpointCatalog(ep);
-      this.catalogs.set(key, cat);
+      this.bindVolumeCatalog(key, cat);
       return cat;
     }
     const prefix = `${this.remoteNbpName}:`;
@@ -3889,7 +4449,7 @@ export class FinderWindow extends HTMLElement {
     const name = key.slice(prefix.length);
     if (!name) return null;
     const cat = await this.host.openVolume(name);
-    this.catalogs.set(key, cat);
+    this.bindVolumeCatalog(key, cat);
     return cat;
   }
 
@@ -3907,6 +4467,26 @@ export class FinderWindow extends HTMLElement {
         parentId: cat?.rootId() ?? 0,
         shareKey: share.key,
         label: share.name,
+      };
+    }
+    if (isNetworkCatalog(this.vfs)) {
+      const parentId = this.resolveDropParent(e);
+      if (parentId == null) return null;
+      const destNode = this.findNodeAnywhere(parentId);
+      const info = parseNetworkPath(typeof parentId === 'string' ? parentId : '', this.servers);
+      if (!info.share || destNode?.chrome?.networkRole === 'service') return null;
+      const native = this.overlayNative(destNode);
+      if (native) {
+        return {
+          catalog: native.cat,
+          parentId: native.ref,
+          label: destNode?.name ?? this.pathStack.find((p) => p.id === parentId)?.name ?? 'folder',
+        };
+      }
+      return {
+        catalog: this.vfs,
+        parentId,
+        label: destNode?.name ?? this.pathStack.find((p) => p.id === parentId)?.name ?? 'folder',
       };
     }
     const parentId = this.resolveDropParent(e);
@@ -4144,7 +4724,10 @@ export class FinderWindow extends HTMLElement {
       if (!this.folderLoadIsCurrent(id, gen)) return;
       this.listChildCache.set(id, kids);
     } catch (err) {
-      if (!this.folderLoadIsCurrent(id, gen) || isAbortError(err)) return;
+      if (!this.folderLoadIsCurrent(id, gen) || isListingCancelled(err)) {
+        if (this.folderLoadIsCurrent(id, gen) && !isAbortError(err)) this.expandedIds.delete(id);
+        return;
+      }
       this.expandedIds.delete(id);
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus(`Couldn’t expand folder: ${msg}`);
@@ -4328,9 +4911,16 @@ export class FinderWindow extends HTMLElement {
       this.columnLoading = false;
       this.paintColumnKids(view, colIndex, kids);
     } catch (err) {
-      if (gen !== this.columnLoadGen || isAbortError(err)) return;
+      if (gen !== this.columnLoadGen) return;
       this.columnLoading = false;
       view.querySelector('.column--loading')?.remove();
+      if (isListingCancelled(err)) {
+        if (!isAbortError(err)) {
+          this.pathStack = this.pathStack.slice(0, colIndex + 1);
+          this.cwd = this.pathStack[this.pathStack.length - 1]!.id;
+        }
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus(`Couldn’t open folder: ${msg}`);
       this.pathStack = this.pathStack.slice(0, colIndex + 1);
@@ -4399,7 +4989,9 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async moveNodeTo(id: NodeRef, destParent: NodeRef, fs: Catalog = this.vfs): Promise<void> {
-    const node = (this.dragNodeId === id ? this.dragNode : null) ?? (await fs.get(id));
+    const cached =
+      this.dragNodeId === id && this.dragNode && nodeRef(this.dragNode) === id ? this.dragNode : null;
+    const node = cached ?? (await fs.get(id));
     if (!node) return;
     if (parentRef(node) === destParent) return;
     if (!this.isValidMoveTarget(id, destParent, fs)) {
@@ -4420,9 +5012,11 @@ export class FinderWindow extends HTMLElement {
     dest: Catalog,
     destParent: NodeRef,
   ): Promise<void> {
-    const node =
-      (this.dragNodeId === id && this.dragCatalog === src ? this.dragNode : null) ??
-      (await src.get(id));
+    const cached =
+      this.dragNodeId === id && this.dragCatalog === src && this.dragNode && nodeRef(this.dragNode) === id
+        ? this.dragNode
+        : null;
+    const node = cached ?? (await src.get(id));
     if (!node) return;
     const plan = await this.planPlacement(dest, destParent, node.name, node.isDir);
     const expected = node.isDir ? 0 : nodeByteSize(node);
@@ -4532,17 +5126,23 @@ export class FinderWindow extends HTMLElement {
     }
 
     try {
-      const destCat = destInfo.catalog ?? (destInfo.shareKey ? await this.ensureShareCatalog(destInfo.shareKey) : null);
+      let destCat = destInfo.catalog ?? (destInfo.shareKey ? await this.ensureShareCatalog(destInfo.shareKey) : null);
       if (!destCat) {
         this.setStatus('Couldn’t open drop target');
         return;
       }
-      const destParent = destInfo.parentId ?? destCat.rootId();
+      let destParent = destInfo.parentId ?? destCat.rootId();
+      if (isNetworkCatalog(destCat)) {
+        const mapped = await this.resolveNative(destParent);
+        destCat = mapped.cat;
+        destParent = mapped.ref;
+      }
 
       if (internalId != null) {
         if (!srcCat) return;
         const srcNode =
-          (this.dragCatalog === srcCat ? this.dragNode : null) ?? (await srcCat.get(internalId));
+          (this.dragNode && nodeRef(this.dragNode) === internalId ? this.dragNode : null) ??
+          (await srcCat.get(internalId));
         const srcParent = srcNode ? parentRef(srcNode) : undefined;
         if (srcCat === destCat) {
           await this.moveNodeTo(internalId, destParent, destCat);
@@ -4661,6 +5261,9 @@ export class FinderWindow extends HTMLElement {
       case 'win-resources':
         this.openWinResourceExplorer();
         break;
+      case 'copy-uri':
+        await this.copyInfoUri();
+        break;
       case 'download':
         await this.onDownload();
         break;
@@ -4705,10 +5308,22 @@ export class FinderWindow extends HTMLElement {
     }
   }
 
+  private async copyInfoUri(): Promise<void> {
+    const el = this.getInfoWindow?.querySelector('.info-uri') ?? this.querySelector('.info-uri');
+    const uri = el?.textContent?.trim() || '';
+    if (!uri) return;
+    try {
+      await navigator.clipboard.writeText(uri);
+      this.setStatus('Copied URI');
+    } catch {
+      this.setStatus('Couldn’t copy URI');
+    }
+  }
+
   private async applyProps(): Promise<void> {
     const sel = this.selectedNode();
     if (!sel) return;
-    const caps = this.vfs.capabilities();
+    const caps = this.caps();
     const typeEl =
       (this.getInfoWindow?.querySelector('[data-prop="type"]') as HTMLInputElement | null) ??
       (this.querySelector('[data-prop="type"]') as HTMLInputElement | null);
@@ -4722,7 +5337,11 @@ export class FinderWindow extends HTMLElement {
         sel.finderInfo[i] = type.charCodeAt(i);
         sel.finderInfo[4 + i] = creator.charCodeAt(i);
       }
-      await this.withOwnVfsMutation(() => this.vfs.put(sel));
+      await this.withOwnVfsMutation(async () => {
+        const dest = await this.nativeNode(sel);
+        dest.node.finderInfo = sel.finderInfo;
+        await dest.cat.put(dest.node);
+      });
     }
     const patch: Record<string, boolean> = {};
     for (const a of caps.attributes) {
@@ -4731,8 +5350,11 @@ export class FinderWindow extends HTMLElement {
         (this.querySelector(`[data-attr="${CSS.escape(a.id)}"]`) as HTMLInputElement | null);
       if (el) patch[a.id] = el.checked;
     }
-    if (Object.keys(patch).length && this.vfs.setAttrs) {
-      await this.withOwnVfsMutation(() => this.vfs.setAttrs!(nodeRef(sel), patch));
+    if (Object.keys(patch).length) {
+      const dest = await this.resolveNative(nodeRef(sel), sel);
+      if (dest.cat.setAttrs) {
+        await this.withOwnVfsMutation(() => dest.cat.setAttrs!(dest.ref, patch));
+      }
     }
     this.setStatus('Info updated');
     await this.reload();
@@ -4756,10 +5378,14 @@ export class FinderWindow extends HTMLElement {
   }
 
   /** Select a sidebar row and show listing placeholders while a share connects. */
-  private beginConnecting(ep: RemoteEndpoint, volume?: string): void {
+  private beginConnecting(ep: RemoteEndpoint, volume?: string, opts?: { keepListing?: boolean }): void {
+    this.remoteBusy = true;
+    const keep = opts?.keepListing || isNetworkCatalog(this.vfs);
+    const label = volume?.trim() || ep.title;
+    this.setStatus(volume?.trim() ? `Opening “${label}”…` : `Contacting ${ep.title}…`, { busy: true });
+    if (keep) return;
     this.connectingEndpointId = ep.id;
     this.connectingVolume = volume?.trim() || null;
-    this.remoteBusy = true;
     this.folderOpening = true;
     this.nodes = [];
     this.clearSelection();
@@ -4767,29 +5393,32 @@ export class FinderWindow extends HTMLElement {
       this.columnLoading = true;
       this.columnChildren = [];
     }
-    const label = this.connectingVolume || ep.title;
-    this.setStatus(
-      this.connectingVolume ? `Opening “${label}”…` : `Contacting ${ep.title}…`,
-      { busy: true },
-    );
     this.renderSidebar();
     this.renderPath();
     this.renderContent();
   }
 
   private endConnecting(): void {
-    const was = this.connectingEndpointId != null;
+    const wiped = this.connectingEndpointId != null;
     this.connectingEndpointId = null;
     this.connectingVolume = null;
     this.remoteBusy = false;
-    if (!this.remoteOpen) {
+    if (wiped && !this.remoteOpen) {
       this.folderOpening = false;
       this.columnLoading = false;
     }
-    if (was) this.renderSidebar();
+    if (wiped) this.renderSidebar();
   }
 
   private async restoreAfterFailedConnect(): Promise<void> {
+    if (isNetworkCatalog(this.vfs)) {
+      this.folderOpening = false;
+      this.columnLoading = false;
+      this.loadingIds.clear();
+      this.renderPath();
+      this.renderContent();
+      return;
+    }
     if (this.hasLocalShare()) {
       this.showLocalShare();
       await this.reload();
@@ -4807,6 +5436,125 @@ export class FinderWindow extends HTMLElement {
     if (this.vfs) await this.reload();
   }
 
+  /** Show this server’s shares in the pane, or stay in Network Browser after login. */
+  private async afterServerListed(s: RemoteEndpoint, opts?: OpenRemoteOptions): Promise<void> {
+    if (isCatalogEndpoint(s)) {
+      await this.openCatalogVolume(s);
+      return;
+    }
+    if (opts?.listShares) {
+      await this.showServerSharesFolder(s);
+      return;
+    }
+    if (isNetworkCatalog(this.vfs)) {
+      this.renderSidebar();
+      return;
+    }
+    this.remoteOpen = false;
+    this.renderSidebar();
+    await this.restoreListingIfIdle();
+  }
+
+  private applyLocationOpts(opts?: OpenRemoteOptions): void {
+    if (opts?.locationUri) {
+      this.locationMode = 'url';
+      this.locationUri = opts.locationUri;
+      this.networkPrefix = [];
+      return;
+    }
+    if (opts?.locationMode) {
+      this.locationMode = opts.locationMode;
+      if (opts.locationMode !== 'url') this.locationUri = '';
+      if (opts.locationMode !== 'network') this.networkPrefix = [];
+    }
+  }
+
+  private bindVolumeCatalog(key: string, cat: Catalog): void {
+    this.catalogs.set(key, cat);
+    if (this.volumeUnsubs.has(key)) return;
+    this.volumeUnsubs.set(
+      key,
+      cat.subscribe(() => {
+        if (isNetworkCatalog(this.vfs)) this.networkCatalog?.notify();
+      }),
+    );
+  }
+
+  /** Login if needed; skip when this client already has a session. */
+  private async ensureLoggedIn(ep: RemoteEndpoint): Promise<boolean> {
+    if (this.loggedInEndpoints.has(ep.id)) {
+      this.adoptEndpoint(ep);
+      this.remoteNbpName = ep.id;
+      this.remoteLoggedIn = true;
+      this.remoteVolumes = this.volumesFor(ep);
+      return true;
+    }
+    return this.connectServerWithLogin(ep, undefined, {
+      autoOpenSingle: false,
+      listShares: false,
+      attachOnly: true,
+      locationMode: 'network',
+    });
+  }
+
+  /** Open a volume catalog without leaving the Network Browser. */
+  private async attachVolumeCatalog(ep: RemoteEndpoint, name: string): Promise<void> {
+    const key = shareKeyForEndpoint(ep, name);
+    if (this.catalogs.has(key)) {
+      this.openedVolumeKeys.add(key);
+      return;
+    }
+    this.adoptEndpoint(ep);
+    this.remoteNbpName = ep.id;
+    this.remoteLoggedIn = true;
+    const cat = await this.host.openVolume(name);
+    this.bindVolumeCatalog(key, cat);
+    this.openedVolumeKeys.add(key);
+  }
+
+  private async ensureVolumeAttached(ep: RemoteEndpoint, name: string): Promise<boolean> {
+    const key = shareKeyForEndpoint(ep, name);
+    if (this.catalogs.has(key)) {
+      this.openedVolumeKeys.add(key);
+      return true;
+    }
+    const ok = await this.ensureLoggedIn(ep);
+    if (!ok) return false;
+    try {
+      await this.attachVolumeCatalog(ep, name);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error(`Open volume failed: ${msg}`, ep.kind);
+      this.setStatus(`Couldn’t open “${name}”: ${msg}`);
+      return false;
+    }
+  }
+
+  /**
+   * Before listing a server or share in Network Browser, prompt for login /
+   * open the volume if this client has not already done so.
+   */
+  private async prepareNetworkListing(parentId: NodeRef, signal?: AbortSignal): Promise<boolean> {
+    if (!isNetworkCatalog(this.vfs) || typeof parentId !== 'string') return true;
+    if (signal?.aborted) return false;
+    const info = parseNetworkPath(parentId, this.servers);
+    if (info.role === 'server' && info.protocol && info.server) {
+      const ep = matchNetworkServer(this.servers, info.protocol, info.neighborhood, info.server);
+      if (!ep) return true;
+      const ok = await this.ensureLoggedIn(ep);
+      return ok && !signal?.aborted;
+    }
+    if (info.role === 'share' && info.protocol && info.server && info.share) {
+      const ep = matchNetworkServer(this.servers, info.protocol, info.neighborhood, info.server);
+      if (!ep) return true;
+      if ((ep.services ?? []).some((s) => s.kind !== 'share' && s.name === info.share)) return true;
+      const ok = await this.ensureVolumeAttached(ep, info.share);
+      return ok && !signal?.aborted;
+    }
+    return true;
+  }
+
   private async connectServerWithLogin(
     s: RemoteEndpoint,
     volume?: string,
@@ -4814,35 +5562,51 @@ export class FinderWindow extends HTMLElement {
   ): Promise<boolean> {
     if (this.remoteBusy) return false;
     const wantVol = volume?.trim() || '';
-    const autoOpenSingle = opts?.autoOpenSingle !== false;
+    const attachOnly = !!opts?.attachOnly;
+    const autoOpenSingle = opts?.autoOpenSingle !== false && !attachOnly;
+    if (
+      attachOnly &&
+      this.loggedInEndpoints.has(s.id) &&
+      (!wantVol || this.catalogs.has(shareKeyForEndpoint(s, wantVol)))
+    ) {
+      this.adoptEndpoint(s);
+      this.remoteNbpName = s.id;
+      this.remoteLoggedIn = true;
+      this.remoteVolumes = this.volumesFor(s);
+      this.renderSidebar();
+      return true;
+    }
     const alreadyViewing =
       this.viewingEndpoint(s) &&
       (!wantVol || (this.source === 'remote' && this.pathStack[0]?.name === wantVol));
-    if (alreadyViewing) {
+    if (alreadyViewing && !attachOnly) {
       this.renderSidebar();
       return true;
     }
 
-    this.beginConnecting(s, wantVol || undefined);
+    this.beginConnecting(s, wantVol || undefined, { keepListing: attachOnly || isNetworkCatalog(this.vfs) });
+    this.applyLocationOpts(opts);
     let ok = false;
     try {
       if (this.loggedInEndpoints.has(s.id)) {
         this.adoptEndpoint(s);
         this.remoteNbpName = s.id;
         this.remoteLoggedIn = true;
-        try {
-          const info = await this.host.beginRemote(s);
-          if (info.volumes.length) this.knownVolumes.set(s.id, [...info.volumes]);
-          this.adoptEndpoint(s, { title: connectedEndpointTitle(s, info.serverName) });
-        } catch {
-          /* keep cached volumes */
+        if (!this.knownVolumes.has(s.id)) {
+          try {
+            const info = await this.host.beginRemote(s);
+            if (info.volumes.length) this.knownVolumes.set(s.id, [...info.volumes]);
+            this.adoptEndpoint(s, { title: connectedEndpointTitle(s, info.serverName) });
+          } catch {
+            /* keep cached volumes */
+          }
         }
         this.remoteVolumes = this.volumesFor(s);
         if (wantVol && !this.remoteVolumes.some((v) => v.toLowerCase() === wantVol.toLowerCase())) {
           this.remoteVolumes = [...this.remoteVolumes, wantVol];
           this.knownVolumes.set(s.id, [...this.remoteVolumes]);
         }
-        if (!wantVol) {
+          if (!wantVol) {
           if (isCatalogEndpoint(s)) {
             try {
               await this.openCatalogVolume(s);
@@ -4856,14 +5620,13 @@ export class FinderWindow extends HTMLElement {
               return false;
             }
           }
-          this.remoteOpen = false;
-          this.renderSidebar();
-          await this.restoreListingIfIdle();
+          await this.afterServerListed(s, opts);
           ok = true;
           return true;
         }
         try {
-          await this.mountRemoteVolume(wantVol);
+          if (attachOnly) await this.attachVolumeCatalog(s, wantVol);
+          else await this.mountRemoteVolume(wantVol);
           ok = true;
           return true;
         } catch (err) {
@@ -4935,11 +5698,12 @@ export class FinderWindow extends HTMLElement {
           );
           this.host.dismissLogin?.();
           if (wantVol) {
-            await this.mountRemoteVolume(wantVol);
+            if (attachOnly) await this.attachVolumeCatalog(s, wantVol);
+            else await this.mountRemoteVolume(wantVol);
           } else if (autoOpenSingle && skipPrompt && this.remoteVolumes.length === 1) {
             await this.mountRemoteVolume(this.remoteVolumes[0]!);
           } else {
-            await this.restoreListingIfIdle();
+            await this.afterServerListed(s, opts);
           }
           ok = true;
           return true;
@@ -5023,7 +5787,8 @@ export class FinderWindow extends HTMLElement {
     const cat = this.catalogs.get(key);
     if (this.clipboard && this.clipboard.source === cat) this.clipboard.source = null;
     this.catalogs.delete(key);
-    if (this.remoteEndpoint) this.openedVolumeKeys.delete(shareKeyForEndpoint(this.remoteEndpoint, name));
+    this.volumeUnsubs.get(key)?.();
+    this.volumeUnsubs.delete(key);
     if (viewing) {
       this.showLocalShare();
       this.remoteOpen = false;
@@ -5283,6 +6048,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   private startRename(): void {
+    if (this.networkListingLocked() || !selectionAllowsMutate(this.selectionNodes())) return;
     // Renaming only makes sense for a single item — matches Finder, which
     // disables Rename whenever more than one item is selected.
     if (this.selectedId == null || this.selectedIds.size > 1) return;
@@ -5291,12 +6057,12 @@ export class FinderWindow extends HTMLElement {
   }
 
   private isPreviewable(node: VNode | null | undefined): node is VNode {
-    if (!node || node.isDir) return false;
+    if (!node || node.isDir || isNetworkContainer(node)) return false;
     return previewKindFor(node) != null;
   }
 
   private isExpandableArchive(node: VNode | null | undefined): node is VNode {
-    if (!node || node.isDir) return false;
+    if (!node || node.isDir || isNetworkContainer(node)) return false;
     return isExpandableArchive(node.name, node.finderInfo, node.data);
   }
 
@@ -5321,13 +6087,21 @@ export class FinderWindow extends HTMLElement {
       this.host.showAlert(`Couldn’t Expand “${node.name}”`, text);
       this.setStatus(`Couldn’t expand “${node.name}”`);
     };
-    const bytesTotal = nodeByteSize(node);
-    const track = this.trackImportItem({ name: node.name, isDir: false, bytesTotal }, this.vfs, parentRef(node), false);
+    const { cat, node: native } = await this.nativeNode(node);
+    const nativeId = nodeRef(native);
+    const parent = await this.resolveNative(parentRef(node), this.findNodeAnywhere(parentRef(node)));
+    const bytesTotal = nodeByteSize(native);
+    const track = this.trackImportItem(
+      { name: native.name, isDir: false, bytesTotal },
+      cat,
+      parent.ref,
+      false,
+    );
     this.setStatus(`Expanding “${node.name}”…`, { busy: true });
     try {
-      if (isCatalogWithBackend(this.vfs)) {
+      if (isCatalogWithBackend(cat)) {
         let last = 0;
-        await this.vfs.expandNode(id, {
+        await cat.expandNode(nativeId, {
           signal: track.signal,
           onProgress: (p) => {
             const next = p.bytesDone || 0;
@@ -5343,17 +6117,17 @@ export class FinderWindow extends HTMLElement {
         await this.refreshAfterMutation();
         return;
       }
-      const inPlace = await expandSitInPlace(this.vfs, node, {
-        fileSize: node.dataBytes ?? node.data.length,
+      const inPlace = await expandSitInPlace(cat, native, {
+        fileSize: native.dataBytes ?? native.data.length,
         track,
         resolveConflict: (info) => this.host.promptNameConflict(info),
         wrapWrite: (fn) =>
           this.withOwnVfsMutation(async () => {
-            this.vfs.beginBatch();
+            cat.beginBatch();
             try {
               await fn();
             } finally {
-              this.vfs.endBatch();
+              cat.endBatch();
             }
           }),
       });
@@ -5366,7 +6140,7 @@ export class FinderWindow extends HTMLElement {
         await this.refreshAfterMutation();
         return;
       }
-      const full = (await this.vfs.ensureContent(id, track.onBytes, track.signal)) ?? node;
+      const full = (await cat.ensureContent(nativeId, track.onBytes, track.signal)) ?? native;
       let expanded;
       try {
         expanded = expandArchiveFile(full.name, full.data);
@@ -5379,7 +6153,7 @@ export class FinderWindow extends HTMLElement {
       const reserved = new Set<string>();
       const planned: { item: ExpandedNode; replaceId: NodeRef | null }[] = [];
       for (const item of expanded) {
-        const plan = await planItemPlacement(this.vfs, parentId, item.name, item.kind === 'dir', {
+        const plan = await planItemPlacement(cat, parentId, item.name, item.kind === 'dir', {
           reserved,
           resolveConflict: (info) => this.host.promptNameConflict(info),
         });
@@ -5388,19 +6162,19 @@ export class FinderWindow extends HTMLElement {
         planned.push({ item: { ...item, name: plan.destName }, replaceId: plan.replaceId });
       }
       await this.withOwnVfsMutation(async () => {
-        this.vfs.beginBatch();
+        cat.beginBatch();
         try {
           for (const row of planned) {
-            if (row.replaceId != null) await this.vfs.remove(row.replaceId);
+            if (row.replaceId != null) await cat.remove(row.replaceId);
           }
           await importExpandedTree(
-            this.vfs,
+            cat,
             parentId,
             planned.map((row) => row.item),
             track,
           );
         } finally {
-          this.vfs.endBatch();
+          cat.endBatch();
         }
       });
       track.onDone();
@@ -5431,7 +6205,8 @@ export class FinderWindow extends HTMLElement {
     this.preview = { id: nodeRef(node), name: node.name, kind, text: null };
     this.renderPreview();
     try {
-      const full = (await this.vfs.ensureContent(nodeRef(node))) ?? node;
+      const { cat, node: native } = await this.nativeNode(node);
+      const full = (await cat.ensureContent(nodeRef(native))) ?? native;
       if (gen !== this.previewGen) return;
       if (!full.data.length) {
         this.preview = { id: nodeRef(full), name: full.name, kind, text: '' };
@@ -5600,10 +6375,12 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async cutSelection(): Promise<void> {
+    if (this.networkListingLocked() || !selectionAllowsMutate(this.selectionNodes())) return;
     await this.captureSelection('cut');
   }
 
   private async copySelection(): Promise<void> {
+    if (this.networkListingLocked() || !selectionAllowsMutate(this.selectionNodes())) return;
     await this.captureSelection('copy');
   }
 
@@ -5619,16 +6396,18 @@ export class FinderWindow extends HTMLElement {
     this.setStatus(mode === 'cut' ? 'Cutting…' : 'Copying…', { busy: true });
     const items: ClipNode[] = [];
     const sourceIds: NodeRef[] = [];
+    let clipSource: Catalog = this.vfs;
     try {
       for (const node of nodes) {
-        const jobId = this.startTransfer(node.name, node.isDir, nodeByteSize(node), node.finderInfo);
+        const { cat, node: native } = await this.nativeNode(node);
+        const jobId = this.startTransfer(native.name, native.isDir, nodeByteSize(native), native.finderInfo);
         const signal = transferActivity.signal(jobId);
         try {
           const item = await transferActivity.withCopySlot(jobId, () =>
             this.snapshotNode(
-              this.vfs,
-              node,
-              this.vfs.reportsChunkedBytes
+              cat,
+              native,
+              cat.reportsChunkedBytes
                 ? (n) => {
                     throwIfAborted(signal);
                     transferActivity.addBytes(jobId, n);
@@ -5639,13 +6418,14 @@ export class FinderWindow extends HTMLElement {
           );
           await transferActivity.settle(jobId);
           items.push(item);
-          sourceIds.push(nodeRef(node));
+          sourceIds.push(nodeRef(native));
+          clipSource = cat;
         } catch (err) {
           await transferActivity.settle(jobId, err);
           throw err;
         }
       }
-      this.clipboard = { mode, items, source: this.vfs, sourceIds };
+      this.clipboard = { mode, items, source: clipSource, sourceIds };
       this.syncClipboardButtons();
       this.setStatus(
         nodes.length === 1
@@ -5696,7 +6476,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   private catalogName(name: string): string {
-    const caps = this.vfs.capabilities();
+    const caps = this.caps();
     let n = caps.nameCase === 'upper' ? name.toUpperCase() : name;
     const max = caps.maxNameBytes.long ?? caps.maxNameBytes.medium ?? caps.maxNameBytes.short ?? 255;
     const bytes = new TextEncoder().encode(n);
@@ -5705,11 +6485,14 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async onMkdir(): Promise<void> {
-    const name = await this.uniqueChildName(this.cwd, this.catalogName('New folder'));
-    const node = await this.withOwnVfsMutation(() => this.vfs.mkdir(this.cwd, name));
-    this.selectOnly(nodeRef(node));
-    this.renamingId = nodeRef(node);
+    if (this.networkListingLocked() || this.caps().readOnly) return;
+    const dest = await this.resolveNative(this.cwd);
+    const name = await this.uniqueChildName(dest.ref, this.catalogName('New folder'), dest.cat);
+    const node = await this.withOwnVfsMutation(() => dest.cat.mkdir(dest.ref, name));
     await this.reload();
+    const overlay = this.nodes.find((n) => n.name === node.name);
+    this.selectOnly(overlay ? nodeRef(overlay) : nodeRef(node));
+    this.renamingId = overlay ? nodeRef(overlay) : nodeRef(node);
     this.renderContent();
   }
 
@@ -5723,6 +6506,7 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async onDelete(): Promise<void> {
+    if (this.networkListingLocked() || !selectionAllowsMutate(this.selectionNodes())) return;
     if (this.selectedId == null) return;
     const ids = this.selectedIds.size > 1 ? [...this.selectedIds] : [this.selectedId];
     const nodes: { id: NodeRef; node: VNode }[] = [];
@@ -5734,8 +6518,16 @@ export class FinderWindow extends HTMLElement {
     const prompt =
       nodes.length === 1 ? `Delete “${nodes[0]!.node.name}”?` : `Delete ${nodes.length} items?`;
     if (!confirm(prompt)) return;
-    for (const { id } of nodes) {
-      await this.withOwnVfsMutation(() => this.vfs.remove(id));
+    try {
+      for (const { id, node } of nodes) {
+        const dest = await this.resolveNative(id, node);
+        await this.withOwnVfsMutation(() => dest.cat.remove(dest.ref));
+      }
+    } catch (err) {
+      this.setStatus(`Couldn’t delete: ${(err as Error).message}`);
+      await this.reload();
+      this.renderContent();
+      return;
     }
     this.clearSelection();
     this.showProps = false;
@@ -5770,7 +6562,8 @@ export class FinderWindow extends HTMLElement {
       return;
     }
     try {
-      const full = (await this.vfs.ensureContent(nodeRef(node))) ?? node;
+      const { cat, node: native } = await this.nativeNode(node);
+      const full = (await cat.ensureContent(nodeRef(native))) ?? native;
       const bytes = fork === 'resource' ? full.resource : full.data;
       const filename = fork === 'resource' ? `${full.name}.rsrc` : full.name;
       downloadBytes(bytes, filename);
@@ -5781,10 +6574,84 @@ export class FinderWindow extends HTMLElement {
     }
   }
 
+  private async downloadNetworkShare(node: VNode): Promise<void> {
+    const ep = this.endpointForNetworkNode(node);
+    const name = node.name;
+    if (!ep || !name) {
+      this.setStatus('Can’t zip that volume');
+      return;
+    }
+    const ok = await this.ensureVolumeAttached(ep, name);
+    if (!ok) return;
+    this.adoptEndpoint(ep);
+    this.remoteNbpName = ep.id;
+    const key = this.catalogKeyForVolume(name);
+    const cat = this.catalogs.get(key);
+    if (!cat) {
+      this.setStatus(`Couldn’t zip “${name}”`);
+      return;
+    }
+    const root = await cat.get(cat.rootId());
+    if (!root) {
+      this.setStatus(`Couldn’t zip “${name}”`);
+      return;
+    }
+    const zipName = name;
+    const jobId = this.startTransfer(zipName, true, 0);
+    const signal = transferActivity.signal(jobId);
+    try {
+      const entries = await transferActivity.withCopySlot(jobId, async () => {
+        transferActivity.setDetail(jobId, TRANSFER_DETAIL_SEARCHING);
+        const listed = await enumerateZipFiles(
+          cat,
+          root,
+          '',
+          (p) => {
+            throwIfAborted(signal);
+            transferActivity.setFound(jobId, p.items, p.bytes);
+          },
+          signal,
+        );
+        transferActivity.setBytes(jobId, 0, listed.bytes, '');
+        return collectZipEntries(
+          cat,
+          listed.files,
+          loadPrefs().zipExportStyle,
+          (n) => {
+            throwIfAborted(signal);
+            transferActivity.addBytes(jobId, n);
+          },
+          signal,
+        );
+      });
+      throwIfAborted(signal);
+      downloadZipEntries(zipName, entries);
+      await transferActivity.settle(jobId);
+      this.setStatus(`Downloaded ${zipName}.zip`);
+    } catch (err) {
+      await transferActivity.settle(jobId, err);
+      if (isTransferCancelled(err)) {
+        this.setStatus('Transfer cancelled');
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      this.setStatus(`Download failed: ${msg}`);
+    }
+  }
+
   private async onDownload(): Promise<void> {
     const nodes = await this.downloadTargets();
     if (!nodes.length) {
       this.setStatus('Nothing to download');
+      return;
+    }
+    if (nodes.some((n) => isNetworkContainer(n) && n.chrome?.networkRole !== 'share')) {
+      this.setStatus('Can’t zip a network location');
+      return;
+    }
+    const share = nodes.length === 1 && nodes[0]!.chrome?.networkRole === 'share' ? nodes[0]! : null;
+    if (share) {
+      await this.downloadNetworkShare(share);
       return;
     }
     const single = nodes.length === 1 ? nodes[0]! : null;
@@ -5800,42 +6667,55 @@ export class FinderWindow extends HTMLElement {
     try {
       const entries = await transferActivity.withCopySlot(jobId, async () => {
         throwIfAborted(signal);
+        const mapped: { cat: Catalog; node: VNode }[] = [];
+        for (const node of nodes) mapped.push(await this.nativeNode(node));
         let files: ZipFilePlan[];
         if (single && !single.isDir) {
-          files = [{ node: single, path: single.name, bytes: nodeByteSize(single) }];
-        } else {
-          transferActivity.setDetail(jobId, TRANSFER_DETAIL_SEARCHING);
-          files = [];
-          let items = 0;
-          let bytes = 0;
-          for (const node of nodes) {
-            if (node.isDir) {
-              const listed = await enumerateZipFiles(
-                this.vfs,
-                node,
-                '',
-                (p) => {
-                  throwIfAborted(signal);
-                  transferActivity.setFound(jobId, items + p.items, bytes + p.bytes);
-                },
-                signal,
-              );
+          const n = mapped[0]!.node;
+          files = [{ node: n, path: n.name, bytes: nodeByteSize(n) }];
+          return collectZipEntries(
+            mapped[0]!.cat,
+            files,
+            loadPrefs().zipExportStyle,
+            (n) => {
               throwIfAborted(signal);
-              files.push(...listed.files);
-              items += listed.items;
-              bytes += listed.bytes;
-            } else {
-              const size = nodeByteSize(node);
-              files.push({ node, path: node.name, bytes: size });
-              items++;
-              bytes += size;
-              transferActivity.setFound(jobId, items, bytes);
-            }
-          }
-          transferActivity.setBytes(jobId, 0, bytes, '');
+              transferActivity.addBytes(jobId, n);
+            },
+            signal,
+          );
         }
+        transferActivity.setDetail(jobId, TRANSFER_DETAIL_SEARCHING);
+        files = [];
+        let items = 0;
+        let bytes = 0;
+        for (const { cat, node } of mapped) {
+          if (node.isDir) {
+            const listed = await enumerateZipFiles(
+              cat,
+              node,
+              '',
+              (p) => {
+                throwIfAborted(signal);
+                transferActivity.setFound(jobId, items + p.items, bytes + p.bytes);
+              },
+              signal,
+            );
+            throwIfAborted(signal);
+            files.push(...listed.files);
+            items += listed.items;
+            bytes += listed.bytes;
+          } else {
+            const size = nodeByteSize(node);
+            files.push({ node, path: node.name, bytes: size });
+            items++;
+            bytes += size;
+            transferActivity.setFound(jobId, items, bytes);
+          }
+        }
+        transferActivity.setBytes(jobId, 0, bytes, '');
+        const zipCat = mapped[0]!.cat;
         return collectZipEntries(
-          this.vfs,
+          zipCat,
           files,
           loadPrefs().zipExportStyle,
           (n) => {
@@ -6030,7 +6910,14 @@ export class FinderWindow extends HTMLElement {
     const count = this.selectedIds.size;
     const items =
       sel != null
-        ? [
+        ? isNetworkContainer(sel)
+          ? [
+              opsForNetworkNode(sel)?.downloadZip
+                ? `<button type="button" class="callout__item" data-callout-act="download">Download Zip</button>`
+                : '',
+              `<button type="button" class="callout__item" data-callout-act="props">${multi ? `Get Info (${count} items)…` : 'Get Info…'}</button>`,
+            ]
+          : [
             (multi ? this.allSelectedExpandable() : this.isExpandableArchive(sel))
               ? `<button type="button" class="callout__item" data-callout-act="expand">Expand</button>`
               : '',
@@ -6038,7 +6925,7 @@ export class FinderWindow extends HTMLElement {
             multi ? '' : `<button type="button" class="callout__item" data-callout-act="rename">Rename</button>`,
             `<button type="button" class="callout__item" data-callout-act="delete">${multi ? `Delete ${count} Items…` : 'Delete…'}</button>`,
             `<button type="button" class="callout__item" data-callout-act="props">${multi ? `Get Info (${count} items)…` : 'Get Info…'}</button>`,
-            !multi && sel && !sel.isDir && showsResourceFork(this.vfs.capabilities())
+            !multi && sel && !sel.isDir && showsResourceFork(this.caps())
               ? `<button type="button" class="callout__item" data-callout-act="resources">Resources…</button>`
               : '',
             !multi && sel && !sel.isDir && isWinResourceName(sel.name)
@@ -6049,7 +6936,9 @@ export class FinderWindow extends HTMLElement {
             `<button type="button" class="callout__item" data-callout-act="copy">Copy</button>`,
             this.clipboard ? `<button type="button" class="callout__item" data-callout-act="paste">Paste</button>` : '',
           ]
-        : [
+        : isNetworkCatalog(this.vfs) && this.networkListingLocked()
+          ? [`<button type="button" class="callout__item" data-callout-act="props-blank">Get Info</button>`]
+          : [
             `<button type="button" class="callout__item" data-callout-act="mkdir">New Folder</button>`,
             this.clipboard ? `<button type="button" class="callout__item" data-callout-act="paste">Paste</button>` : '',
             `<button type="button" class="callout__item" data-callout-act="props-blank">Get Info</button>`,
@@ -6063,11 +6952,11 @@ export class FinderWindow extends HTMLElement {
   private async importPickedFiles(files: FileList): Promise<void> {
     const dt = new DataTransfer();
     for (const f of Array.from(files)) dt.items.add(f);
-    const destParent = this.cwd;
+    const dest = await this.resolveNative(this.cwd);
     this.setStatus('Scanning…', { busy: true });
     try {
       const count = await this.withOwnVfsMutation(() =>
-        this.vfs.importDataTransfer(destParent, dt, {
+        dest.cat.importDataTransfer(dest.ref, dt, {
           onScan: (total) => {
             this.setStatus(total > 0 ? `Importing… 0/${total} (0%)` : 'Importing…', { busy: true });
           },
@@ -6078,7 +6967,7 @@ export class FinderWindow extends HTMLElement {
               { busy: true },
             );
           },
-          onItem: (item) => this.trackImportItem(item, this.vfs, destParent),
+          onItem: (item) => this.trackImportItem(item, dest.cat, dest.ref),
           resolveConflict: (info) => this.host.promptNameConflict(info),
         }),
       );
@@ -6206,14 +7095,21 @@ export class FinderWindow extends HTMLElement {
             `<button type="button" data-ctx="erase-local">Erase All Items…</button>`,
           ]
         : targetId != null
-          ? [
+          ? isNetworkContainer(targetNode)
+            ? [
+                opsForNetworkNode(targetNode)?.downloadZip
+                  ? `<button type="button" data-ctx="download">Download Zip</button>`
+                  : '',
+                `<button type="button" data-ctx="props">${multi ? `Get Info (${count} items)…` : 'Get Info…'}</button>`,
+              ]
+            : [
               canExpand ? `<button type="button" data-ctx="expand">Expand</button>` : '',
               `<button type="button" data-ctx="download">Download Zip</button>`,
               canPreview ? `<button type="button" data-ctx="preview">Preview…</button>` : '',
               multi ? '' : `<button type="button" data-ctx="rename">Rename</button>`,
               `<button type="button" data-ctx="delete">${multi ? `Delete ${count} Items…` : 'Delete…'}</button>`,
               `<button type="button" data-ctx="props">${multi ? `Get Info (${count} items)…` : 'Get Info…'}</button>`,
-              !multi && targetNode && !targetNode.isDir && showsResourceFork(this.vfs.capabilities())
+              !multi && targetNode && !targetNode.isDir && showsResourceFork(this.caps())
                 ? `<button type="button" data-ctx="resources">Resources…</button>`
                 : '',
               !multi && targetNode && !targetNode.isDir && isWinResourceName(targetNode.name)
@@ -6224,7 +7120,9 @@ export class FinderWindow extends HTMLElement {
               `<button type="button" data-ctx="copy">Copy</button>`,
               this.clipboard ? `<button type="button" data-ctx="paste">Paste</button>` : '',
             ]
-          : [
+          : isNetworkCatalog(this.vfs) && this.networkListingLocked()
+            ? [`<button type="button" data-ctx="props-blank">Get Info</button>`]
+            : [
               `<button type="button" data-ctx="mkdir">New Folder</button>`,
               this.clipboard ? `<button type="button" data-ctx="paste">Paste</button>` : '',
               `<button type="button" data-ctx="props-blank">Get Info</button>`,
@@ -6388,31 +7286,35 @@ export class FinderWindow extends HTMLElement {
   }
 
   private async pasteClipboard(destParent = this.cwd): Promise<void> {
+    if (this.networkListingLocked()) return;
     if (!this.clipboard?.items.length) return;
     const clip = this.clipboard;
     this.setStatus('Pasting…', { busy: true });
     const srcParents: NodeRef[] = [];
+    const dest = await this.resolveNative(destParent);
+    const destCat = dest.cat;
+    const destRef = dest.ref;
     try {
-      const sameShare = clip.source === this.vfs;
+      const sameShare = clip.source === destCat;
       const reserved = new Set<string>();
       if (clip.mode === 'cut' && sameShare) {
         const moves: { id: NodeRef; name: string; plan: PlacementPlan }[] = [];
         for (const id of clip.sourceIds) {
-          const src = await this.vfs.get(id);
-          if (!src || parentRef(src) === destParent) continue;
-          if (!this.isValidMoveTarget(id, destParent)) {
+          const src = await destCat.get(id);
+          if (!src || parentRef(src) === destRef) continue;
+          if (!this.isValidMoveTarget(id, destRef, destCat)) {
             this.setStatus('Can’t move an item into itself');
             return;
           }
           srcParents.push(parentRef(src));
-          const plan = await this.planPlacement(this.vfs, destParent, src.name, src.isDir, id, reserved);
+          const plan = await this.planPlacement(destCat, destRef, src.name, src.isDir, id, reserved);
           moves.push({ id, name: src.name, plan });
         }
         for (const { id, name, plan } of moves) {
           await this.withOwnVfsMutation(async () => {
-            if (plan.replaceId != null) await this.vfs.remove(plan.replaceId);
-            if (plan.destName !== name) await this.vfs.rename(id, plan.destName);
-            await this.vfs.move(id, destParent);
+            if (plan.replaceId != null) await destCat.remove(plan.replaceId);
+            if (plan.destName !== name) await destCat.rename(id, plan.destName);
+            await destCat.move(id, destRef);
           });
         }
       } else {
@@ -6420,22 +7322,22 @@ export class FinderWindow extends HTMLElement {
         for (const item of clip.items) {
           planned.push({
             item,
-            plan: await this.planPlacement(this.vfs, destParent, item.name, item.isDir, undefined, reserved),
+            plan: await this.planPlacement(destCat, destRef, item.name, item.isDir, undefined, reserved),
           });
         }
         await this.withOwnVfsMutation(async () => {
-          this.vfs.beginBatch();
+          destCat.beginBatch();
           try {
             for (const { item, plan } of planned) {
-              if (plan.replaceId != null) await this.vfs.remove(plan.replaceId);
+              if (plan.replaceId != null) await destCat.remove(plan.replaceId);
               const jobId = this.startTransfer(plan.destName, item.isDir, clipByteSize(item), item.finderInfo);
-              transferActivity.setDest(jobId, this.vfs, destParent, plan.destName);
+              transferActivity.setDest(jobId, destCat, destRef, plan.destName);
               const signal = transferActivity.signal(jobId);
               try {
                 await transferActivity.withCopySlot(jobId, async () => {
                   await this.writeClipNode(
-                    this.vfs,
-                    destParent,
+                    destCat,
+                    destRef,
                     item,
                     (n) => {
                       throwIfAborted(signal);
@@ -6454,7 +7356,7 @@ export class FinderWindow extends HTMLElement {
               }
             }
           } finally {
-            this.vfs.endBatch();
+            destCat.endBatch();
           }
           if (clip.mode === 'cut' && clip.source) {
             for (const id of clip.sourceIds) {
@@ -6465,12 +7367,12 @@ export class FinderWindow extends HTMLElement {
       }
       if (clip.mode === 'cut') this.clipboard = null;
       this.syncClipboardButtons();
-      await this.refreshIfDestVisible(this.vfs, destParent, ...srcParents);
+      await this.refreshIfDestVisible(destCat, destRef, ...srcParents);
       this.setStatus('Paste complete');
     } catch (err) {
       if (isTransferCancelled(err)) {
         this.setStatus('Transfer cancelled');
-        await this.refreshIfDestVisible(this.vfs, destParent, ...srcParents);
+        await this.refreshIfDestVisible(destCat, destRef, ...srcParents);
         return;
       }
       this.setStatus(`Paste failed: ${(err as Error).message}`);
@@ -6689,14 +7591,16 @@ export class FinderWindow extends HTMLElement {
       const node = this.findNodeAnywhere(id) ?? (await this.vfs.get(id));
       if (!node) return;
       if (node.name !== name) {
-        const clash = await this.vfs.lookup(parentRef(node), name);
-        if (clash && nodeRef(clash) !== id) {
+        const parent = await this.resolveNative(parentRef(node), this.findNodeAnywhere(parentRef(node)));
+        const dest = await this.resolveNative(id, node);
+        const clash = await parent.cat.lookup(parent.ref, name);
+        if (clash && nodeRef(clash) !== dest.ref) {
           this.setStatus(`“${name}” already exists`);
           this.renamingId = id;
           this.renderContent();
           return;
         }
-        await this.withOwnVfsMutation(() => this.vfs.rename(id, name));
+        await this.withOwnVfsMutation(() => dest.cat.rename(dest.ref, name));
       }
       await this.reload();
       this.renderContent();

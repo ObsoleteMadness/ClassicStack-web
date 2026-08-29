@@ -12,6 +12,9 @@ function host(overrides: Partial<ViewMenuHost['finder']> = {}): ViewMenuHost {
     getSortKey: () => 'name' as const,
     applyViewMode: vi.fn(),
     applySortKey: vi.fn(),
+    networkBrowserEnabled: () => true,
+    isNetworkBrowserOpen: () => false,
+    openNetworkBrowser: vi.fn(),
     ...overrides,
   };
   return { finder: finder as ViewMenuHost['finder'] };
@@ -42,11 +45,30 @@ describe('View menu actions', () => {
     expect(h.finder.applySortKey).toHaveBeenCalledWith('modified');
   });
 
+  it('opens Network Browser when the client is enabled', async () => {
+    const h = host();
+    expect(await applyViewMenuAction('network-browser', h)).toBe(true);
+    expect(h.finder.openNetworkBrowser).toHaveBeenCalled();
+  });
+
+  it('checks Network Browser only while that catalog is open', () => {
+    const html = viewMenuInnerHTML(host({ isNetworkBrowserOpen: () => true }), false);
+    expect(html).toMatch(/role="menuitemcheckbox" aria-checked="true" data-act="network-browser"/);
+    expect(html).toContain('✓');
+  });
+
+  it('disables Network Browser when the client is off', () => {
+    const html = viewMenuInnerHTML(host({ networkBrowserEnabled: () => false }), false);
+    expect(html).toContain('data-act="network-browser"');
+    expect(html).toMatch(/data-act="network-browser"[^>]*disabled/);
+  });
+
   it('renders view shortcuts and sort submenu', () => {
     const html = viewMenuInnerHTML(host(), false);
     expect(html).toContain('as Icons');
     expect(html).toContain('Sort By');
     expect(html).toContain('Load icons');
+    expect(html).toContain('Network Browser');
     expect(html).not.toContain('AppleDouble zip');
   });
 });

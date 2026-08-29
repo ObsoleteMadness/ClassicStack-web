@@ -25,5 +25,5 @@ export {
   parseRefKey,
   refKey,
 } from '../fs/catalog-caps';
-export { volumeChrome, sidebarGlyphSrc, formatStorePath, clientVolumeURI, isClientURI } from '../fs/volume-chrome';
+export { volumeChrome, sidebarGlyphSrc, networkGlyphSrc, formatStorePath, clientVolumeURI, isClientURI } from '../fs/volume-chrome';
 export type { SidebarGlyphRole } from '../fs/volume-chrome';

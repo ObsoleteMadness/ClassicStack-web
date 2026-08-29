@@ -41,6 +41,30 @@ export type VNodeBase = {
   accessDate?: number;
   backupDate?: number;
   attrs?: Record<string, boolean>;
+  /**
+   * Finder chrome only — not catalog identity. Network Neighborhood folders
+   * set this so the pane reuses sidebar glyphs instead of a generic folder.
+   */
+  chrome?: VNodeChrome;
+};
+
+/**
+ * Overlay icons / Network Browser type (not part of CNID or path addressing).
+ * Protocol / zone / server / share / service set `container`. Shares are
+ * folder-like (`isDir`) and overlay a volume catalog after it is attached.
+ */
+export type VNodeChrome = {
+  iconSrc?: string;
+  networkRole?: 'root' | 'protocol' | 'neighborhood' | 'server' | 'share' | 'service';
+  endpointId?: string;
+  /** True when this node is a Network Browser object (share, server, …). */
+  container?: boolean;
+  /** Extra service on a server (`printer`, `macipgw`, …). */
+  serviceKind?: string;
+  /** Catalog key of the volume this overlay node belongs to. */
+  catalogKey?: string;
+  /** Native `NodeRef` in `catalogKey` (CNID or store path). */
+  nativeRef?: NodeRef;
 };
 
 export type CnidVNode = VNodeBase & { addr: 'cnid'; id: number; parentId: number };

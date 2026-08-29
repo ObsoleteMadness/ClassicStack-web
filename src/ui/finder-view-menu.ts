@@ -71,6 +71,11 @@ export function viewMenuInnerHTML(host: ViewMenuHost, open: boolean): string {
           <span class="app-menu__check">${icons ? '✓' : ''}</span>
           <span class="app-menu__label">Load icons</span>
         </button>
+        <hr />
+        <button type="button" role="menuitemcheckbox" aria-checked="${finder.isNetworkBrowserOpen()}" data-act="network-browser" class="app-menu__item"${finder.networkBrowserEnabled() ? '' : ' disabled'}>
+          <span class="app-menu__check">${finder.isNetworkBrowserOpen() ? '✓' : ''}</span>
+          <span class="app-menu__label">Network Browser</span>
+        </button>
       </div>
     `;
 }
@@ -111,6 +116,11 @@ export async function applyViewMenuAction(act: string | undefined, host: ViewMen
   }
   if (act === 'sort-size') {
     await finder.applySortKey('size');
+    return true;
+  }
+  if (act === 'network-browser') {
+    if (!finder.networkBrowserEnabled()) return true;
+    await finder.openNetworkBrowser();
     return true;
   }
   return false;

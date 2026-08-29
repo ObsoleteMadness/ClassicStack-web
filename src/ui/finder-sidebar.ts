@@ -128,6 +128,45 @@ export function volumesForEndpoint(
   return ep.knownVolumes?.map((v) => v.name) ?? [];
 }
 
+export type SidebarActive =
+  | { kind: 'none' }
+  | { kind: 'local' }
+  | { kind: 'network' }
+  | { kind: 'server'; id: string }
+  | { kind: 'volume'; id: string; volume: string };
+
+/**
+ * At most one sidebar row is selected: local share, Browse Network, a server,
+ * or a volume. Connecting state wins so a spinner row is the only highlight,
+ * except while the Network Browser catalog is showing — Browse Network stays
+ * selected as the user walks zone → server → volume.
+ */
+export function resolveSidebarActive(opts: {
+  connectingEndpointId: string | null;
+  connectingVolume?: string | null;
+  viewingLocal: boolean;
+  networkCatalog: boolean;
+  networkRole: 'root' | 'protocol' | 'neighborhood' | 'server' | 'share' | 'service' | '';
+  networkServerId?: string;
+  remoteOpen: boolean;
+  openVolume: string;
+  remoteEndpointId: string;
+}): SidebarActive {
+  if (opts.connectingEndpointId && !opts.networkCatalog) {
+    if (opts.connectingVolume) {
+      return { kind: 'volume', id: opts.connectingEndpointId, volume: opts.connectingVolume };
+    }
+    return { kind: 'server', id: opts.connectingEndpointId };
+  }
+  if (opts.viewingLocal) return { kind: 'local' };
+  if (opts.networkCatalog) return { kind: 'network' };
+  if (opts.remoteOpen && opts.remoteEndpointId && opts.openVolume) {
+    return { kind: 'volume', id: opts.remoteEndpointId, volume: opts.openVolume };
+  }
+  if (opts.remoteEndpointId) return { kind: 'server', id: opts.remoteEndpointId };
+  return { kind: 'none' };
+}
+
 export type ShareDrop = { key: string; name: string };
 
 /**
